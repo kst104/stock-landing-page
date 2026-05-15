@@ -804,6 +804,24 @@ def _get_listing() -> pd.DataFrame:
     return pd.DataFrame(columns=["Code", "Name", "Market", "Marcap"])
 
 
+def _get_listing_with_progress(prog: dict | None = None) -> pd.DataFrame:
+    """Load listing and expose the lookup time in the progress payload."""
+    if prog is not None:
+        prog["listing_status"] = "loading"
+        prog["listing_started_at"] = time.time()
+        prog.pop("listing_elapsed", None)
+        prog.pop("listing_count", None)
+    started = time.perf_counter()
+    df = _get_listing()
+    elapsed = round(time.perf_counter() - started, 1)
+    if prog is not None:
+        prog["listing_status"] = "done"
+        prog["listing_elapsed"] = elapsed
+        prog["listing_count"] = int(len(df))
+        prog.pop("listing_started_at", None)
+    return df
+
+
 def _save_listing_cache(df: pd.DataFrame, date_str: str):
     """listing을 디스크에 JSON으로 저장 (서버 재시작 후 재사용)."""
     try:
@@ -1362,7 +1380,7 @@ def _screen1_ticker(code, start, end):
 def run_screen1(date_str, prog):
     prog.update({"current":0,"total":0,"status":"loading"})
     start = (datetime.strptime(date_str,"%Y%m%d")-timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen1_ticker, start, date_str, prog)
@@ -1408,7 +1426,7 @@ def _screen2_ticker(code, start, end):
 def run_screen2(date_str, prog):
     prog.update({"current":0,"total":0,"status":"loading"})
     start = (datetime.strptime(date_str,"%Y%m%d")-timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen2_ticker, start, date_str, prog)
@@ -1500,7 +1518,7 @@ def _screen3_ticker(code, start, end):
 def run_screen3(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen3_ticker, start, date_str, prog)
@@ -1594,7 +1612,7 @@ def _screen4_ticker(code, start, end):
 def run_screen4(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen4_ticker, start, date_str, prog)
@@ -1674,7 +1692,7 @@ def _screen5_ticker(code, start, end):
 def run_screen5(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen5_ticker, start, date_str, prog)
@@ -1762,7 +1780,7 @@ def _screen6_ticker(code, start, end):
 def run_screen6(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen6_ticker, start, date_str, prog)
@@ -1856,7 +1874,7 @@ def _screen7_ticker(code, start, end):
 def run_screen7(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen7_ticker, start, date_str, prog)
@@ -1962,7 +1980,7 @@ def _screen8_ticker(code, start, end):
 def run_screen8(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen8_ticker, start, date_str, prog)
@@ -2068,7 +2086,7 @@ def _screen9_ticker(code, start, end):
 def run_screen9(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen9_ticker, start, date_str, prog)
@@ -2150,7 +2168,7 @@ def _screen10_ticker(code, start, end):
 def run_screen10(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen10_ticker, start, date_str, prog)
@@ -2297,7 +2315,7 @@ def _screen11_ticker(code, start, end):
 def run_screen11(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen11_ticker, start, date_str, prog)
@@ -2386,7 +2404,7 @@ def _screen12_ticker(code, start, end):
 def run_screen12(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen12_ticker, start, date_str, prog)
@@ -2465,7 +2483,7 @@ def _screen13_ticker(code, start, end):
 def run_screen13(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP13].copy()   # 3000억 이상
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen13_ticker, start, date_str, prog)
@@ -2565,7 +2583,7 @@ def run_screen14(date_str, prog):
     t_scan_start = datetime.now()
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP13].copy()   # 3000억 이상
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen14_ticker, start, date_str, prog)
@@ -2768,7 +2786,7 @@ def run_screen15(date_str, prog):
     t_scan_start = datetime.now()
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP13].copy()   # 3000억 이상
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen15_ticker, start, date_str, prog)
@@ -2856,7 +2874,7 @@ def _screen16_ticker(code, start, end):
 def run_screen16(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()   # 1500억 이상
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen16_ticker, start, date_str, prog)
@@ -2944,7 +2962,7 @@ def _screen17_ticker(code, start, end):
 def run_screen17(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()   # 1500억 이상
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen17_ticker, start, date_str, prog)
@@ -3034,7 +3052,7 @@ def _screen18_ticker(code, start, end):
 def run_screen18(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()   # 1500억 이상
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen18_ticker, start, date_str, prog)
@@ -3131,7 +3149,7 @@ def _screen19_ticker(code, start, end):
 def run_screen19(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()   # 1500억 이상
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen19_ticker, start, date_str, prog)
@@ -3309,7 +3327,7 @@ def _screen20_ticker(code, start, end):
 def run_screen20(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP13].copy()   # 3000억 이상
     prog["total"] = len(valid); prog["status"] = "running"
     t_start = datetime.now()
@@ -3527,7 +3545,7 @@ def _screen22_ticker(code, start, end):
 def run_screen22(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"] = len(valid); prog["status"] = "running"
     rows = _run_screen_parallel(valid, _screen22_ticker, start, date_str, prog)
@@ -3601,7 +3619,7 @@ def _screen23_ticker(code, start, end):
 def run_screen23(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP13) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -3690,7 +3708,7 @@ def _screen24_ticker(code, start, end):
 def run_screen24(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP13) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -3963,7 +3981,7 @@ def _screen26_ticker(code, start, end):
 
 
 def run_screen26(date_str, prog):
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -4071,7 +4089,7 @@ def _screen27_ticker(code, start, end):
 def run_screen27(date_str, prog):
     t_start = datetime.now()
     prog.update({"current": 0, "total": 0, "status": "loading"})
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -4239,7 +4257,7 @@ def run_screen28(date_str, prog):
     t_start = datetime.now()
     prog.update({"current": 0, "total": 0, "status": "loading"})
     start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[listing["Marcap"] >= MIN_CAP].copy()
     prog["total"]  = len(valid)
     prog["status"] = "running"
@@ -4354,7 +4372,7 @@ def run_screen29(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=400)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -4450,7 +4468,7 @@ def run_screen30(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -4596,7 +4614,7 @@ def run_screen31(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -4702,7 +4720,7 @@ def run_screen43(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -4896,7 +4914,7 @@ def run_screen44(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= _S44_MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -5097,7 +5115,7 @@ def run_screen45(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= _S45_MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -5214,7 +5232,7 @@ def run_screen46(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= _S46_MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -5319,7 +5337,7 @@ def run_screen47(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK * 3)   # 월봉 충분히 확보 (약 6년)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= _S47_MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -6263,7 +6281,7 @@ def run_screen32(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=200)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -6370,7 +6388,7 @@ def run_screen33(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -6474,7 +6492,7 @@ def run_screen34(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -6585,7 +6603,7 @@ def run_screen35(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP_35) &
         (listing["Marcap"] <  MAX_CAP_35) &                         # 20조 미만
@@ -6707,7 +6725,7 @@ def run_screen36(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"]))
@@ -6788,7 +6806,7 @@ def run_screen37(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP_35) &
         (listing["Marcap"] <  MAX_CAP_35) &
@@ -7032,7 +7050,7 @@ def run_screen38(date_str, prog):
     prog.update({"current": 0, "total": 0, "status": "loading"})
     end     = pd.Timestamp(date_str)
     start   = end - pd.Timedelta(days=LOOKBACK)
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"])) &
@@ -7143,7 +7161,7 @@ def run_screen39(date_str, prog):
     end   = date_str
     start = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
 
-    listing = _get_listing()
+    listing = _get_listing_with_progress(prog)
     valid   = listing[
         (listing["Marcap"] >= MIN_CAP) &
         (~listing["Market"].isin(["ETF", "ETN"])) &
@@ -8141,13 +8159,36 @@ function listenProg() {
   evtSrc = new EventSource(`/api/${SID}/progress`);
   evtSrc.onmessage = e => {
     const d = JSON.parse(e.data);
-    if(d.status==='running'||d.status==='loading'){
+    if(d.status==='loading'){
+      setP(0, listingProgressText(d));
+    } else if(d.status==='running'){
       const pct = d.total>0 ? Math.round(d.current/d.total*100) : 0;
-      setP(pct,`분석 중... ${d.current} / ${d.total} 종목`);
+      setP(pct,`분석 중... ${d.current} / ${d.total} 종목${listingDoneText(d)}`);
     } else if(d.status==='done'){
-      evtSrc.close(); setP(100,'완료!'); setTimeout(loadResult,400);
+      evtSrc.close(); setP(100,`완료!${listingDoneText(d)}`); setTimeout(loadResult,400);
     }
   };
+}
+
+function fmtSec(sec){
+  if(sec===undefined || sec===null || sec==='') return '';
+  const n = Number(sec);
+  if(!Number.isFinite(n)) return '';
+  return n >= 60 ? `${Math.floor(n/60)}분 ${Math.round(n%60)}초` : `${n.toFixed(1)}초`;
+}
+
+function listingProgressText(d){
+  if(d.listing_status === 'loading' && d.listing_started_at){
+    const sec = Math.max(0, Date.now()/1000 - Number(d.listing_started_at));
+    return `종목 리스트 조회 중... ${fmtSec(sec)} 경과`;
+  }
+  return `종목 리스트 조회 중...`;
+}
+
+function listingDoneText(d){
+  if(d.listing_elapsed === undefined || d.listing_elapsed === null) return '';
+  const count = d.listing_count ? ` / ${Number(d.listing_count).toLocaleString()}종목` : '';
+  return `  |  종목조회 ${fmtSec(d.listing_elapsed)}${count}`;
 }
 
 function setP(pct,txt){
