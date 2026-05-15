@@ -643,6 +643,7 @@ import re as _re
 
 _listing_cache: pd.DataFrame = pd.DataFrame()
 _listing_cache_date: str     = ""
+_LISTING_CACHE_VERSION = "naver-krx-kis-v2"
 _LISTING_DISK_CACHE = Path(__file__).parent / ".listing_cache.json"
 
 # ── 네이버 페이지 1장 가져오기 (병렬 worker 함수) ──────────────────────────
@@ -674,7 +675,7 @@ def _naver_fetch_page(args):
             return None   # 빈 페이지 (마지막 페이지 초과)
 
         # 시가총액 테이블 파싱
-        tables = pd.read_html(r.text, flavor="lxml")
+        tables = pd.read_html(io.StringIO(r.text), flavor="lxml")
         tbl    = None
         for t in tables:
             if "종목명" in t.columns and "시가총액" in t.columns:
@@ -704,12 +705,14 @@ def _naver_fetch_page(args):
 
 def _get_listing() -> pd.DataFrame:
     """
-    KRX 전체 종목 리스트 + 시가총액(원 단위) 반환.
-    1순위: 메모리 캐시 (당일)
-    2순위: 디스크 캐시 (서버 재시작 후 당일 재사용)
-    3순위: FDR StockListing("KRX")
-    4순위: 네이버 금융 병렬 스크래핑 (20 workers)
-    컬럼: Code, Name, Market, Marcap
+    Return listing rows with columns: Code, Name, Market, Marcap.
+
+    Fresh lookup order:
+      1. Naver Finance market-cap pages
+      2. KRX listing via FinanceDataReader
+      3. KIS trade-value ranking fallback
+
+    Same-day memory/disk caches are reused before a fresh network lookup.
     """
     global _listing_cache, _listing_cache_date
     today = datetime.now().strftime("%Y%m%d")
@@ -722,7 +725,9 @@ def _get_listing() -> pd.DataFrame:
     try:
         if _LISTING_DISK_CACHE.exists():
             cached = json.loads(_LISTING_DISK_CACHE.read_text(encoding="utf-8"))
-            if cached.get("date") == today and cached.get("rows"):
+            if (cached.get("date") == today and
+                    cached.get("version") == _LISTING_CACHE_VERSION and
+                    cached.get("rows")):
                 df = pd.DataFrame(cached["rows"])
                 _listing_cache      = df.reset_index(drop=True)
                 _listing_cache_date = today
@@ -731,22 +736,7 @@ def _get_listing() -> pd.DataFrame:
     except Exception as e:
         print(f"[LISTING] 디스크 캐시 로드 실패: {e}")
 
-    # ── 3. FDR ────────────────────────────────────────────────────────────────
-    try:
-        df = fdr.StockListing("KRX")
-        if df is not None and not df.empty and "Marcap" in df.columns:
-            df = df[["Code", "Name", "Market", "Marcap"]].copy()
-            df["Code"] = df["Code"].astype(str).str.zfill(6)
-            df = df.reset_index(drop=True)
-            _listing_cache      = df
-            _listing_cache_date = today
-            _save_listing_cache(df, today)
-            print(f"[LISTING] FDR 성공 → {len(df)}종목")
-            return _listing_cache.copy()
-    except Exception as e:
-        print(f"[LISTING] FDR 실패: {e}  → 네이버 병렬 스크래핑")
-
-    # ── 4. 네이버 병렬 스크래핑 ──────────────────────────────────────────────
+    # ── 3. Naver first ───────────────────────────────────────────────────────
     try:
         # KOSPI ~55 페이지, KOSDAQ ~50 페이지 (넉넉하게)
         tasks = ([(0, p, "KOSPI")  for p in range(1, 65)] +
@@ -760,14 +750,54 @@ def _get_listing() -> pd.DataFrame:
         if all_rows:
             df = pd.concat(all_rows, ignore_index=True)
             df = df[df["Code"].notna() & (df["Marcap"] > 0)]
+            df["Code"] = df["Code"].astype(str).str.zfill(6)
             df = df.drop_duplicates(subset="Code").reset_index(drop=True)
             _listing_cache      = df
             _listing_cache_date = today
             _save_listing_cache(df, today)
-            print(f"[LISTING] 네이버 병렬 스크래핑 성공 → {len(df)}종목")
+            print(f"[LISTING] Naver success → {len(df)}종목")
             return _listing_cache.copy()
     except Exception as e:
-        print(f"[LISTING] 네이버 스크래핑 실패: {e}")
+        print(f"[LISTING] Naver 실패: {e}  → KRX/FDR")
+
+    # ── 4. KRX/FDR fallback ─────────────────────────────────────────────────
+    try:
+        df = fdr.StockListing("KRX")
+        if df is not None and not df.empty and "Marcap" in df.columns:
+            df = df[["Code", "Name", "Market", "Marcap"]].copy()
+            df["Code"] = df["Code"].astype(str).str.zfill(6)
+            df = df.reset_index(drop=True)
+            _listing_cache      = df
+            _listing_cache_date = today
+            _save_listing_cache(df, today)
+            print(f"[LISTING] KRX/FDR 성공 → {len(df)}종목")
+            return _listing_cache.copy()
+    except Exception as e:
+        print(f"[LISTING] KRX/FDR 실패: {e}  → KIS")
+
+    # ── 5. KIS final fallback ───────────────────────────────────────────────
+    try:
+        rows = []
+        if _kis:
+            for market, market_name in [("J", "KOSPI/KOSDAQ"), ("Q", "KOSDAQ")]:
+                for item in _kis.trade_value_ranking(top_n=500, market=market):
+                    rows.append({
+                        "Code": str(item.get("code", "")).zfill(6),
+                        "Name": str(item.get("name", "")),
+                        "Market": market_name,
+                        "Marcap": 0,
+                    })
+        if rows:
+            df = pd.DataFrame(rows)
+            df = df[df["Code"].str.match(r"^\d{6}$", na=False)]
+            df = df.drop_duplicates(subset="Code").reset_index(drop=True)
+            _listing_cache      = df
+            _listing_cache_date = today
+            _save_listing_cache(df, today)
+            print(f"[LISTING] KIS fallback 성공 → {len(df)}종목")
+            return _listing_cache.copy()
+    except Exception as e:
+        print(f"[LISTING] KIS fallback 실패: {e}")
 
     # 모두 실패
     print("[LISTING] 모든 방법 실패 → 빈 리스트 반환")
@@ -777,7 +807,11 @@ def _get_listing() -> pd.DataFrame:
 def _save_listing_cache(df: pd.DataFrame, date_str: str):
     """listing을 디스크에 JSON으로 저장 (서버 재시작 후 재사용)."""
     try:
-        data = {"date": date_str, "rows": df.to_dict(orient="records")}
+        data = {
+            "date": date_str,
+            "version": _LISTING_CACHE_VERSION,
+            "rows": df.to_dict(orient="records"),
+        }
         _LISTING_DISK_CACHE.write_text(
             json.dumps(data, ensure_ascii=False), encoding="utf-8"
         )
