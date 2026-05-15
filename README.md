@@ -1,8 +1,8 @@
-# 주식 랜딩페이지 / 스크리너 허브
+# Stock Landing Page / Screener Hub
 
-Flask 기반 주식 스크리너 허브입니다.
+Flask-based stock screener hub.
 
-## 로컬 실행
+## Local Run
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -12,11 +12,11 @@ $env:AUTH_ADMIN_PASSWORD="your-admin-password"
 python app.py
 ```
 
-접속 주소는 `http://localhost:8888`입니다.
+Open `http://localhost:8888`.
 
-## 환경 변수
+## Environment Variables
 
-`.env.example`을 참고해 배포 환경에 아래 값을 설정하세요.
+Set these values in your deployment environment. See `.env.example`.
 
 - `KIS_KEY`
 - `KIS_SECRET`
