@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.log
+server_*.txt
+
+.claude/
+.auth_secret
+.env
+.listing_cache.json
+authorized_users.json
+email_config.json
+kis_token.json
+vl_result_*.csv
+start-localhost.ps1

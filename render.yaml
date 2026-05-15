@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: stock-landing-page
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: KIS_KEY
+        sync: false
+      - key: KIS_SECRET
+        sync: false
+      - key: AUTH_ADMIN_EMAIL
+        value: promokorea@gmail.com
+      - key: AUTH_ADMIN_PASSWORD
+        sync: false

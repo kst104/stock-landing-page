@@ -1,0 +1,11 @@
+beautifulsoup4
+finance-datareader
+flask
+lxml
+numpy
+openpyxl
+pandas
+pillow
+requests
+werkzeug
+

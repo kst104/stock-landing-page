@@ -1,0 +1,1119 @@
+<!DOCTYPE html>
+<html lang="ko" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StockLens — 주식 검색의 새로운 기준</title>
+
+  <!-- Pretendard -->
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css" />
+
+  <!-- Tailwind CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Pretendard Variable', 'Pretendard', '-apple-system', 'sans-serif'],
+            display: ['Pretendard Variable', 'sans-serif'],
+          },
+          colors: {
+            bg: '#0a0a0b',
+            surface: '#111113',
+            card: '#161618',
+            border: '#252528',
+            accent: '#3b7aff',
+            'accent-muted': '#1e3a7a',
+            muted: '#6b6b73',
+            sub: '#9999a8',
+            text: '#e8e8f0',
+          },
+          borderRadius: {
+            '2xl': '1rem',
+            '3xl': '1.5rem',
+            '4xl': '2rem',
+          },
+        },
+      },
+    };
+  </script>
+
+  <!-- Iconify -->
+  <script src="https://code.iconify.design/3/3.1.1/iconify.min.js"></script>
+
+  <!-- Motion One -->
+  <script src="https://cdn.jsdelivr.net/npm/motion@10.16.2/dist/motion.js"></script>
+
+  <style>
+    * { box-sizing: border-box; }
+    html { background: #0a0a0b; }
+    body {
+      font-family: 'Pretendard Variable', Pretendard, -apple-system, sans-serif;
+      background: #0a0a0b;
+      color: #e8e8f0;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: #0a0a0b; }
+    ::-webkit-scrollbar-thumb { background: #252528; border-radius: 2px; }
+
+    /* Glass nav */
+    .glass-nav {
+      background: rgba(10, 10, 11, 0.72);
+      backdrop-filter: blur(20px) saturate(160%);
+      -webkit-backdrop-filter: blur(20px) saturate(160%);
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+
+    /* Double-Bezel card */
+    .bezel-card {
+      background: #161618;
+      border: 1px solid #252528;
+      border-radius: 1.25rem;
+      position: relative;
+    }
+    .bezel-card::before {
+      content: '';
+      position: absolute;
+      inset: 1px;
+      border-radius: calc(1.25rem - 1px);
+      border: 1px solid rgba(255,255,255,0.05);
+      pointer-events: none;
+    }
+
+    /* Accent glow — subtle, no neon */
+    .accent-glow {
+      box-shadow: 0 0 40px rgba(59, 122, 255, 0.12);
+    }
+
+    /* Search input */
+    .search-wrap {
+      background: #161618;
+      border: 1px solid #252528;
+      border-radius: 0.875rem;
+      transition: border-color 0.2s cubic-bezier(0.16,1,0.3,1),
+                  box-shadow 0.2s cubic-bezier(0.16,1,0.3,1);
+    }
+    .search-wrap:focus-within {
+      border-color: #3b7aff;
+      box-shadow: 0 0 0 3px rgba(59,122,255,0.14);
+    }
+
+    /* Tag badge */
+    .tag {
+      background: rgba(59,122,255,0.1);
+      border: 1px solid rgba(59,122,255,0.2);
+      color: #7eaaff;
+      border-radius: 9999px;
+      padding: 2px 10px;
+      font-size: 0.75rem;
+      font-weight: 500;
+    }
+
+    /* Ticker chip */
+    .ticker-chip {
+      background: #1c1c1f;
+      border: 1px solid #2a2a2e;
+      border-radius: 0.75rem;
+      transition: all 0.2s cubic-bezier(0.16,1,0.3,1);
+    }
+    .ticker-chip:hover {
+      border-color: #3b7aff;
+      background: rgba(59,122,255,0.06);
+      transform: translateY(-2px);
+    }
+
+    /* Number counter shimmer */
+    .stat-num {
+      background: linear-gradient(135deg, #e8e8f0 40%, #7eaaff 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    /* Section dividers */
+    .section-line {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, #252528 30%, #252528 70%, transparent);
+    }
+
+    /* Testimonial avatar ring */
+    .avatar-ring {
+      outline: 2px solid #252528;
+      outline-offset: 2px;
+    }
+
+    /* Feature icon bg */
+    .icon-bg {
+      background: rgba(59,122,255,0.08);
+      border: 1px solid rgba(59,122,255,0.14);
+    }
+
+    /* CTA section gradient */
+    .cta-bg {
+      background: radial-gradient(ellipse 80% 60% at 50% 100%, rgba(59,122,255,0.1) 0%, transparent 70%),
+                  #111113;
+    }
+
+    /* Fade-in animation target */
+    .reveal {
+      opacity: 0;
+      transform: translateY(28px);
+      transition: opacity 0.7s cubic-bezier(0.16,1,0.3,1),
+                  transform 0.7s cubic-bezier(0.16,1,0.3,1);
+    }
+    .reveal.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .reveal-delay-1 { transition-delay: 0.08s; }
+    .reveal-delay-2 { transition-delay: 0.16s; }
+    .reveal-delay-3 { transition-delay: 0.24s; }
+    .reveal-delay-4 { transition-delay: 0.32s; }
+
+    /* Chart sparkline placeholder */
+    .sparkline {
+      height: 48px;
+      position: relative;
+      overflow: hidden;
+    }
+    .sparkline svg { position: absolute; inset: 0; }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════
+     NAVIGATION
+═══════════════════════════════════════ -->
+<header class="fixed top-0 left-0 right-0 z-50 glass-nav">
+  <nav class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+    <!-- Logo -->
+    <a href="#" class="flex items-center gap-2.5">
+      <div class="w-7 h-7 rounded-lg bg-accent flex items-center justify-center">
+        <iconify-icon icon="solar:chart-line-duotone" width="16" style="color:#fff"></iconify-icon>
+      </div>
+      <span class="font-semibold text-[15px] tracking-tight text-text">StockLens</span>
+    </a>
+
+    <!-- Desktop links -->
+    <ul class="hidden md:flex items-center gap-6 text-[13.5px] text-sub font-medium">
+      <li><a href="#features" class="hover:text-text transition-colors">기능</a></li>
+      <li><a href="#markets" class="hover:text-text transition-colors">시장 데이터</a></li>
+      <li><a href="#pricing" class="hover:text-text transition-colors">요금제</a></li>
+      <li><a href="#faq" class="hover:text-text transition-colors">FAQ</a></li>
+    </ul>
+
+    <!-- CTA -->
+    <div class="flex items-center gap-3">
+      <a href="#" class="hidden sm:inline-flex text-[13px] text-sub hover:text-text font-medium transition-colors">로그인</a>
+      <a href="#"
+         class="inline-flex items-center gap-1.5 bg-accent hover:bg-blue-500 text-white text-[13px] font-semibold px-4 py-2 rounded-lg transition-all duration-200"
+         style="transition-timing-function:cubic-bezier(0.16,1,0.3,1)">
+        무료로 시작하기
+        <iconify-icon icon="solar:arrow-right-linear" width="14"></iconify-icon>
+      </a>
+    </div>
+  </nav>
+</header>
+
+
+<!-- ═══════════════════════════════════════
+     HERO — Split asymmetric layout
+═══════════════════════════════════════ -->
+<section class="min-h-[100dvh] flex flex-col justify-center pt-16 pb-24 px-6 relative overflow-hidden">
+
+  <!-- Ambient light blobs -->
+  <div class="pointer-events-none absolute inset-0 overflow-hidden">
+    <div class="absolute -top-32 -left-24 w-[600px] h-[600px] rounded-full"
+         style="background:radial-gradient(circle, rgba(59,122,255,0.06) 0%, transparent 70%);"></div>
+    <div class="absolute top-1/3 right-0 w-[400px] h-[400px] rounded-full"
+         style="background:radial-gradient(circle, rgba(59,122,255,0.04) 0%, transparent 70%);"></div>
+  </div>
+
+  <div class="max-w-7xl mx-auto w-full grid lg:grid-cols-[1fr_480px] gap-12 xl:gap-20 items-center relative z-10">
+
+    <!-- Left: Copy + Search -->
+    <div>
+      <div class="tag inline-flex items-center gap-1.5 mb-6 reveal">
+        <iconify-icon icon="solar:lightning-bolt-linear" width="13"></iconify-icon>
+        실시간 주식 데이터 · 국내외 동시 지원
+      </div>
+
+      <h1 class="text-[2.75rem] sm:text-[3.5rem] xl:text-[4.25rem] font-bold leading-snug break-keep-all tracking-tight text-text mb-6 reveal reveal-delay-1">
+        모든 주식을<br/>
+        <span class="stat-num">한 번에 검색.</span>
+      </h1>
+
+      <p class="text-sub text-[1.0625rem] leading-relaxed max-w-[52ch] break-keep-all mb-10 reveal reveal-delay-2">
+        코스피·코스닥·나스닥·NYSE 전 종목을 하나의 검색창에서.
+        재무 지표부터 공시, 뉴스까지 — 투자 판단에 필요한 모든 정보를 3초 안에.
+      </p>
+
+      <!-- Search bar -->
+      <div class="search-wrap flex items-center gap-3 px-4 py-3 max-w-[560px] mb-5 reveal reveal-delay-3">
+        <iconify-icon icon="solar:magnifer-linear" width="20" style="color:#6b6b73; flex-shrink:0;"></iconify-icon>
+        <input
+          type="text"
+          placeholder="종목명 또는 티커 검색 — 삼성전자, AAPL, 005930..."
+          class="flex-1 bg-transparent text-text text-[0.9375rem] placeholder:text-muted outline-none"
+          style="font-family: inherit;"
+        />
+        <button class="flex-shrink-0 bg-accent hover:bg-blue-500 text-white text-[13px] font-semibold px-4 py-2 rounded-lg transition-all duration-200"
+                style="transition-timing-function:cubic-bezier(0.16,1,0.3,1)">
+          검색
+        </button>
+      </div>
+
+      <!-- Quick tickers -->
+      <div class="flex flex-wrap gap-2 reveal reveal-delay-4">
+        <span class="text-[12px] text-muted pt-0.5">인기 검색:</span>
+        <button class="ticker-chip px-3 py-1 text-[12.5px] text-sub font-medium">삼성전자</button>
+        <button class="ticker-chip px-3 py-1 text-[12.5px] text-sub font-medium">NVIDIA</button>
+        <button class="ticker-chip px-3 py-1 text-[12.5px] text-sub font-medium">카카오</button>
+        <button class="ticker-chip px-3 py-1 text-[12.5px] text-sub font-medium">TSMC</button>
+        <button class="ticker-chip px-3 py-1 text-[12.5px] text-sub font-medium">현대차</button>
+        <button class="ticker-chip px-3 py-1 text-[12.5px] text-sub font-medium">Apple</button>
+      </div>
+    </div>
+
+    <!-- Right: Live stock cards -->
+    <div class="hidden lg:flex flex-col gap-3 reveal reveal-delay-2">
+
+      <!-- Card 1: 삼성전자 -->
+      <div class="bezel-card p-5 accent-glow">
+        <div class="flex items-start justify-between mb-4">
+          <div>
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-[11px] font-semibold text-muted bg-surface border border-border px-2 py-0.5 rounded">KRX</span>
+              <span class="text-[11px] text-muted">005930</span>
+            </div>
+            <div class="text-[15px] font-semibold text-text">삼성전자</div>
+          </div>
+          <div class="text-right">
+            <div class="text-[1.25rem] font-bold text-text">71,400<span class="text-[12px] font-normal text-muted ml-0.5">원</span></div>
+            <div class="flex items-center justify-end gap-1 mt-0.5">
+              <iconify-icon icon="solar:arrow-up-linear" width="12" style="color:#22c55e"></iconify-icon>
+              <span class="text-[12px] font-medium text-green-400">+1.28%</span>
+            </div>
+          </div>
+        </div>
+        <div class="sparkline">
+          <svg viewBox="0 0 280 48" fill="none" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">
+            <path d="M0 38 L28 35 L56 30 L84 32 L112 26 L140 22 L168 24 L196 18 L224 14 L252 16 L280 10" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M0 38 L28 35 L56 30 L84 32 L112 26 L140 22 L168 24 L196 18 L224 14 L252 16 L280 10 L280 48 L0 48Z" fill="url(#g1)" opacity="0.18"/>
+            <defs>
+              <linearGradient id="g1" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#22c55e"/>
+                <stop offset="100%" stop-color="transparent"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <div class="grid grid-cols-3 gap-3 mt-4 pt-4 border-t border-border">
+          <div>
+            <div class="text-[11px] text-muted mb-0.5">시가총액</div>
+            <div class="text-[13px] font-semibold text-text">426.8조</div>
+          </div>
+          <div>
+            <div class="text-[11px] text-muted mb-0.5">거래량</div>
+            <div class="text-[13px] font-semibold text-text">12.3M</div>
+          </div>
+          <div>
+            <div class="text-[11px] text-muted mb-0.5">PER</div>
+            <div class="text-[13px] font-semibold text-text">14.2x</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 2: NVIDIA -->
+      <div class="bezel-card p-5">
+        <div class="flex items-start justify-between mb-4">
+          <div>
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-[11px] font-semibold text-muted bg-surface border border-border px-2 py-0.5 rounded">NASDAQ</span>
+              <span class="text-[11px] text-muted">NVDA</span>
+            </div>
+            <div class="text-[15px] font-semibold text-text">NVIDIA</div>
+          </div>
+          <div class="text-right">
+            <div class="text-[1.25rem] font-bold text-text">$875.14</div>
+            <div class="flex items-center justify-end gap-1 mt-0.5">
+              <iconify-icon icon="solar:arrow-down-linear" width="12" style="color:#f87171"></iconify-icon>
+              <span class="text-[12px] font-medium text-red-400">-0.74%</span>
+            </div>
+          </div>
+        </div>
+        <div class="sparkline">
+          <svg viewBox="0 0 280 48" fill="none" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">
+            <path d="M0 12 L28 10 L56 15 L84 8 L112 12 L140 18 L168 14 L196 20 L224 24 L252 28 L280 32" stroke="#f87171" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M0 12 L28 10 L56 15 L84 8 L112 12 L140 18 L168 14 L196 20 L224 24 L252 28 L280 32 L280 48 L0 48Z" fill="url(#g2)" opacity="0.14"/>
+            <defs>
+              <linearGradient id="g2" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#f87171"/>
+                <stop offset="100%" stop-color="transparent"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+      </div>
+
+      <!-- Mini label -->
+      <p class="text-center text-[11.5px] text-muted">
+        <iconify-icon icon="solar:refresh-circle-linear" width="12" class="inline-block mr-1"></iconify-icon>
+        15초마다 자동 갱신 · 거래소 지연 데이터 기준
+      </p>
+    </div>
+  </div>
+</section>
+
+
+<!-- ═══════════════════════════════════════
+     STATS — Social proof numbers
+═══════════════════════════════════════ -->
+<section class="py-16 px-6 border-y border-border">
+  <div class="max-w-7xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-8 text-center">
+    <div class="reveal">
+      <div class="text-[2rem] font-bold stat-num mb-1">83,400<span class="text-xl">+</span></div>
+      <div class="text-[13px] text-muted">검색 가능 종목 수</div>
+    </div>
+    <div class="reveal reveal-delay-1">
+      <div class="text-[2rem] font-bold stat-num mb-1">12개국</div>
+      <div class="text-[13px] text-muted">지원 거래소</div>
+    </div>
+    <div class="reveal reveal-delay-2">
+      <div class="text-[2rem] font-bold stat-num mb-1">0.3<span class="text-xl">초</span></div>
+      <div class="text-[13px] text-muted">평균 검색 응답 속도</div>
+    </div>
+    <div class="reveal reveal-delay-3">
+      <div class="text-[2rem] font-bold stat-num mb-1">47,200<span class="text-xl">+</span></div>
+      <div class="text-[13px] text-muted">월 활성 투자자</div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ═══════════════════════════════════════
+     FEATURES — Asymmetric bento grid
+═══════════════════════════════════════ -->
+<section id="features" class="py-28 px-6">
+  <div class="max-w-7xl mx-auto">
+
+    <!-- Header -->
+    <div class="max-w-xl mb-16 reveal">
+      <div class="tag inline-flex items-center gap-1.5 mb-4">
+        <iconify-icon icon="solar:shield-star-linear" width="13"></iconify-icon>
+        핵심 기능
+      </div>
+      <h2 class="text-[2rem] sm:text-[2.5rem] font-bold leading-snug break-keep-all text-text">
+        투자에 필요한 모든 데이터,<br/>
+        검색 한 번으로.
+      </h2>
+    </div>
+
+    <!-- Bento grid -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+
+      <!-- Feature 1 — wide -->
+      <div class="bezel-card p-6 lg:col-span-2 reveal">
+        <div class="icon-bg w-11 h-11 rounded-xl flex items-center justify-center mb-5">
+          <iconify-icon icon="solar:magnifer-zoom-in-linear" width="22" style="color:#3b7aff"></iconify-icon>
+        </div>
+        <h3 class="text-[1.1rem] font-semibold text-text mb-2 break-keep-all">통합 스마트 검색</h3>
+        <p class="text-sub text-[14px] leading-relaxed max-w-[55ch] break-keep-all mb-6">
+          종목명, 티커, 업종, 대표 키워드 중 어떤 것으로 검색해도 정확하게 찾아드립니다. 오타 보정·자동완성·연관 종목 추천까지 내장되어 있어 처음 투자하는 분도 헤매지 않습니다.
+        </p>
+        <!-- Mock autocomplete -->
+        <div class="bg-surface border border-border rounded-xl overflow-hidden">
+          <div class="px-4 py-3 flex items-center gap-3 border-b border-border">
+            <iconify-icon icon="solar:magnifer-linear" width="16" style="color:#6b6b73"></iconify-icon>
+            <span class="text-[14px] text-sub">반도체</span>
+            <span class="ml-auto text-[11px] text-muted">34개 결과</span>
+          </div>
+          <div class="divide-y divide-border">
+            <div class="px-4 py-3 flex items-center gap-3 hover:bg-card transition-colors cursor-pointer">
+              <div class="w-7 h-7 rounded bg-card border border-border flex items-center justify-center text-[11px] font-bold text-accent">S</div>
+              <div>
+                <div class="text-[13.5px] font-medium text-text">삼성전자 <span class="text-muted font-normal text-[12px]">· 005930</span></div>
+                <div class="text-[11.5px] text-muted">반도체 · KOSPI</div>
+              </div>
+              <div class="ml-auto text-right">
+                <div class="text-[13px] font-semibold text-text">71,400</div>
+                <div class="text-[11px] text-green-400">+1.28%</div>
+              </div>
+            </div>
+            <div class="px-4 py-3 flex items-center gap-3 hover:bg-card transition-colors cursor-pointer">
+              <div class="w-7 h-7 rounded bg-card border border-border flex items-center justify-center text-[11px] font-bold text-accent">H</div>
+              <div>
+                <div class="text-[13.5px] font-medium text-text">SK하이닉스 <span class="text-muted font-normal text-[12px]">· 000660</span></div>
+                <div class="text-[11.5px] text-muted">반도체 · KOSPI</div>
+              </div>
+              <div class="ml-auto text-right">
+                <div class="text-[13px] font-semibold text-text">182,300</div>
+                <div class="text-[11px] text-red-400">-0.55%</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Feature 2 -->
+      <div class="bezel-card p-6 reveal reveal-delay-1">
+        <div class="icon-bg w-11 h-11 rounded-xl flex items-center justify-center mb-5">
+          <iconify-icon icon="solar:chart-2-linear" width="22" style="color:#3b7aff"></iconify-icon>
+        </div>
+        <h3 class="text-[1.1rem] font-semibold text-text mb-2 break-keep-all">실시간 재무 분석</h3>
+        <p class="text-sub text-[14px] leading-relaxed break-keep-all mb-5">
+          PER·PBR·ROE·부채비율을 업종 평균과 나란히 비교. 숫자가 무엇을 의미하는지 자동 해석 코멘트가 함께 표시됩니다.
+        </p>
+        <div class="grid grid-cols-2 gap-2">
+          <div class="bg-surface rounded-xl p-3 border border-border">
+            <div class="text-[11px] text-muted mb-1">PER</div>
+            <div class="text-[1.1rem] font-bold text-text">14.2x</div>
+            <div class="text-[10.5px] text-green-400 mt-0.5">업종 평균 대비 -18%</div>
+          </div>
+          <div class="bg-surface rounded-xl p-3 border border-border">
+            <div class="text-[11px] text-muted mb-1">ROE</div>
+            <div class="text-[1.1rem] font-bold text-text">9.4%</div>
+            <div class="text-[10.5px] text-muted mt-0.5">전년 대비 +2.1%p</div>
+          </div>
+          <div class="bg-surface rounded-xl p-3 border border-border">
+            <div class="text-[11px] text-muted mb-1">PBR</div>
+            <div class="text-[1.1rem] font-bold text-text">1.8x</div>
+            <div class="text-[10.5px] text-muted mt-0.5">적정 밸류에이션 구간</div>
+          </div>
+          <div class="bg-surface rounded-xl p-3 border border-border">
+            <div class="text-[11px] text-muted mb-1">배당수익률</div>
+            <div class="text-[1.1rem] font-bold text-text">2.7%</div>
+            <div class="text-[10.5px] text-green-400 mt-0.5">5년 연속 배당 증가</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Feature 3 -->
+      <div class="bezel-card p-6 reveal">
+        <div class="icon-bg w-11 h-11 rounded-xl flex items-center justify-center mb-5">
+          <iconify-icon icon="solar:bell-linear" width="22" style="color:#3b7aff"></iconify-icon>
+        </div>
+        <h3 class="text-[1.1rem] font-semibold text-text mb-2 break-keep-all">가격 알림 & 포트폴리오</h3>
+        <p class="text-sub text-[14px] leading-relaxed break-keep-all">
+          목표가 도달·급등락·공시 발생 시 즉시 푸시 알림. 최대 50개 종목 포트폴리오를 자동 손익 추적합니다.
+        </p>
+        <div class="mt-5 space-y-2">
+          <div class="flex items-center gap-3 bg-surface border border-border rounded-xl px-3.5 py-3">
+            <iconify-icon icon="solar:bell-check-linear" width="16" style="color:#22c55e"></iconify-icon>
+            <span class="text-[13px] text-text flex-1">삼성전자 목표가 도달</span>
+            <span class="text-[11px] text-muted">방금</span>
+          </div>
+          <div class="flex items-center gap-3 bg-surface border border-border rounded-xl px-3.5 py-3">
+            <iconify-icon icon="solar:document-text-linear" width="16" style="color:#facc15"></iconify-icon>
+            <span class="text-[13px] text-text flex-1">SK하이닉스 공시 발행</span>
+            <span class="text-[11px] text-muted">3분 전</span>
+          </div>
+          <div class="flex items-center gap-3 bg-surface border border-border rounded-xl px-3.5 py-3">
+            <iconify-icon icon="solar:arrow-up-linear" width="16" style="color:#f87171"></iconify-icon>
+            <span class="text-[13px] text-text flex-1">TSMC 급등 감지 +5.2%</span>
+            <span class="text-[11px] text-muted">9분 전</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Feature 4 -->
+      <div class="bezel-card p-6 reveal reveal-delay-1">
+        <div class="icon-bg w-11 h-11 rounded-xl flex items-center justify-center mb-5">
+          <iconify-icon icon="solar:global-linear" width="22" style="color:#3b7aff"></iconify-icon>
+        </div>
+        <h3 class="text-[1.1rem] font-semibold text-text mb-2 break-keep-all">해외주식 완전 지원</h3>
+        <p class="text-sub text-[14px] leading-relaxed break-keep-all">
+          미국·일본·홍콩·유럽 주요 거래소를 국내 종목과 동일한 UX로 검색. 원화 환산 가격·환율 영향도 함께 표시됩니다.
+        </p>
+        <div class="mt-5 flex flex-wrap gap-2">
+          <span class="bg-surface border border-border rounded-full px-3 py-1 text-[12px] text-sub font-medium">🇺🇸 NYSE</span>
+          <span class="bg-surface border border-border rounded-full px-3 py-1 text-[12px] text-sub font-medium">🇺🇸 NASDAQ</span>
+          <span class="bg-surface border border-border rounded-full px-3 py-1 text-[12px] text-sub font-medium">🇯🇵 TSE</span>
+          <span class="bg-surface border border-border rounded-full px-3 py-1 text-[12px] text-sub font-medium">🇭🇰 HKEX</span>
+          <span class="bg-surface border border-border rounded-full px-3 py-1 text-[12px] text-sub font-medium">🇩🇪 XETRA</span>
+          <span class="bg-surface border border-border rounded-full px-3 py-1 text-[12px] text-sub font-medium">+7 더보기</span>
+        </div>
+      </div>
+
+      <!-- Feature 5 -->
+      <div class="bezel-card p-6 reveal reveal-delay-2">
+        <div class="icon-bg w-11 h-11 rounded-xl flex items-center justify-center mb-5">
+          <iconify-icon icon="solar:bookmark-linear" width="22" style="color:#3b7aff"></iconify-icon>
+        </div>
+        <h3 class="text-[1.1rem] font-semibold text-text mb-2 break-keep-all">뉴스 & 공시 통합</h3>
+        <p class="text-sub text-[14px] leading-relaxed break-keep-all">
+          종목 검색 결과 화면에서 관련 뉴스·DART 공시·애널리스트 리포트를 한 페이지로 확인. 정보 파편화는 이제 그만.
+        </p>
+        <div class="mt-5 bg-surface border border-border rounded-xl p-4">
+          <div class="flex items-center gap-2 mb-3">
+            <iconify-icon icon="solar:newspaper-linear" width="14" style="color:#3b7aff"></iconify-icon>
+            <span class="text-[11.5px] font-semibold text-accent uppercase tracking-wider">최신 뉴스</span>
+          </div>
+          <div class="space-y-3">
+            <div>
+              <div class="text-[13px] text-text leading-snug break-keep-all">삼성전자, HBM4 양산 일정 앞당겨... 내년 상반기 목표</div>
+              <div class="text-[11px] text-muted mt-0.5">한국경제 · 2시간 전</div>
+            </div>
+            <div class="border-t border-border pt-3">
+              <div class="text-[13px] text-text leading-snug break-keep-all">"반도체 업황 바닥 확인" — 외국인 순매수 3일 연속</div>
+              <div class="text-[11px] text-muted mt-0.5">매일경제 · 4시간 전</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ═══════════════════════════════════════
+     MARKETS — Live ticker board
+═══════════════════════════════════════ -->
+<section id="markets" class="py-24 px-6 bg-surface border-y border-border">
+  <div class="max-w-7xl mx-auto">
+
+    <div class="flex flex-col sm:flex-row sm:items-end justify-between gap-4 mb-12 reveal">
+      <div>
+        <div class="tag inline-flex items-center gap-1.5 mb-4">
+          <iconify-icon icon="solar:pulse-linear" width="13"></iconify-icon>
+          시장 현황
+        </div>
+        <h2 class="text-[1.875rem] font-bold text-text break-keep-all">오늘의 주요 지수</h2>
+      </div>
+      <a href="#" class="text-[13px] text-accent hover:underline flex items-center gap-1 font-medium">
+        전체 시장 보기
+        <iconify-icon icon="solar:arrow-right-linear" width="14"></iconify-icon>
+      </a>
+    </div>
+
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-10">
+      <!-- Index cards -->
+      <div class="bezel-card p-5 reveal">
+        <div class="text-[12px] text-muted mb-3 font-medium">KOSPI</div>
+        <div class="text-[1.5rem] font-bold text-text mb-1">2,748.36</div>
+        <div class="flex items-center gap-1">
+          <iconify-icon icon="solar:arrow-up-linear" width="14" style="color:#22c55e"></iconify-icon>
+          <span class="text-[13px] text-green-400 font-medium">+12.4 (+0.45%)</span>
+        </div>
+        <div class="sparkline mt-3">
+          <svg viewBox="0 0 160 40" fill="none" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">
+            <path d="M0 28 L20 25 L40 22 L60 24 L80 18 L100 20 L120 14 L140 16 L160 12" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="bezel-card p-5 reveal reveal-delay-1">
+        <div class="text-[12px] text-muted mb-3 font-medium">KOSDAQ</div>
+        <div class="text-[1.5rem] font-bold text-text mb-1">841.22</div>
+        <div class="flex items-center gap-1">
+          <iconify-icon icon="solar:arrow-down-linear" width="14" style="color:#f87171"></iconify-icon>
+          <span class="text-[13px] text-red-400 font-medium">-3.8 (-0.45%)</span>
+        </div>
+        <div class="sparkline mt-3">
+          <svg viewBox="0 0 160 40" fill="none" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">
+            <path d="M0 12 L20 14 L40 18 L60 15 L80 20 L100 22 L120 26 L140 24 L160 28" stroke="#f87171" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="bezel-card p-5 reveal reveal-delay-2">
+        <div class="text-[12px] text-muted mb-3 font-medium">S&P 500</div>
+        <div class="text-[1.5rem] font-bold text-text mb-1">5,224.62</div>
+        <div class="flex items-center gap-1">
+          <iconify-icon icon="solar:arrow-up-linear" width="14" style="color:#22c55e"></iconify-icon>
+          <span class="text-[13px] text-green-400 font-medium">+28.7 (+0.55%)</span>
+        </div>
+        <div class="sparkline mt-3">
+          <svg viewBox="0 0 160 40" fill="none" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">
+            <path d="M0 32 L20 28 L40 24 L60 26 L80 20 L100 16 L120 18 L140 12 L160 10" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="bezel-card p-5 reveal reveal-delay-3">
+        <div class="text-[12px] text-muted mb-3 font-medium">NASDAQ</div>
+        <div class="text-[1.5rem] font-bold text-text mb-1">16,384.47</div>
+        <div class="flex items-center gap-1">
+          <iconify-icon icon="solar:arrow-up-linear" width="14" style="color:#22c55e"></iconify-icon>
+          <span class="text-[13px] text-green-400 font-medium">+94.2 (+0.58%)</span>
+        </div>
+        <div class="sparkline mt-3">
+          <svg viewBox="0 0 160 40" fill="none" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none">
+            <path d="M0 30 L20 26 L40 28 L60 20 L80 22 L100 14 L120 16 L140 10 L160 8" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </div>
+      </div>
+    </div>
+
+    <!-- Top movers table -->
+    <div class="bezel-card overflow-hidden reveal">
+      <div class="px-6 py-4 border-b border-border flex items-center justify-between">
+        <span class="text-[14px] font-semibold text-text">오늘의 급등 종목</span>
+        <div class="flex gap-2">
+          <button class="text-[12px] px-3 py-1.5 rounded-lg bg-accent text-white font-medium">상승</button>
+          <button class="text-[12px] px-3 py-1.5 rounded-lg text-muted hover:text-text transition-colors">하락</button>
+          <button class="text-[12px] px-3 py-1.5 rounded-lg text-muted hover:text-text transition-colors">거래량</button>
+        </div>
+      </div>
+      <div class="divide-y divide-border">
+        <div class="px-6 py-4 grid grid-cols-4 text-[11.5px] text-muted font-medium uppercase tracking-wider">
+          <span>종목</span>
+          <span class="text-right">현재가</span>
+          <span class="text-right">등락률</span>
+          <span class="text-right hidden sm:block">거래량</span>
+        </div>
+        <div class="px-6 py-3.5 grid grid-cols-4 hover:bg-card transition-colors cursor-pointer">
+          <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-lg bg-card border border-border flex items-center justify-center text-[12px] font-bold text-accent">에</div>
+            <div>
+              <div class="text-[13.5px] font-medium text-text">에코프로비엠</div>
+              <div class="text-[11px] text-muted">247540</div>
+            </div>
+          </div>
+          <div class="text-right text-[13.5px] font-semibold text-text self-center">198,500</div>
+          <div class="text-right self-center"><span class="text-green-400 text-[13px] font-semibold">+14.82%</span></div>
+          <div class="text-right text-[13px] text-muted self-center hidden sm:block">3.2M</div>
+        </div>
+        <div class="px-6 py-3.5 grid grid-cols-4 hover:bg-card transition-colors cursor-pointer">
+          <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-lg bg-card border border-border flex items-center justify-center text-[12px] font-bold text-accent">한</div>
+            <div>
+              <div class="text-[13.5px] font-medium text-text">한화오션</div>
+              <div class="text-[11px] text-muted">042660</div>
+            </div>
+          </div>
+          <div class="text-right text-[13.5px] font-semibold text-text self-center">34,250</div>
+          <div class="text-right self-center"><span class="text-green-400 text-[13px] font-semibold">+9.24%</span></div>
+          <div class="text-right text-[13px] text-muted self-center hidden sm:block">8.7M</div>
+        </div>
+        <div class="px-6 py-3.5 grid grid-cols-4 hover:bg-card transition-colors cursor-pointer">
+          <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-lg bg-card border border-border flex items-center justify-center text-[12px] font-bold text-accent">셀</div>
+            <div>
+              <div class="text-[13.5px] font-medium text-text">셀트리온</div>
+              <div class="text-[11px] text-muted">068270</div>
+            </div>
+          </div>
+          <div class="text-right text-[13.5px] font-semibold text-text self-center">176,400</div>
+          <div class="text-right self-center"><span class="text-green-400 text-[13px] font-semibold">+7.66%</span></div>
+          <div class="text-right text-[13px] text-muted self-center hidden sm:block">2.1M</div>
+        </div>
+        <div class="px-6 py-3.5 grid grid-cols-4 hover:bg-card transition-colors cursor-pointer">
+          <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-lg bg-card border border-border flex items-center justify-center text-[12px] font-bold text-accent">카</div>
+            <div>
+              <div class="text-[13.5px] font-medium text-text">카카오뱅크</div>
+              <div class="text-[11px] text-muted">323410</div>
+            </div>
+          </div>
+          <div class="text-right text-[13.5px] font-semibold text-text self-center">26,850</div>
+          <div class="text-right self-center"><span class="text-green-400 text-[13px] font-semibold">+6.13%</span></div>
+          <div class="text-right text-[13px] text-muted self-center hidden sm:block">5.4M</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ═══════════════════════════════════════
+     TESTIMONIALS
+═══════════════════════════════════════ -->
+<section class="py-28 px-6">
+  <div class="max-w-7xl mx-auto">
+    <div class="text-center mb-16 reveal">
+      <div class="tag inline-flex items-center gap-1.5 mb-4">
+        <iconify-icon icon="solar:star-linear" width="13"></iconify-icon>
+        사용자 후기
+      </div>
+      <h2 class="text-[1.875rem] sm:text-[2.25rem] font-bold text-text break-keep-all">
+        이미 47,200명이 선택했습니다
+      </h2>
+    </div>
+
+    <div class="grid md:grid-cols-3 gap-5">
+
+      <!-- Review 1 -->
+      <div class="bezel-card p-6 reveal">
+        <div class="flex items-center gap-1 mb-4">
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+        </div>
+        <p class="text-sub text-[14px] leading-relaxed break-keep-all mb-6">
+          "여러 앱을 돌아다니며 퍼즐 맞추던 게 이젠 하나로 끝납니다. 공시와 재무 지표를 이렇게 빠르게 볼 수 있는 서비스는 처음이에요."
+        </p>
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 rounded-full bg-accent-muted avatar-ring flex items-center justify-center text-[13px] font-bold text-accent">박</div>
+          <div>
+            <div class="text-[13.5px] font-semibold text-text">박지훈</div>
+            <div class="text-[12px] text-muted">개인 투자자 · 서울</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Review 2 -->
+      <div class="bezel-card p-6 reveal reveal-delay-1">
+        <div class="flex items-center gap-1 mb-4">
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+        </div>
+        <p class="text-sub text-[14px] leading-relaxed break-keep-all mb-6">
+          "미국 주식 보다가 바로 코스피 종목으로 넘어가도 끊김이 없어요. 가격 알림 기능 덕분에 폰을 24시간 들여다보는 일이 없어졌습니다."
+        </p>
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 rounded-full bg-accent-muted avatar-ring flex items-center justify-center text-[13px] font-bold text-accent">이</div>
+          <div>
+            <div class="text-[13.5px] font-semibold text-text">이수연</div>
+            <div class="text-[12px] text-muted">직장인 주주 · 부산</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Review 3 -->
+      <div class="bezel-card p-6 reveal reveal-delay-2">
+        <div class="flex items-center gap-1 mb-4">
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-bold" width="14" style="color:#facc15"></iconify-icon>
+          <iconify-icon icon="solar:star-half-star-bold" width="14" style="color:#facc15"></iconify-icon>
+        </div>
+        <p class="text-sub text-[14px] leading-relaxed break-keep-all mb-6">
+          "운용사에서 종목 스크리닝할 때 필터 조합이 정말 편리합니다. 다른 유료 툴 대신 팀 전체가 StockLens로 갈아탔어요."
+        </p>
+        <div class="flex items-center gap-3">
+          <div class="w-9 h-9 rounded-full bg-accent-muted avatar-ring flex items-center justify-center text-[13px] font-bold text-accent">최</div>
+          <div>
+            <div class="text-[13.5px] font-semibold text-text">최민석</div>
+            <div class="text-[12px] text-muted">펀드매니저 · 여의도</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ═══════════════════════════════════════
+     PRICING
+═══════════════════════════════════════ -->
+<section id="pricing" class="py-24 px-6 bg-surface border-y border-border">
+  <div class="max-w-4xl mx-auto">
+    <div class="text-center mb-14 reveal">
+      <div class="tag inline-flex items-center gap-1.5 mb-4">
+        <iconify-icon icon="solar:tag-price-linear" width="13"></iconify-icon>
+        요금제
+      </div>
+      <h2 class="text-[1.875rem] sm:text-[2.25rem] font-bold text-text break-keep-all">부담 없이 시작하고, 필요할 때 확장하세요</h2>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-5">
+      <!-- Free -->
+      <div class="bezel-card p-7 reveal">
+        <div class="text-[13px] font-semibold text-muted uppercase tracking-widest mb-4">무료</div>
+        <div class="text-[2.5rem] font-bold text-text mb-1">₩0 <span class="text-[1.125rem] font-normal text-muted">/ 월</span></div>
+        <p class="text-sub text-[13.5px] mb-7 break-keep-all">국내 종목 검색 & 기본 재무 지표, 영원히 무료.</p>
+        <ul class="space-y-3 mb-8">
+          <li class="flex items-center gap-2.5 text-[13.5px] text-sub">
+            <iconify-icon icon="solar:check-circle-linear" width="16" style="color:#3b7aff"></iconify-icon>
+            국내 전 종목 검색 (코스피·코스닥)
+          </li>
+          <li class="flex items-center gap-2.5 text-[13.5px] text-sub">
+            <iconify-icon icon="solar:check-circle-linear" width="16" style="color:#3b7aff"></iconify-icon>
+            기본 재무 지표 (PER·PBR·ROE)
+          </li>
+          <li class="flex items-center gap-2.5 text-[13.5px] text-sub">
+            <iconify-icon icon="solar:check-circle-linear" width="16" style="color:#3b7aff"></iconify-icon>
+            관심종목 5개
+          </li>
+          <li class="flex items-center gap-2.5 text-[13.5px] text-muted">
+            <iconify-icon icon="solar:close-circle-linear" width="16" style="color:#6b6b73"></iconify-icon>
+            해외 주식
+          </li>
+          <li class="flex items-center gap-2.5 text-[13.5px] text-muted">
+            <iconify-icon icon="solar:close-circle-linear" width="16" style="color:#6b6b73"></iconify-icon>
+            가격 알림
+          </li>
+        </ul>
+        <a href="#" class="block text-center border border-border hover:border-accent text-text text-[14px] font-semibold py-3 rounded-xl transition-all duration-200"
+           style="transition-timing-function:cubic-bezier(0.16,1,0.3,1)">
+          무료로 시작하기
+        </a>
+      </div>
+
+      <!-- Pro -->
+      <div class="bezel-card p-7 border-accent/30 accent-glow reveal reveal-delay-1" style="border-color: rgba(59,122,255,0.3);">
+        <div class="flex items-center justify-between mb-4">
+          <div class="text-[13px] font-semibold text-accent uppercase tracking-widest">프로</div>
+          <span class="tag">인기</span>
+        </div>
+        <div class="text-[2.5rem] font-bold text-text mb-1">₩9,900 <span class="text-[1.125rem] font-normal text-muted">/ 월</span></div>
+        <p class="text-sub text-[13.5px] mb-7 break-keep-all">전문 투자자 수준의 데이터를 합리적인 가격에.</p>
+        <ul class="space-y-3 mb-8">
+          <li class="flex items-center gap-2.5 text-[13.5px] text-sub">
+            <iconify-icon icon="solar:check-circle-linear" width="16" style="color:#3b7aff"></iconify-icon>
+            무료 플랜 전체 포함
+          </li>
+          <li class="flex items-center gap-2.5 text-[13.5px] text-sub">
+            <iconify-icon icon="solar:check-circle-linear" width="16" style="color:#3b7aff"></iconify-icon>
+            해외 12개 거래소 동시 검색
+          </li>
+          <li class="flex items-center gap-2.5 text-[13.5px] text-sub">
+            <iconify-icon icon="solar:check-circle-linear" width="16" style="color:#3b7aff"></iconify-icon>
+            가격 알림 무제한 · 포트폴리오 50개
+          </li>
+          <li class="flex items-center gap-2.5 text-[13.5px] text-sub">
+            <iconify-icon icon="solar:check-circle-linear" width="16" style="color:#3b7aff"></iconify-icon>
+            애널리스트 리포트 전체 열람
+          </li>
+          <li class="flex items-center gap-2.5 text-[13.5px] text-sub">
+            <iconify-icon icon="solar:check-circle-linear" width="16" style="color:#3b7aff"></iconify-icon>
+            고급 스크리너 & CSV 내보내기
+          </li>
+        </ul>
+        <a href="#"
+           class="block text-center bg-accent hover:bg-blue-500 text-white text-[14px] font-semibold py-3 rounded-xl transition-all duration-200"
+           style="transition-timing-function:cubic-bezier(0.16,1,0.3,1)">
+          30일 무료 체험 시작
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ═══════════════════════════════════════
+     FAQ
+═══════════════════════════════════════ -->
+<section id="faq" class="py-24 px-6">
+  <div class="max-w-2xl mx-auto">
+    <div class="text-center mb-14 reveal">
+      <h2 class="text-[1.875rem] font-bold text-text break-keep-all">자주 묻는 질문</h2>
+    </div>
+
+    <div class="space-y-3" id="faq-list">
+      <div class="bezel-card reveal faq-item">
+        <button class="w-full flex items-center justify-between px-5 py-4 text-left" onclick="toggleFaq(this)">
+          <span class="text-[14.5px] font-medium text-text break-keep-all">데이터가 얼마나 실시간으로 업데이트되나요?</span>
+          <iconify-icon icon="solar:alt-arrow-down-linear" width="18" style="color:#6b6b73" class="faq-icon flex-shrink-0 ml-4 transition-transform duration-300"></iconify-icon>
+        </button>
+        <div class="faq-body px-5 pb-4 hidden">
+          <p class="text-sub text-[13.5px] leading-relaxed break-keep-all">국내 주식은 거래소 지연 없이 5초, 해외 주식은 거래소 정책에 따라 15~20분 지연됩니다. 프로 플랜은 미국 주식 준실시간(1분) 데이터를 제공합니다.</p>
+        </div>
+      </div>
+
+      <div class="bezel-card reveal reveal-delay-1 faq-item">
+        <button class="w-full flex items-center justify-between px-5 py-4 text-left" onclick="toggleFaq(this)">
+          <span class="text-[14.5px] font-medium text-text break-keep-all">체험 기간 중 카드를 등록해야 하나요?</span>
+          <iconify-icon icon="solar:alt-arrow-down-linear" width="18" style="color:#6b6b73" class="faq-icon flex-shrink-0 ml-4 transition-transform duration-300"></iconify-icon>
+        </button>
+        <div class="faq-body px-5 pb-4 hidden">
+          <p class="text-sub text-[13.5px] leading-relaxed break-keep-all">30일 무료 체험 동안에는 결제 수단이 필요 없습니다. 체험 종료 7일 전 알림이 발송되며, 그 이후에 구독 여부를 결정하시면 됩니다.</p>
+        </div>
+      </div>
+
+      <div class="bezel-card reveal reveal-delay-2 faq-item">
+        <button class="w-full flex items-center justify-between px-5 py-4 text-left" onclick="toggleFaq(this)">
+          <span class="text-[14.5px] font-medium text-text break-keep-all">모바일 앱도 있나요?</span>
+          <iconify-icon icon="solar:alt-arrow-down-linear" width="18" style="color:#6b6b73" class="faq-icon flex-shrink-0 ml-4 transition-transform duration-300"></iconify-icon>
+        </button>
+        <div class="faq-body px-5 pb-4 hidden">
+          <p class="text-sub text-[13.5px] leading-relaxed break-keep-all">iOS와 Android 앱이 있으며, 웹과 계정이 연동되어 알림·포트폴리오가 즉시 동기화됩니다. App Store 및 Google Play에서 'StockLens'로 검색하세요.</p>
+        </div>
+      </div>
+
+      <div class="bezel-card reveal reveal-delay-3 faq-item">
+        <button class="w-full flex items-center justify-between px-5 py-4 text-left" onclick="toggleFaq(this)">
+          <span class="text-[14.5px] font-medium text-text break-keep-all">구독을 중단하면 데이터는 어떻게 되나요?</span>
+          <iconify-icon icon="solar:alt-arrow-down-linear" width="18" style="color:#6b6b73" class="faq-icon flex-shrink-0 ml-4 transition-transform duration-300"></iconify-icon>
+        </button>
+        <div class="faq-body px-5 pb-4 hidden">
+          <p class="text-sub text-[13.5px] leading-relaxed break-keep-all">구독 해지 후에도 계정과 관심종목·포트폴리오 데이터는 6개월간 보존됩니다. 해지 후에는 무료 플랜으로 자동 전환됩니다.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ═══════════════════════════════════════
+     CTA
+═══════════════════════════════════════ -->
+<section class="py-28 px-6 cta-bg border-t border-border">
+  <div class="max-w-2xl mx-auto text-center reveal">
+    <h2 class="text-[2rem] sm:text-[2.75rem] font-bold text-text leading-snug break-keep-all mb-5">
+      더 빠르고 정확한<br/>
+      투자 판단을 시작하세요.
+    </h2>
+    <p class="text-sub text-[1rem] leading-relaxed max-w-[45ch] mx-auto break-keep-all mb-10">
+      지금 가입하면 프로 플랜 30일을 무료로 체험할 수 있습니다. 신용카드 불필요.
+    </p>
+    <div class="flex flex-col sm:flex-row gap-3 justify-center">
+      <a href="#"
+         class="inline-flex items-center justify-center gap-2 bg-accent hover:bg-blue-500 text-white font-semibold px-8 py-3.5 rounded-xl text-[15px] transition-all duration-200"
+         style="transition-timing-function:cubic-bezier(0.16,1,0.3,1)">
+        <iconify-icon icon="solar:user-plus-linear" width="18"></iconify-icon>
+        무료로 시작하기
+      </a>
+      <a href="#"
+         class="inline-flex items-center justify-center gap-2 border border-border hover:border-sub text-text font-medium px-8 py-3.5 rounded-xl text-[15px] transition-all duration-200"
+         style="transition-timing-function:cubic-bezier(0.16,1,0.3,1)">
+        <iconify-icon icon="solar:play-circle-linear" width="18"></iconify-icon>
+        데모 영상 보기
+      </a>
+    </div>
+  </div>
+</section>
+
+
+<!-- ═══════════════════════════════════════
+     FOOTER
+═══════════════════════════════════════ -->
+<footer class="border-t border-border bg-surface px-6 py-16">
+  <div class="max-w-7xl mx-auto">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-10 mb-12">
+      <!-- Brand -->
+      <div class="col-span-2 md:col-span-1">
+        <div class="flex items-center gap-2.5 mb-4">
+          <div class="w-7 h-7 rounded-lg bg-accent flex items-center justify-center">
+            <iconify-icon icon="solar:chart-line-duotone" width="16" style="color:#fff"></iconify-icon>
+          </div>
+          <span class="font-semibold text-[15px] text-text">StockLens</span>
+        </div>
+        <p class="text-muted text-[13px] leading-relaxed break-keep-all max-w-[22ch]">
+          주식 검색의 새로운 기준. 국내외 8만여 종목, 하나의 검색창으로.
+        </p>
+      </div>
+
+      <!-- Links 1 -->
+      <div>
+        <div class="text-[12px] font-semibold text-sub uppercase tracking-widest mb-4">서비스</div>
+        <ul class="space-y-2.5 text-[13px] text-muted">
+          <li><a href="#" class="hover:text-text transition-colors">주식 검색</a></li>
+          <li><a href="#" class="hover:text-text transition-colors">시장 지수</a></li>
+          <li><a href="#" class="hover:text-text transition-colors">포트폴리오</a></li>
+          <li><a href="#" class="hover:text-text transition-colors">스크리너</a></li>
+          <li><a href="#" class="hover:text-text transition-colors">가격 알림</a></li>
+        </ul>
+      </div>
+
+      <!-- Links 2 -->
+      <div>
+        <div class="text-[12px] font-semibold text-sub uppercase tracking-widest mb-4">회사</div>
+        <ul class="space-y-2.5 text-[13px] text-muted">
+          <li><a href="#" class="hover:text-text transition-colors">소개</a></li>
+          <li><a href="#" class="hover:text-text transition-colors">블로그</a></li>
+          <li><a href="#" class="hover:text-text transition-colors">채용</a></li>
+          <li><a href="#" class="hover:text-text transition-colors">문의</a></li>
+        </ul>
+      </div>
+
+      <!-- Links 3 -->
+      <div>
+        <div class="text-[12px] font-semibold text-sub uppercase tracking-widest mb-4">법적 고지</div>
+        <ul class="space-y-2.5 text-[13px] text-muted">
+          <li><a href="#" class="hover:text-text transition-colors">이용약관</a></li>
+          <li><a href="#" class="hover:text-text transition-colors">개인정보처리방침</a></li>
+          <li><a href="#" class="hover:text-text transition-colors">투자 유의사항</a></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="section-line mb-8"></div>
+
+    <div class="flex flex-col sm:flex-row justify-between items-center gap-4">
+      <p class="text-[12.5px] text-muted">
+        © 2026 StockLens Inc. 본 서비스에 표시된 데이터는 투자 권유가 아닙니다.
+      </p>
+      <div class="flex items-center gap-4">
+        <a href="#" class="text-muted hover:text-text transition-colors">
+          <iconify-icon icon="solar:twitter-linear" width="18"></iconify-icon>
+        </a>
+        <a href="#" class="text-muted hover:text-text transition-colors">
+          <iconify-icon icon="solar:instagram-linear" width="18"></iconify-icon>
+        </a>
+        <a href="#" class="text-muted hover:text-text transition-colors">
+          <iconify-icon icon="solar:github-linear" width="18"></iconify-icon>
+        </a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+
+<!-- ═══════════════════════════════════════
+     SCRIPTS
+═══════════════════════════════════════ -->
+<script>
+  // ── Scroll reveal (IntersectionObserver)
+  const revealEls = document.querySelectorAll('.reveal');
+  const observer = new IntersectionObserver(
+    (entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('visible');
+          observer.unobserve(entry.target);
+        }
+      });
+    },
+    { threshold: 0.12, rootMargin: '0px 0px -40px 0px' }
+  );
+  revealEls.forEach(el => observer.observe(el));
+
+  // ── FAQ accordion
+  function toggleFaq(btn) {
+    const item = btn.closest('.faq-item');
+    const body = item.querySelector('.faq-body');
+    const icon = btn.querySelector('.faq-icon');
+    const isOpen = !body.classList.contains('hidden');
+
+    // Close all
+    document.querySelectorAll('.faq-item').forEach(i => {
+      i.querySelector('.faq-body').classList.add('hidden');
+      i.querySelector('.faq-icon').style.transform = 'rotate(0deg)';
+    });
+
+    // Open clicked if was closed
+    if (!isOpen) {
+      body.classList.remove('hidden');
+      icon.style.transform = 'rotate(180deg)';
+    }
+  }
+
+  // ── Quick ticker search shortcut
+  document.querySelectorAll('.ticker-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const input = document.querySelector('input[type="text"]');
+      if (input) {
+        input.value = chip.textContent.trim();
+        input.focus();
+        // Animate search bar
+        const wrap = input.closest('.search-wrap');
+        wrap.style.borderColor = '#3b7aff';
+        wrap.style.boxShadow = '0 0 0 3px rgba(59,122,255,0.14)';
+        setTimeout(() => {
+          wrap.style.borderColor = '';
+          wrap.style.boxShadow = '';
+        }, 1200);
+      }
+    });
+  });
+
+  // ── Market table tab switcher
+  const tabBtns = document.querySelectorAll('.bezel-card button');
+</script>
+
+</body>
+</html>
