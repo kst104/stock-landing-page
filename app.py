@@ -8206,14 +8206,6 @@ input[type=date]:focus{border-color:#4f8ef7}
 .prog-bg{background:#0f1117;border-radius:999px;height:8px;overflow:hidden}
 .prog-bar{background:linear-gradient(90deg,#4f8ef7,#7b5ff7);height:100%;
            width:0%;transition:width .3s;border-radius:999px}
-.prog-bar.loading{width:34%!important;
-           background:linear-gradient(90deg,rgba(79,142,247,.15),#4f8ef7,#7b5ff7,rgba(123,95,247,.15));
-           animation:progIndeterminate 1.15s ease-in-out infinite}
-@keyframes progIndeterminate{
-  0%{transform:translateX(-120%)}
-  50%{transform:translateX(95%)}
-  100%{transform:translateX(320%)}
-}
 .prog-txt{font-size:.78rem;color:#8b8fa8;margin-top:6px}
 .summary{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
 .badge{padding:7px 16px;border-radius:8px;font-size:.85rem;font-weight:600}
@@ -8299,8 +8291,8 @@ function listenProg() {
     if(d.status==='loading'){
       setP(0, listingProgressText(d));
     } else if(d.status==='running'){
-      const pct = d.total>0 ? Math.round(d.current/d.total*100) : 0;
-      setP(pct,`분석 중... ${d.current} / ${d.total} 종목${listingDoneText(d)}`);
+      const pct = scanProgressPct(d.current, d.total);
+      setP(pct, `${scanProgressText(d.current, d.total, '분석 중')}${listingDoneText(d)}`);
     } else if(d.status==='done'){
       evtSrc.close(); setP(100,`완료!${listingDoneText(d)}`); setTimeout(loadResult,400);
     }
@@ -8328,12 +8320,24 @@ function listingDoneText(d){
   return `  |  종목조회 ${fmtSec(d.listing_elapsed)}${count}`;
 }
 
+function scanProgressPct(current,total){
+  const c = Number(current) || 0;
+  const t = Number(total) || 0;
+  return t > 0 ? Math.max(0, Math.min(100, Math.round(c / t * 100))) : 0;
+}
+
+function scanProgressText(current,total,label='스캔 중',unit='종목'){
+  const c = Number(current) || 0;
+  const t = Number(total) || 0;
+  if(t <= 0) return '조회대상 산정 중...';
+  const pct = scanProgressPct(c, t);
+  return `${label}... ${c.toLocaleString()} / ${t.toLocaleString()} ${unit} (${pct}%)`;
+}
+
 function setP(pct,txt){
   const bar = document.getElementById('progBar');
   const n = Number(pct) || 0;
-  const busy = n <= 0 && txt && !String(txt).includes('완료');
-  bar.classList.toggle('loading', busy);
-  bar.style.width = busy ? '' : Math.max(0, Math.min(100, n)) + '%';
+  bar.style.width = Math.max(0, Math.min(100, n)) + '%';
   document.getElementById('progTxt').textContent=txt;
 }
 
@@ -10263,7 +10267,7 @@ function rtPoll(){
       } else if(pst === 'running'){
         const pct = s.prog_total > 0
           ? Math.round(s.prog_current / s.prog_total * 100) : 0;
-        setP(pct, `스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 종목`);
+        setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중'));
       } else if(pst === 'done'){
         const el = s.scan_elapsed ? `  소요 ${fmtElapsed(s.scan_elapsed)}` : '';
         setP(100, `스캔 완료 ✓  ${s.result_count}개 종목 발견${el}`);
@@ -10522,7 +10526,7 @@ function rtPoll(){
       } else if(pst === 'running'){
         const pct = s.prog_total > 0
           ? Math.round(s.prog_current / s.prog_total * 100) : 0;
-        setP(pct, `스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 종목`);
+        setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중'));
       } else if(pst === 'done'){
         const el = s.scan_elapsed ? `  소요 ${fmtElapsed(s.scan_elapsed)}` : '';
         setP(100, `스캔 완료 ✓  ${s.result_count}개 종목 발견${el}`);
@@ -10756,7 +10760,7 @@ function rtPoll(){
       if(pst==='loading') setP(0,'종목 리스트 불러오는 중...');
       else if(pst==='running'){
         const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0;
-        setP(pct,`스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 종목`);
+        setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중'));
       } else if(pst==='done'){
         const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:'';
         setP(100,`스캔 완료 ✓  ${s.result_count}개 종목 발견${el}`);
@@ -10982,7 +10986,7 @@ function rtPoll(){
       if(pst==='loading') setP(0,'테마 목록 불러오는 중...');
       else if(pst==='running'){
         const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0;
-        setP(pct,`스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 테마`);
+        setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중', '테마'));
       } else if(pst==='done'){
         const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:'';
         setP(100,`스캔 완료 ✓  ${s.result_count}개 종목 발견${el}`);
@@ -11208,7 +11212,7 @@ function rtPoll(){
       if(pst==='loading') setP(0,'종목 리스트 불러오는 중...');
       else if(pst==='running'){
         const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0;
-        setP(pct,`스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 종목`);
+        setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중'));
       } else if(pst==='done'){
         const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:'';
         setP(100,`스캔 완료 ✓  ${s.result_count}개 종목 발견${el}`);
@@ -11447,7 +11451,10 @@ function rtPoll(){
       }
       const pst=s.prog_status;
       if(pst==='loading') setP(0,'KIS 거래대금 순위 조회 중...');
-      else if(pst==='running') setP(50,'전일 순위 비교 중...');
+      else if(pst==='running'){
+        const pct = scanProgressPct(s.prog_current, s.prog_total);
+        setP(pct, s.prog_total>0 ? scanProgressText(s.prog_current, s.prog_total, '전일 순위 비교 중', '단계') : '전일 순위 비교 중...');
+      }
       else if(pst==='done') setP(100,`스캔 완료 ✓  ${s.result_count}개 종목`);
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>0&&!rtLastScanTs)){
@@ -11636,7 +11643,7 @@ function rtPoll(){
       }
       const pst=s.prog_status;
       if(pst==='loading') setP(0,'종목 리스트 불러오는 중...');
-      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct,`스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 종목`); }
+      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중')); }
       else if(pst==='done'){ const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:''; setP(100,`스캔 완료 ✓  ${s.result_count}개 종목 발견${el}`); }
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>0&&!rtLastScanTs)){ rtLastScanTs=s.last_scan||'_init_'; rtLoadResult(s.new_count); }
@@ -11962,7 +11969,10 @@ function rtPoll(){
         infoEl.textContent=info;
       }
       const pst=s.prog_status;
-      if(pst==='loading'||pst==='running') setP(s.prog_total>0?Math.round(s.prog_current/s.prog_total*95):30,'스캔 중...');
+      if(pst==='loading'||pst==='running'){
+        const pct = scanProgressPct(s.prog_current, s.prog_total);
+        setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중'));
+      }
       else if(pst==='done'){ const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:''; setP(100,`완료 ✓  ${s.result_count}종목${el}`); }
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>=0&&!rtLastScanTs)){ rtLastScanTs=s.last_scan||'_init_'; rtLoadResult(s.new_count); }
@@ -12129,7 +12139,10 @@ function rtPoll(){
         infoEl.textContent=info;
       }
       const pst=s.prog_status;
-      if(pst==='loading'||pst==='running') setP(s.prog_total>0?Math.round(s.prog_current/s.prog_total*95):30,'스캔 중...');
+      if(pst==='loading'||pst==='running'){
+        const pct = scanProgressPct(s.prog_current, s.prog_total);
+        setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중'));
+      }
       else if(pst==='done'){ const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:''; setP(100,`완료 ✓  ${s.result_count}종목${el}`); }
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>=0&&!rtLastScanTs)){ rtLastScanTs=s.last_scan||'_init_'; rtLoadResult(s.new_count); }
@@ -12296,7 +12309,7 @@ function rtPoll(){
       }
       const pst=s.prog_status;
       if(pst==='loading') setP(0,'종목 리스트 불러오는 중...');
-      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct,`스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 종목`); }
+      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중')); }
       else if(pst==='done'){ const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:''; setP(100,`스캔 완료 ✓  ${s.result_count}개 종목 발견${el}`); }
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>0&&!rtLastScanTs)){ rtLastScanTs=s.last_scan||'_init_'; rtLoadResult(s.new_count); }
@@ -12457,7 +12470,7 @@ function rtPoll(){
       }
       const pst=s.prog_status;
       if(pst==='loading') setP(0,'종목 리스트 불러오는 중...');
-      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct,`스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 종목`); }
+      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중')); }
       else if(pst==='done'){ const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:''; setP(100,`스캔 완료 ✓  ${s.result_count}개 종목 발견${el}`); }
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>0&&!rtLastScanTs)){ rtLastScanTs=s.last_scan||'_init_'; rtLoadResult(s.new_count); }
@@ -12618,7 +12631,7 @@ function rtPoll(){
       }
       const pst=s.prog_status;
       if(pst==='loading') setP(0,'종목 리스트 불러오는 중...');
-      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct,`스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 종목`); }
+      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중')); }
       else if(pst==='done'){ const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:''; setP(100,`스캔 완료 ✓  TOP10 ${s.result_count}개${el}`); }
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>0&&!rtLastScanTs)){ rtLastScanTs=s.last_scan||'_init_'; rtLoadResult(s.new_count); }
@@ -12778,7 +12791,7 @@ function rtPoll(){
       }
       const pst=s.prog_status;
       if(pst==='loading') setP(0,'종목 리스트 불러오는 중...');
-      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct,`스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 종목`); }
+      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중')); }
       else if(pst==='done'){ const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:''; setP(100,`스캔 완료 ✓  ${s.result_count}개 종목 발견${el}`); }
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>0&&!rtLastScanTs)){ rtLastScanTs=s.last_scan||'_init_'; rtLoadResult(s.new_count); }
@@ -13032,7 +13045,7 @@ function rtPoll(){
       }
       const pst=s.prog_status;
       if(pst==='loading') setP(0,'종목 리스트 불러오는 중...');
-      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct,`스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 종목`); }
+      else if(pst==='running'){ const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0; setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중')); }
       else if(pst==='done'){ const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:''; setP(100,`스캔 완료 ✓  ${s.result_count}개 종목 발견${el}`); }
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>0&&!rtLastScanTs)){ rtLastScanTs=s.last_scan||'_init_'; rtLoadResult(s.new_count); }
@@ -13213,7 +13226,10 @@ function rtPoll(){
         infoEl.textContent=info;
       }
       const pst=s.prog_status;
-      if(pst==='loading'||pst==='running') setP(50,'KIS API 조회 중...');
+      if(pst==='loading'||pst==='running'){
+        const pct = scanProgressPct(s.prog_current, s.prog_total);
+        setP(pct, s.prog_total>0 ? scanProgressText(s.prog_current, s.prog_total, 'KIS 조회 중') : 'KIS API 조회 중...');
+      }
       else if(pst==='done'){ const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:''; setP(100,`조회 완료 ✓  TOP${s.result_count}${el}`); }
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>0&&!rtLastScanTs)){ rtLastScanTs=s.last_scan||'_init_'; rtLoadResult(s.new_count); }
@@ -13400,7 +13416,10 @@ function rtPoll(){
         infoEl.textContent=info;
       }
       const pst=s.prog_status;
-      if(pst==='loading'||pst==='running') setP(50,'KIS API 조회 중...');
+      if(pst==='loading'||pst==='running'){
+        const pct = scanProgressPct(s.prog_current, s.prog_total);
+        setP(pct, s.prog_total>0 ? scanProgressText(s.prog_current, s.prog_total, 'KIS 조회 중') : 'KIS API 조회 중...');
+      }
       else if(pst==='done'){ const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:''; setP(100,`조회 완료 ✓  ${s.result_count}종목${el}`); }
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>0&&!rtLastScanTs)){ rtLastScanTs=s.last_scan||'_init_'; rtLoadResult(s.new_count); }
@@ -13587,7 +13606,10 @@ function rtPoll(){
         infoEl.textContent=info;
       }
       const pst=s.prog_status;
-      if(pst==='loading'||pst==='running') setP(50,'KIS API 조회 및 분석 중...');
+      if(pst==='loading'||pst==='running'){
+        const pct = scanProgressPct(s.prog_current, s.prog_total);
+        setP(pct, s.prog_total>0 ? scanProgressText(s.prog_current, s.prog_total, 'KIS 분석 중') : 'KIS API 조회 및 분석 중...');
+      }
       else if(pst==='done'){ const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:''; setP(100,`분석 완료 ✓  TOP${s.result_count}종목${el}`); }
       const justDone=(pst==='done')&&s.last_scan&&(s.last_scan!==rtLastScanTs);
       if(justDone||(pst==='done'&&s.result_count>0&&!rtLastScanTs)){ rtLastScanTs=s.last_scan||'_init_'; rtLoadResult(s.new_count); }
@@ -13762,7 +13784,7 @@ function rtPoll(){
       if(pst==='loading') setP(0,'종목 리스트 불러오는 중...');
       else if(pst==='running'){
         const pct=s.prog_total>0?Math.round(s.prog_current/s.prog_total*100):0;
-        setP(pct,`스캔 중... ${s.prog_current.toLocaleString()} / ${s.prog_total.toLocaleString()} 종목`);
+        setP(pct, scanProgressText(s.prog_current, s.prog_total, '스캔 중'));
       } else if(pst==='done'){
         const el=s.scan_elapsed?`  소요 ${fmtElapsed(s.scan_elapsed)}`:'';
         setP(100,`스캔 완료 ✓  ${s.result_count}개 종목 발견${el}`);
