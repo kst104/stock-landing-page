@@ -8206,6 +8206,14 @@ input[type=date]:focus{border-color:#4f8ef7}
 .prog-bg{background:#0f1117;border-radius:999px;height:8px;overflow:hidden}
 .prog-bar{background:linear-gradient(90deg,#4f8ef7,#7b5ff7);height:100%;
            width:0%;transition:width .3s;border-radius:999px}
+.prog-bar.loading{width:34%!important;
+           background:linear-gradient(90deg,rgba(79,142,247,.15),#4f8ef7,#7b5ff7,rgba(123,95,247,.15));
+           animation:progIndeterminate 1.15s ease-in-out infinite}
+@keyframes progIndeterminate{
+  0%{transform:translateX(-120%)}
+  50%{transform:translateX(95%)}
+  100%{transform:translateX(320%)}
+}
 .prog-txt{font-size:.78rem;color:#8b8fa8;margin-top:6px}
 .summary{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
 .badge{padding:7px 16px;border-radius:8px;font-size:.85rem;font-weight:600}
@@ -8321,7 +8329,11 @@ function listingDoneText(d){
 }
 
 function setP(pct,txt){
-  document.getElementById('progBar').style.width=pct+'%';
+  const bar = document.getElementById('progBar');
+  const n = Number(pct) || 0;
+  const busy = n <= 0 && txt && !String(txt).includes('완료');
+  bar.classList.toggle('loading', busy);
+  bar.style.width = busy ? '' : Math.max(0, Math.min(100, n)) + '%';
   document.getElementById('progTxt').textContent=txt;
 }
 
