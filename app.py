@@ -8206,6 +8206,14 @@ input[type=date]:focus{border-color:#4f8ef7}
 .prog-bg{background:#0f1117;border-radius:999px;height:8px;overflow:hidden}
 .prog-bar{background:linear-gradient(90deg,#4f8ef7,#7b5ff7);height:100%;
            width:0%;transition:width .3s;border-radius:999px}
+.prog-bar.loading{width:16%!important;
+           background:linear-gradient(90deg,rgba(79,142,247,.12),#4f8ef7,#7b5ff7,rgba(123,95,247,.12));
+           animation:progLoading 1.05s ease-in-out infinite}
+@keyframes progLoading{
+  0%{transform:translateX(-120%)}
+  55%{transform:translateX(260%)}
+  100%{transform:translateX(260%)}
+}
 .prog-txt{font-size:.78rem;color:#8b8fa8;margin-top:6px}
 .summary{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px}
 .badge{padding:7px 16px;border-radius:8px;font-size:.85rem;font-weight:600}
@@ -8289,7 +8297,12 @@ function listenProg() {
   evtSrc.onmessage = e => {
     const d = JSON.parse(e.data);
     if(d.status==='loading'){
-      setP(0, listingProgressText(d));
+      if(Number(d.total)>0){
+        const pct = scanProgressPct(d.current, d.total);
+        setP(pct, `${scanProgressText(d.current, d.total, '조회대상 준비 중')}${listingDoneText(d)}`);
+      } else {
+        setP(0, listingProgressText(d));
+      }
     } else if(d.status==='running'){
       const pct = scanProgressPct(d.current, d.total);
       setP(pct, `${scanProgressText(d.current, d.total, '분석 중')}${listingDoneText(d)}`);
@@ -8323,7 +8336,10 @@ function listingDoneText(d){
 function scanProgressPct(current,total){
   const c = Number(current) || 0;
   const t = Number(total) || 0;
-  return t > 0 ? Math.max(0, Math.min(100, Math.round(c / t * 100))) : 0;
+  if(t <= 0) return 0;
+  if(c <= 0) return 0;
+  if(c >= t) return 100;
+  return Math.max(1, Math.min(99, Math.round(c / t * 100)));
 }
 
 function scanProgressText(current,total,label='스캔 중',unit='종목'){
@@ -8337,7 +8353,10 @@ function scanProgressText(current,total,label='스캔 중',unit='종목'){
 function setP(pct,txt){
   const bar = document.getElementById('progBar');
   const n = Number(pct) || 0;
-  bar.style.width = Math.max(0, Math.min(100, n)) + '%';
+  const clamped = Math.max(0, Math.min(100, n));
+  const waiting = clamped <= 0 && String(txt || '').trim().length > 0;
+  bar.classList.toggle('loading', waiting);
+  bar.style.width = waiting ? '16%' : clamped + '%';
   document.getElementById('progTxt').textContent=txt;
 }
 
