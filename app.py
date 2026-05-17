@@ -1336,6 +1336,12 @@ SCREENERS = {
         "color":  "#e11d48",
         "icon":   "🔥",
     },
+    48: {
+        "title":  "칼만트렌드라인",
+        "desc":   "시총 3,000억↑ · ETF/ETN 제외 · Short Kalman(50) / Long Kalman(150) 교차 및 추세 상태 검색",
+        "color":  "#14b8a6",
+        "icon":   "📈",
+    },
 }
 
 
@@ -5360,6 +5366,129 @@ def run_screen47(date_str, prog):
     return df
 
 
+# 조건48: 칼만트렌드라인 — 시총 3,000억↑, Short Kalman(50) / Long Kalman(150)
+_S48_MIN_CAP = 300_000_000_000
+_S48_SHORT_LEN = 50
+_S48_LONG_LEN = 150
+
+
+def _kalman_filter_series(close: pd.Series, length: int,
+                          r: float = 0.01, q: float = 0.1) -> pd.Series:
+    error_est = 1.0
+    error_meas = r * length
+    estimate = np.nan
+    vals = []
+    close_vals = close.astype(float).to_numpy()
+
+    for i, price in enumerate(close_vals):
+        if np.isnan(price):
+            vals.append(np.nan)
+            continue
+        if np.isnan(estimate):
+            estimate = close_vals[i - 1] if i > 0 and not np.isnan(close_vals[i - 1]) else price
+        prediction = estimate
+        kalman_gain = error_est / (error_est + error_meas)
+        estimate = prediction + kalman_gain * (price - prediction)
+        error_est = (1 - kalman_gain) * error_est + q / length
+        vals.append(estimate)
+
+    return pd.Series(vals, index=close.index)
+
+
+def _screen48_ticker(code, start, end):
+    try:
+        find_mode = int(_state[48].get("find_mode", 0))
+        df = fetch_ohlcv(code, start, end)
+        if df is None or len(df) < _S48_LONG_LEN + 5:
+            return None
+        df = df.copy().dropna(subset=["Open", "High", "Low", "Close"])
+        if len(df) < _S48_LONG_LEN + 5:
+            return None
+
+        op = df["Open"].astype(float)
+        cl = df["Close"].astype(float)
+        short_k = _kalman_filter_series(cl, _S48_SHORT_LEN)
+        long_k = _kalman_filter_series(cl, _S48_LONG_LEN)
+        if pd.isna(short_k.iloc[-1]) or pd.isna(long_k.iloc[-1]):
+            return None
+
+        cross_up = short_k.iloc[-2] <= long_k.iloc[-2] and short_k.iloc[-1] > long_k.iloc[-1]
+        cross_down = short_k.iloc[-2] >= long_k.iloc[-2] and short_k.iloc[-1] < long_k.iloc[-1]
+        trend_up = bool(short_k.iloc[-1] > long_k.iloc[-1])
+        candle_up = bool(cl.iloc[-1] > op.iloc[-1])
+
+        if find_mode == 0:
+            ok = cross_up and candle_up
+            signal = "골든크로스"
+        elif find_mode == 1:
+            ok = cross_down
+            signal = "데드크로스"
+        elif find_mode == 2:
+            ok = cross_up or cross_down
+            signal = "골든크로스" if cross_up else "데드크로스"
+        elif find_mode == 3:
+            ok = trend_up
+            signal = "상승추세"
+        elif find_mode == 4:
+            ok = not trend_up
+            signal = "하락추세"
+        else:
+            ok = cross_up and candle_up
+            signal = "골든크로스"
+
+        if not ok:
+            return None
+
+        prev_close = float(cl.iloc[-2]) if len(cl) >= 2 else float(cl.iloc[-1])
+        day_chg = (float(cl.iloc[-1]) / prev_close - 1) * 100 if prev_close > 0 else 0.0
+        gap = (float(short_k.iloc[-1]) / float(long_k.iloc[-1]) - 1) * 100 if long_k.iloc[-1] else 0.0
+        slope = float(short_k.iloc[-1] - short_k.iloc[-3]) if len(short_k) >= 3 else 0.0
+
+        return {
+            "종목코드": code,
+            "종가": int(cl.iloc[-1]),
+            "전일대비(%)": round(day_chg, 2),
+            "신호": signal,
+            "추세": "상승" if trend_up else "하락",
+            "양봉": "Y" if candle_up else "N",
+            "ShortKalman": round(float(short_k.iloc[-1]), 2),
+            "LongKalman": round(float(long_k.iloc[-1]), 2),
+            "이격(%)": round(gap, 2),
+            "Short기울기": round(slope, 2),
+        }
+    except Exception:
+        return None
+
+
+def run_screen48(date_str, prog):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    end = date_str
+    start = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
+    listing = _get_listing_with_progress(prog)
+    valid = listing[
+        (listing["Marcap"] >= _S48_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False))
+    ].copy()
+    prog["total"] = len(valid)
+    prog["status"] = "running"
+    rows = _run_screen_parallel(valid, _screen48_ticker, start, end, prog)
+    t_end = datetime.now()
+    elapsed = int((t_end - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+            "신호", "추세", "양봉", "ShortKalman", "LongKalman", "이격(%)", "Short기울기"]]
+          .sort_values(["신호", "이격(%)"], ascending=[True, False])
+          .reset_index(drop=True))
+    df["검색시각"] = t_end.strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
 _rt46_scan_no      = 0
 _rt46_scan_start   = ""
 _rt46_last_scan    = ""
@@ -7945,7 +8074,7 @@ RUNNER = {1: run_screen1,  2: run_screen2,  3: run_screen3,
           37: run_screen37, 38: run_screen38, 39: run_screen39,
           40: run_screen40, 41: run_screen41, 42: run_screen42,
           43: run_screen43, 44: run_screen44, 45: run_screen45,
-          46: run_screen46, 47: run_screen47}
+          46: run_screen46, 47: run_screen47, 48: run_screen48}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -11639,6 +11768,44 @@ function startScan(){
 """
 
 
+_S48_EXTRA_SECTION = """
+<div style="margin-top:14px">
+  <label style="font-size:.82rem;color:#8b8fa8;display:block;margin-bottom:6px">검색 모드 (FindMode)</label>
+  <select id="findModeSelect"
+    style="background:#13161f;border:1px solid #2a2d3a;border-radius:6px;color:#e0e0e0;
+           padding:9px 14px;font-size:.86rem;outline:none;max-width:520px;width:100%">
+    <option value="0">Mode 0 - 골든크로스 + 양봉</option>
+    <option value="1">Mode 1 - 데드크로스</option>
+    <option value="2">Mode 2 - 골든/데드 양방향</option>
+    <option value="3">Mode 3 - 현재 상승 추세</option>
+    <option value="4">Mode 4 - 현재 하락 추세</option>
+  </select>
+  <div style="margin-top:8px;font-size:.76rem;color:#4a4d5e">
+    Short Kalman=50 · Long Kalman=150 · 기본값은 골든크로스 + 양봉입니다.
+  </div>
+</div>
+"""
+
+_S48_EXTRA_JS = r"""
+/* ── 조건48 칼만트렌드라인: FindMode 파라미터 포함하여 스크리닝 시작 ── */
+function startScan(){
+  const d = document.getElementById('dateInput').value.replace(/-/g,'');
+  if(!d) return;
+  const fm = document.getElementById('findModeSelect').value;
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('dlBtn').classList.add('hidden');
+  document.getElementById('resultCard').classList.add('hidden');
+  document.getElementById('progWrap').style.display = 'block';
+  document.getElementById('msg').textContent = '';
+  setP(0,'종목 리스트 조회 중...');
+  fetch(`/api/${SID}/start?date=${d}&find_mode=${fm}`).then(r=>r.json()).then(r=>{
+    if(r.error){showMsg(r.error);resetBtn();return;}
+    listenProg();
+  });
+}
+"""
+
+
 # ── 조건44 Market shift levels: FindMode + 실시간 스캔 + 이메일 통합 UI ──────
 _RT44_EXTRA_SECTION = """
 <div style="margin-top:14px">
@@ -13717,6 +13884,7 @@ def screener_page(sid):
                      _RT40_EXTRA_SECTION if sid == 40 else
                      _RT41_EXTRA_SECTION if sid == 41 else
                      _RT42_EXTRA_SECTION if sid == 42 else
+                     _S48_EXTRA_SECTION  if sid == 48 else
                      _S16_EXTRA_SECTION  if sid == 16 else "")
     extra_js      = (_RT14_EXTRA_JS      if sid == 14 else
                      _RT19_EXTRA_JS      if sid == 19 else
@@ -13739,6 +13907,7 @@ def screener_page(sid):
                      _RT40_EXTRA_JS      if sid == 40 else
                      _RT41_EXTRA_JS      if sid == 41 else
                      _RT42_EXTRA_JS      if sid == 42 else
+                     _S48_EXTRA_JS       if sid == 48 else
                      _S16_EXTRA_JS       if sid == 16 else "")
     html = (SCREENER_HTML
             .replace("{{TITLE}}",          info["title"])
@@ -13936,6 +14105,28 @@ def api_s43_start():
 
     st["progress"] = {"current": 0, "total": 0, "status": "loading"}
     st["worker"]   = threading.Thread(target=_run, daemon=True)
+    st["worker"].start()
+    return jsonify({"ok": True})
+
+
+# ── 조건48 전용 start 라우트 (find_mode 파라미터 처리) ──────────────────────
+@app.route("/api/48/start")
+def api_s48_start():
+    st = _state[48]
+    date_str = request.args.get("date", datetime.now().strftime("%Y%m%d"))
+    find_mode = int(request.args.get("find_mode", 0))
+    st["find_mode"] = find_mode
+
+    def _run():
+        try:
+            st["result_df"] = RUNNER[48](date_str, st["progress"])
+            st["result_date"] = date_str
+        except Exception as e:
+            print(f"[ERROR sid=48] {e}")
+            st["progress"]["status"] = "done"
+
+    st["progress"] = {"current": 0, "total": 0, "status": "loading"}
+    st["worker"] = threading.Thread(target=_run, daemon=True)
     st["worker"].start()
     return jsonify({"ok": True})
 
