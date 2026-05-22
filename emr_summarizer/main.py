@@ -443,19 +443,30 @@ class App(tk.Tk):
         def _analyze():
             try:
                 auto_navigate.activate_window(hwnd)
-                screenshot = auto_navigate.capture_window(hwnd)
 
-                self.after(0, lambda: self._status("탭 위치 분석 중..."))
+                # 1단계: EMR/챠트 버튼 클릭 → 새 창 열기 시도
+                self.after(0, lambda: self._status("EMR 챠트 창 열기 시도 중..."))
+                chart_hwnd = auto_navigate.open_emr_and_get_hwnd(hwnd)
+                if chart_hwnd:
+                    target_hwnd = chart_hwnd
+                    self.after(0, lambda: self._status("챠트 창 발견 — 탭 분석 중..."))
+                    time.sleep(1.0)
+                else:
+                    target_hwnd = hwnd
+                    self.after(0, lambda: self._status("탭 위치 분석 중..."))
 
+                screenshot = auto_navigate.capture_window(target_hwnd)
+
+                # 2단계: 탭 목록 파악
                 tabs, method = auto_navigate.identify_tabs(
-                    hwnd,
+                    target_hwnd,
                     screenshot,
                     api_key=self._settings["claude_api_key"],
                     model=self._settings.get("claude_model", "claude-sonnet-4-6"),
                 )
 
                 if method == "fallback":
-                    # 탭을 찾지 못했지만 현재 화면으로 요약 진행
+                    # 탭 미발견 — 현재 화면 그대로 요약
                     self.after(0, lambda s=screenshot: (
                         self._captures.append(("현재 화면", s)),
                         self._refresh_gallery(),
@@ -465,7 +476,8 @@ class App(tk.Tk):
                     ))
                     return
 
-                self.after(0, lambda t=tabs, h=hwnd, m=method: self._confirm_and_collect(t, h, m))
+                self.after(0, lambda t=tabs, h=target_hwnd, m=method:
+                           self._confirm_and_collect(t, h, m))
 
             except Exception as e:
                 self.after(0, lambda err=e: (

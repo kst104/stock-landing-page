@@ -1,15 +1,17 @@
 """
 NGTMediPlus 창 자동 탐색 및 화면 수집 (pywin32 기반)
 
-탭 탐색 우선순위:
-  1. Windows 자식 컨트롤 열거 (가장 정확 — Delphi/WinForms 앱에 효과적)
+캡처: PrintWindow(PW_RENDERFULLCONTENT) → ImageGrab 폴백
+탭 탐색:
+  1. Windows 자식 컨트롤 열거 (Delphi/WinForms 앱에 효과적)
   2. Claude Vision 분석 (폴백)
-  3. 두 방법 모두 실패 시 → 현재 화면 그대로 반환
+  3. 두 방법 모두 실패 → 현재 화면 그대로
 """
 
 from __future__ import annotations
 
 import base64
+import ctypes
 import io
 import json
 import time
@@ -18,9 +20,11 @@ import anthropic
 import pyautogui
 import win32con
 import win32gui
+import win32ui
 from PIL import Image, ImageGrab
 
 _NGT_KEYWORDS = ["neomed", "ngt", "전자챠트", "전자차트", "emr", "차트", "medit"]
+_EMR_BUTTON_KEYWORDS = ["emr", "전자챠트", "전자차트", "챠트", "차트", "의무기록"]
 _WAIT_AFTER_CLICK = 2.0
 
 
@@ -67,11 +71,47 @@ def activate_window(hwnd: int):
 
 
 def capture_window(hwnd: int) -> Image.Image:
-    rect = win32gui.GetWindowRect(hwnd)
-    return ImageGrab.grab(bbox=rect)
+    """
+    PrintWindow(PW_RENDERFULLCONTENT=2)로 캡처.
+    하드웨어 가속/DRM 창의 검은 화면 문제 해결.
+    실패 시 ImageGrab 폴백.
+    """
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        w, h = right - left, bottom - top
+        if w <= 0 or h <= 0:
+            raise ValueError("zero-size window")
+
+        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        mfc_dc  = win32ui.CreateDCFromHandle(hwnd_dc)
+        save_dc = mfc_dc.CreateCompatibleDC()
+        bmp     = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(mfc_dc, w, h)
+        save_dc.SelectObject(bmp)
+
+        # PW_RENDERFULLCONTENT = 2 : 하드웨어 가속 창도 캡처 가능
+        ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
+
+        info = bmp.GetInfo()
+        bits = bmp.GetBitmapBits(True)
+        img  = Image.frombuffer(
+            "RGB",
+            (info["bmWidth"], info["bmHeight"]),
+            bits, "raw", "BGRX", 0, 1,
+        )
+
+        win32gui.DeleteObject(bmp.GetHandle())
+        save_dc.DeleteDC()
+        mfc_dc.DeleteDC()
+        win32gui.ReleaseDC(hwnd, hwnd_dc)
+        return img
+
+    except Exception:
+        rect = win32gui.GetWindowRect(hwnd)
+        return ImageGrab.grab(bbox=rect)
 
 
-# ── 방법 1: Windows 자식 컨트롤 열거 ─────────────────────────────────────────
+# ── EMR 버튼 클릭 → 챠트 창 열기 ─────────────────────────────────────────────
 
 # Delphi / WinForms / 일반 Win32 탭·버튼 클래스명
 _TAB_CLASSES = {
@@ -122,7 +162,6 @@ def find_tabs_by_enum(hwnd: int) -> list[dict]:
     except Exception:
         pass
 
-    # 중복 제거 (같은 이름)
     seen, unique = set(), []
     for c in controls:
         if c["name"] not in seen:
@@ -131,7 +170,47 @@ def find_tabs_by_enum(hwnd: int) -> list[dict]:
     return unique
 
 
-# ── 방법 2: Claude Vision 분석 ────────────────────────────────────────────────
+def find_emr_button(hwnd: int) -> dict | None:
+    """메인 창에서 EMR/챠트 열기 버튼 찾기"""
+    for tab in find_tabs_by_enum(hwnd):
+        if any(kw in tab["name"].lower() for kw in _EMR_BUTTON_KEYWORDS):
+            return tab
+    return None
+
+
+def open_emr_and_get_hwnd(hwnd: int, timeout: float = 6.0) -> int | None:
+    """
+    EMR 버튼 클릭 후 새로 생긴 창의 hwnd 반환.
+    새 창이 열리지 않으면 None.
+    """
+    btn = find_emr_button(hwnd)
+    if not btn:
+        return None
+
+    rect = win32gui.GetWindowRect(hwnd)
+    ox, oy = rect[0], rect[1]
+    w = rect[2] - ox
+    h = rect[3] - oy
+    abs_x = int(ox + btn["x_ratio"] * w)
+    abs_y = int(oy + btn["y_ratio"] * h)
+
+    before = {h for h, _ in _enum_windows()}
+
+    activate_window(hwnd)
+    pyautogui.click(abs_x, abs_y)
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.4)
+        after = {h for h, _ in _enum_windows()}
+        new_hwnds = after - before
+        if new_hwnds:
+            return next(iter(new_hwnds))
+
+    return None
+
+
+# ── Claude Vision 분석 ────────────────────────────────────────────────────────
 
 def find_tabs_by_vision(screenshot: Image.Image,
                         api_key: str, model: str) -> list[dict]:
@@ -184,17 +263,14 @@ def identify_tabs(hwnd: int, screenshot: Image.Image,
     반환: (tabs, method)
       method: "enum" | "vision" | "fallback"
     """
-    # 1. Windows 컨트롤 열거
     tabs = find_tabs_by_enum(hwnd)
     if tabs:
         return tabs, "enum"
 
-    # 2. Claude Vision
     tabs = find_tabs_by_vision(screenshot, api_key, model)
     if tabs:
         return tabs, "vision"
 
-    # 3. 폴백: 현재 화면 그대로
     return [], "fallback"
 
 
