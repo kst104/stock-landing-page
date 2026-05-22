@@ -619,11 +619,15 @@ class App(tk.Tk):
                     self._on_collected_noduplicate(results),
                 ))
             except Exception as e:
-                self.after(0, lambda err=e: (
+                import traceback as _tb
+                detail = _tb.format_exc()
+                self.after(0, lambda err=e, d=detail: (
                     prog_dlg.destroy(),
                     self.deiconify(),
                     self._status(f"수집 오류: {err}"),
-                    messagebox.showerror("수집 오류", str(err)),
+                    messagebox.showerror(
+                        "수집 오류 상세",
+                        f"{err}\n\n── 상세 ──\n{d[-800:]}"),
                     self._enable_auto_btn(),
                     self._add_btn.config(state="normal"),
                 ))
