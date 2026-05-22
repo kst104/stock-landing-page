@@ -201,6 +201,77 @@ class TabConfirmDialog(tk.Toplevel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 수집 진행 다이얼로그
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CollectProgressDialog(tk.Toplevel):
+    THUMB_W, THUMB_H = 320, 200
+
+    def __init__(self, parent, total: int):
+        super().__init__(parent)
+        self.title("자동 수집 진행 중")
+        self.geometry("400x380")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", lambda: None)  # 닫기 버튼 비활성
+        self._total = total
+        self._photo = None
+        self._build()
+
+    def _build(self):
+        ttk.Label(self, text="EMR 화면 자동 수집 중입니다...",
+                  font=("맑은 고딕", 10, "bold")).pack(pady=(14, 4))
+
+        # 프로그레스 바
+        bar_frame = ttk.Frame(self)
+        bar_frame.pack(fill="x", padx=20, pady=4)
+        self._pbar = ttk.Progressbar(bar_frame, maximum=self._total,
+                                     mode="determinate", length=340)
+        self._pbar.pack(side="left")
+
+        self._count_var = tk.StringVar(value=f"0 / {self._total}")
+        ttk.Label(bar_frame, textvariable=self._count_var,
+                  width=8).pack(side="left", padx=6)
+
+        # 현재 항목명
+        self._item_var = tk.StringVar(value="준비 중...")
+        ttk.Label(self, textvariable=self._item_var,
+                  font=("맑은 고딕", 9), foreground="#1d4ed8",
+                  wraplength=360).pack(pady=(2, 8))
+
+        # 캡처 미리보기
+        preview_frame = ttk.LabelFrame(self, text="최근 캡처 화면")
+        preview_frame.pack(padx=16, fill="x")
+        self._preview_lbl = ttk.Label(preview_frame,
+                                      text="(캡처 대기 중)",
+                                      foreground="gray",
+                                      font=("맑은 고딕", 9))
+        self._preview_lbl.pack(padx=8, pady=8)
+
+        # 상태 텍스트
+        self._status_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._status_var,
+                  foreground="gray", font=("맑은 고딕", 8),
+                  wraplength=360).pack(pady=4)
+
+    def update_item(self, idx: int, name: str, img: Image.Image):
+        """캡처 완료 시 UI 갱신 (메인 스레드에서 호출)"""
+        self._pbar["value"] = idx
+        self._count_var.set(f"{idx} / {self._total}")
+        self._item_var.set(f"완료: {name}")
+        self._status_var.set(f"다음 항목 이동 중...")
+
+        # 썸네일 갱신
+        thumb = img.copy()
+        thumb.thumbnail((self.THUMB_W, self.THUMB_H))
+        self._photo = ImageTk.PhotoImage(thumb)
+        self._preview_lbl.config(image=self._photo, text="")
+
+    def set_status(self, msg: str):
+        self._status_var.set(msg)
+        self._item_var.set(msg)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 썸네일 카드
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -511,21 +582,41 @@ class App(tk.Tk):
         self._auto_btn.config(state="disabled")
         self._add_btn.config(state="disabled")
 
+        # 진행 다이얼로그 생성
+        prog_dlg = CollectProgressDialog(self, total=len(items))
+
+        def _on_item(idx, total, name, img):
+            self.after(0, lambda i=idx, n=name, im=img:
+                       prog_dlg.update_item(i, n, im))
+            # 갤러리에도 실시간 추가
+            self.after(0, lambda n=name, im=img: (
+                self._captures.append((n, im)),
+                self._refresh_gallery(),
+            ))
+
         def _run():
             try:
-                self.after(0, self.iconify)   # 수집 중 앱 최소화
+                self.after(0, self.iconify)
                 import time as _t; _t.sleep(0.5)
 
                 results = auto_navigate.collect_menu_items(
                     hwnd, items,
-                    status_cb=lambda m: self.after(0, lambda msg=m: self._status(msg)))
+                    status_cb=lambda m: self.after(
+                        0, lambda msg=m: (
+                            self._status(msg),
+                            prog_dlg.set_status(msg),
+                        )),
+                    item_cb=_on_item,
+                )
 
-                self.after(0, lambda r=results: (
+                self.after(0, lambda: (
+                    prog_dlg.destroy(),
                     self.deiconify(),
-                    self._on_collected(r),
+                    self._on_collected_noduplicate(results),
                 ))
             except Exception as e:
                 self.after(0, lambda err=e: (
+                    prog_dlg.destroy(),
                     self.deiconify(),
                     self._status(f"수집 오류: {err}"),
                     messagebox.showerror("수집 오류", str(err)),
@@ -540,8 +631,15 @@ class App(tk.Tk):
         self._refresh_gallery()
         self._auto_btn.config(state="normal")
         self._add_btn.config(state="normal")
-        self._status(f"자동 수집 완료 ({len(results)}개 탭) — [요약] 버튼을 클릭하세요.")
-        # 바로 요약 시작
+        self._status(f"자동 수집 완료 ({len(results)}개) — [요약] 버튼을 클릭하세요.")
+        self._run_summary()
+
+    def _on_collected_noduplicate(self, results: list[tuple[str, Image.Image]]):
+        """_do_collect에서 실시간으로 이미 _captures에 추가됐으므로 중복 방지"""
+        self._auto_btn.config(state="normal")
+        self._add_btn.config(state="normal")
+        self._refresh_gallery()
+        self._status(f"자동 수집 완료 ({len(results)}개) — AI 요약 시작 중...")
         self._run_summary()
 
     # ── 수동 캡처 ─────────────────────────────────────────────────────────────

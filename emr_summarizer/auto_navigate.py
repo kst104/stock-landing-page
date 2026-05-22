@@ -153,13 +153,16 @@ def collect_menu_items(
     hwnd: int,
     items: list[dict],
     status_cb=None,
+    item_cb=None,
 ) -> list[tuple[str, Image.Image]]:
     """
     메뉴 항목 목록을 순서대로 클릭하며 전체화면 캡처.
-    Vision이 반환한 x_ratio/y_ratio는 전체 화면 기준이므로
-    클릭 좌표 = 화면 크기 × ratio.
+
+    status_cb(msg)           — 상태 문자열 콜백
+    item_cb(idx, total, name, img) — 항목 캡처 완료 콜백 (미리보기용)
     """
-    sw, sh = pyautogui.size()   # 전체 화면 크기
+    sw, sh = pyautogui.size()
+    total  = len(items)
 
     results = []
     for i, item in enumerate(items):
@@ -168,7 +171,7 @@ def collect_menu_items(
         abs_y = int(item["y_ratio"] * sh)
 
         if status_cb:
-            status_cb(f"[{i+1}/{len(items)}] {name} 캡처 중...")
+            status_cb(f"[{i+1}/{total}] {name} 캡처 중...")
 
         activate_window(hwnd)
         pyautogui.click(abs_x, abs_y)
@@ -176,6 +179,9 @@ def collect_menu_items(
 
         img = capture_screen(hwnd)
         results.append((name, img))
+
+        if item_cb:
+            item_cb(i + 1, total, name, img)
 
     return results
 
