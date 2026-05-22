@@ -144,14 +144,18 @@ def _send_input_click(x: int, y: int, double: bool = False):
 def _safe_click(x: int, y: int, double: bool = False):
     """
     pyautogui 우선 클릭, 실패 시 ctypes.SendInput 폴백.
+    마우스를 먼저 해당 위치로 이동 (시각적 확인 가능).
     좌표가 화면 밖이면 건너뜀.
     """
     sw = ctypes.windll.user32.GetSystemMetrics(0)
     sh = ctypes.windll.user32.GetSystemMetrics(1)
     if not (0 <= x < sw and 0 <= y < sh):
-        return  # 화면 밖 좌표 무시
+        return
 
     try:
+        # 마우스 이동 후 클릭 (어디를 클릭하는지 눈으로 확인 가능)
+        pyautogui.moveTo(x, y, duration=0.4)
+        time.sleep(0.1)
         if double:
             pyautogui.doubleClick(x, y)
         else:

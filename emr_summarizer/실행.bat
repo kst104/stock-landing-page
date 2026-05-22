@@ -1,6 +1,17 @@
 @echo off
+chcp 65001 > nul
+
+:: ── 관리자 권한 확인 ──────────────────────────────────────────
+net session >nul 2>&1
+if %errorLevel% neq 0 (
+    echo 관리자 권한이 필요합니다. UAC 창에서 [예]를 클릭하세요...
+    powershell -Command "Start-Process '%~f0' -Verb RunAs -WorkingDirectory '%~dp0'"
+    exit /b
+)
+
+:: ── 이미 관리자로 실행 중 ─────────────────────────────────────
 echo ================================================
-echo  NGTMediPlus EMR 자동 요약
+echo  NGTMediPlus EMR 자동 요약  [관리자 권한]
 echo ================================================
 echo.
 
