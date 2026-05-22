@@ -330,14 +330,31 @@ class App(tk.Tk):
 
     def _connect_db(self):
         self._status("DB 연결 중...")
-        ok, msg = db.connect(self._settings)
-        if ok:
-            self._db_status_var.set("● DB 연결됨")
-            self._db_status_lbl.config(foreground="#16a34a")
-        else:
-            self._db_status_var.set("● DB 미연결")
-            self._db_status_lbl.config(foreground="#dc2626")
-        self._status(msg)
+        self.update_idletasks()
+
+        def _run():
+            ok, msg = db.connect(self._settings)
+            def _done():
+                if ok:
+                    self._db_status_var.set("● DB 연결됨")
+                    self._db_status_lbl.config(foreground="#16a34a")
+                    self._status(msg)
+                else:
+                    self._db_status_var.set("● DB 미연결")
+                    self._db_status_lbl.config(foreground="#dc2626")
+                    self._status(f"연결 실패: {msg}")
+                    messagebox.showerror(
+                        "DB 연결 실패",
+                        f"{msg}\n\n"
+                        "확인사항:\n"
+                        "1. [설정]에서 서버 주소/DB명/비밀번호가 맞는지 확인\n"
+                        "2. SQL Server가 실행 중인지 확인\n"
+                        "3. SQL Server 인증 모드가 활성화됐는지 확인\n"
+                        "4. ODBC Driver 17 for SQL Server 설치 여부 확인"
+                    )
+            self.after(0, _done)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _disconnect_db(self):
         db.disconnect()
