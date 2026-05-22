@@ -772,6 +772,29 @@ class App(tk.Tk):
         self._set_result("")
 
 
+def _check_admin():
+    """관리자 권한 없으면 경고 (클릭이 안 될 수 있음)"""
+    import ctypes as _ct
+    try:
+        if not _ct.windll.shell32.IsUserAnAdmin():
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            _root = _tk.Tk(); _root.withdraw()
+            _mb.showwarning(
+                "관리자 권한 필요",
+                "현재 일반 권한으로 실행 중입니다.\n\n"
+                "NGTMediPlus가 관리자 권한으로 실행 중이면\n"
+                "자동 클릭이 차단될 수 있습니다.\n\n"
+                "해결: C:\\emr\\emr_summarizer\\실행.bat 으로 실행하세요.\n"
+                "(UAC 창에서 [예] 클릭 필요)",
+                parent=_root,
+            )
+            _root.destroy()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    _check_admin()
     app = App()
     app.mainloop()

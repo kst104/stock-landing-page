@@ -143,25 +143,64 @@ def _send_input_click(x: int, y: int, double: bool = False):
 
 def _safe_click(x: int, y: int, double: bool = False):
     """
-    pyautogui 우선 클릭, 실패 시 ctypes.SendInput 폴백.
-    마우스를 먼저 해당 위치로 이동 (시각적 확인 가능).
-    좌표가 화면 밖이면 건너뜀.
+    마우스를 target 위치로 이동 후 클릭.
+    1) SetCursorPos로 이동
+    2) mouse_event (구형 API, UIPI 우회 가능성 있음)
+    3) SendInput 폴백
+    클릭 후 Enter 키도 전송 (트리뷰/리스트 선택 항목 활성화).
     """
     sw = ctypes.windll.user32.GetSystemMetrics(0)
     sh = ctypes.windll.user32.GetSystemMetrics(1)
     if not (0 <= x < sw and 0 <= y < sh):
         return
 
+    # 마우스 이동 (시각 확인용)
+    ctypes.windll.user32.SetCursorPos(x, y)
+    time.sleep(0.4)
+
+    clicked = False
+
+    # 방법 1: pyautogui (관리자 권한 시 정상 동작)
     try:
-        # 마우스 이동 후 클릭 (어디를 클릭하는지 눈으로 확인 가능)
-        pyautogui.moveTo(x, y, duration=0.4)
-        time.sleep(0.1)
+        pyautogui.click(x, y)
         if double:
-            pyautogui.doubleClick(x, y)
-        else:
+            time.sleep(0.12)
             pyautogui.click(x, y)
+        clicked = True
     except Exception:
+        pass
+
+    if not clicked:
+        # 방법 2: mouse_event (구형 API, 일부 환경에서 UIPI 우회)
+        try:
+            MOUSEEVENTF_LEFTDOWN = 0x0002
+            MOUSEEVENTF_LEFTUP   = 0x0004
+            ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, x, y, 0, 0)
+            time.sleep(0.05)
+            ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, x, y, 0, 0)
+            if double:
+                time.sleep(0.12)
+                ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, x, y, 0, 0)
+                time.sleep(0.05)
+                ctypes.windll.user32.mouse_event(MOUSEEVENTF_LEFTUP, x, y, 0, 0)
+            clicked = True
+        except Exception:
+            pass
+
+    if not clicked:
+        # 방법 3: SendInput
         _send_input_click(x, y, double=double)
+
+    # 클릭 후 Enter 키 — 트리뷰/리스트 항목 활성화
+    time.sleep(0.1)
+    try:
+        pyautogui.press("enter")
+    except Exception:
+        KEYEVENTF_KEYUP = 0x0002
+        VK_RETURN = 0x0D
+        ctypes.windll.user32.keybd_event(VK_RETURN, 0, 0, 0)
+        time.sleep(0.05)
+        ctypes.windll.user32.keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0)
 
 
 # ── 창 활성화 + 캡처 (멀티모니터 대응) ───────────────────────────────────────
