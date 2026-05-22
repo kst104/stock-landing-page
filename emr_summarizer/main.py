@@ -1,5 +1,5 @@
 """
-NGTMediPlus EMR 챠트 자동 요약 (다중 화면 캡처 방식)
+NGTMediPlus EMR 챠트 자동 요약
 실행: python main.py
 """
 
@@ -12,8 +12,14 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+# 필수 패키지 확인
 _MISSING = []
-for _pkg, _imp in [("anthropic", "anthropic"), ("Pillow", "PIL"), ("python-dotenv", "dotenv")]:
+for _pkg, _imp in [
+    ("anthropic",      "anthropic"),
+    ("Pillow",         "PIL"),
+    ("python-dotenv",  "dotenv"),
+    ("pyautogui",      "pyautogui"),
+]:
     try:
         __import__(_imp)
     except ImportError:
@@ -38,10 +44,11 @@ from PIL import Image, ImageEnhance, ImageTk
 
 import config
 import summarizer
+import auto_navigate
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 화면 영역 선택기
+# 화면 영역 선택기 (수동 캡처용)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RegionSelector(tk.Toplevel):
@@ -68,7 +75,6 @@ class RegionSelector(tk.Toplevel):
             text="드래그로 챠트 영역 선택    |    ESC: 취소",
             fill="white", font=("맑은 고딕", 15, "bold"),
         )
-
         self._canvas.bind("<ButtonPress-1>",   self._on_press)
         self._canvas.bind("<B1-Motion>",       self._on_drag)
         self._canvas.bind("<ButtonRelease-1>", self._on_release)
@@ -86,9 +92,7 @@ class RegionSelector(tk.Toplevel):
             self._canvas.delete(self._rect_id)
         self._rect_id = self._canvas.create_rectangle(
             *self._start, e.x, e.y,
-            outline="#00d4ff", width=2,
-            fill="#00d4ff", stipple="gray12",
-        )
+            outline="#00d4ff", width=2, fill="#00d4ff", stipple="gray12")
 
     def _on_release(self, e):
         if not self._start:
@@ -100,32 +104,113 @@ class RegionSelector(tk.Toplevel):
             return
         region = self._screenshot.crop((
             min(x0, x1), min(y0, y1),
-            max(x0, x1), max(y0, y1),
-        ))
+            max(x0, x1), max(y0, y1)))
         self.destroy()
         self._on_selected(region)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 썸네일 카드 (캡처된 이미지 1장)
+# 창 선택 다이얼로그 (자동 수집 시 NGT 창 못 찾았을 때)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class WindowPickerDialog(tk.Toplevel):
+    def __init__(self, parent, on_selected):
+        super().__init__(parent)
+        self.title("창 선택")
+        self.geometry("420x300")
+        self.resizable(False, False)
+        self.grab_set()
+        self._on_selected = on_selected
+        self._build()
+
+    def _build(self):
+        ttk.Label(self, text="NGTMediPlus 창을 목록에서 선택하세요:",
+                  font=("맑은 고딕", 10)).pack(pady=10)
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=12)
+
+        sb = ttk.Scrollbar(frame)
+        sb.pack(side="right", fill="y")
+        self._lb = tk.Listbox(frame, yscrollcommand=sb.set, font=("", 9))
+        self._lb.pack(fill="both", expand=True)
+        sb.config(command=self._lb.yview)
+
+        titles = auto_navigate.get_all_windows()
+        for t in titles:
+            self._lb.insert("end", t)
+
+        btn = ttk.Frame(self)
+        btn.pack(fill="x", padx=12, pady=8)
+        ttk.Button(btn, text="선택", command=self._select).pack(side="right", padx=4)
+        ttk.Button(btn, text="취소", command=self.destroy).pack(side="right")
+
+    def _select(self):
+        sel = self._lb.curselection()
+        if not sel:
+            messagebox.showwarning("선택 오류", "창을 선택하세요.", parent=self)
+            return
+        title = self._lb.get(sel[0])
+        self.destroy()
+        self._on_selected(title)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 탭 확인 다이얼로그 (자동 클릭 전 확인)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TabConfirmDialog(tk.Toplevel):
+    def __init__(self, parent, tabs: list[dict], on_confirm):
+        super().__init__(parent)
+        self.title("발견된 탭 확인")
+        self.geometry("360x280")
+        self.resizable(False, False)
+        self.grab_set()
+        self._tabs = tabs
+        self._on_confirm = on_confirm
+        self._build()
+
+    def _build(self):
+        ttk.Label(self,
+                  text=f"아래 {len(self._tabs)}개 탭을 자동으로 순회합니다.\n진행할까요?",
+                  font=("맑은 고딕", 10)).pack(pady=10)
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=16)
+
+        for i, tab in enumerate(self._tabs, 1):
+            ttk.Label(frame,
+                      text=f"  {i}. {tab['name']}",
+                      font=("맑은 고딕", 10)).pack(anchor="w", pady=2)
+
+        btn = ttk.Frame(self)
+        btn.pack(fill="x", padx=16, pady=10)
+        ttk.Button(btn, text="자동 수집 시작",
+                   command=self._confirm).pack(side="right", padx=4)
+        ttk.Button(btn, text="취소",
+                   command=self.destroy).pack(side="right")
+
+    def _confirm(self):
+        self.destroy()
+        self._on_confirm()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 썸네일 카드
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ThumbCard(ttk.Frame):
     THUMB_W, THUMB_H = 160, 100
 
-    def __init__(self, parent, index: int, image: Image.Image, on_delete):
+    def __init__(self, parent, label: str, image: Image.Image, on_delete):
         super().__init__(parent, relief="ridge", padding=4)
-        self._on_delete = on_delete
-        self._index = index
-
         thumb = image.copy()
         thumb.thumbnail((self.THUMB_W, self.THUMB_H))
         self._photo = ImageTk.PhotoImage(thumb)
-
-        ttk.Label(self, text=f"화면 {index}", font=("", 8, "bold")).pack()
+        ttk.Label(self, text=label, font=("", 8, "bold")).pack()
         ttk.Label(self, image=self._photo).pack()
         ttk.Button(self, text="✕ 삭제", width=8,
-                   command=lambda: on_delete(index)).pack(pady=(4, 0))
+                   command=on_delete).pack(pady=(4, 0))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -146,7 +231,6 @@ class SettingsDialog(tk.Toplevel):
     def _build(self):
         frame = ttk.LabelFrame(self, text="Claude API 설정")
         frame.pack(padx=16, pady=16, fill="x")
-
         for i, (label, key, secret) in enumerate([
             ("API 키", "claude_api_key", True),
             ("모델",   "claude_model",   False),
@@ -158,7 +242,6 @@ class SettingsDialog(tk.Toplevel):
                       show=("*" if secret else "")).grid(
                 row=i, column=1, padx=8, pady=6)
             self._vars[key] = var
-
         ttk.Label(frame, text="API 키 발급: https://console.anthropic.com",
                   foreground="gray").grid(
             row=2, column=0, columnspan=2, padx=10, pady=(0, 8), sticky="w")
@@ -186,33 +269,41 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("NGTMediPlus EMR 자동 요약")
-        self.geometry("900x700")
+        self.geometry("900x720")
         self.minsize(750, 550)
 
         self._settings = config.load()
-        self._captures: list[Image.Image] = []   # 누적 캡처 목록
+        self._captures: list[tuple[str, Image.Image]] = []
         self._thumb_cards: list[ThumbCard] = []
 
         self._build()
         self._check_api_key()
-        self._refresh_capture_area()
+        self._refresh_gallery()
 
     # ── UI 구성 ───────────────────────────────────────────────────────────────
 
     def _build(self):
-        # 상단 버튼 바
+        # 버튼 바
         top = ttk.Frame(self)
         top.pack(fill="x", padx=12, pady=10)
 
+        self._auto_btn = ttk.Button(
+            top, text="🤖  자동 수집 + 요약",
+            command=self._start_auto, width=20)
+        self._auto_btn.pack(side="left", ipady=6)
+
+        ttk.Separator(top, orient="vertical").pack(
+            side="left", fill="y", padx=10, pady=4)
+
         self._add_btn = ttk.Button(
-            top, text="📷  + 화면 캡처 추가",
-            command=self._start_capture, width=20)
+            top, text="📷  수동 캡처 추가",
+            command=self._start_manual_capture, width=18)
         self._add_btn.pack(side="left", ipady=6)
 
         self._summary_btn = ttk.Button(
-            top, text="🤖  전체 요약",
-            command=self._run_summary, width=14)
-        self._summary_btn.pack(side="left", padx=8, ipady=6)
+            top, text="🤖  요약",
+            command=self._run_summary, width=10)
+        self._summary_btn.pack(side="left", padx=6, ipady=6)
 
         ttk.Button(top, text="🗑  초기화",
                    command=self._reset, width=10).pack(side="left", ipady=6)
@@ -225,28 +316,28 @@ class App(tk.Tk):
         self._api_status.pack(side="right")
 
         # 캡처 갤러리
-        gallery_outer = ttk.LabelFrame(self, text="캡처된 화면  (여러 탭을 캡처 추가하세요)")
+        gallery_outer = ttk.LabelFrame(
+            self, text="수집된 화면")
         gallery_outer.pack(fill="x", padx=12, pady=(0, 6))
 
-        self._gallery_canvas = tk.Canvas(gallery_outer, height=160,
-                                         highlightthickness=0)
-        scroll_x = ttk.Scrollbar(gallery_outer, orient="horizontal",
-                                  command=self._gallery_canvas.xview)
-        self._gallery_canvas.configure(xscrollcommand=scroll_x.set)
-        scroll_x.pack(side="bottom", fill="x")
+        self._gallery_canvas = tk.Canvas(
+            gallery_outer, height=160, highlightthickness=0)
+        sx = ttk.Scrollbar(gallery_outer, orient="horizontal",
+                           command=self._gallery_canvas.xview)
+        self._gallery_canvas.configure(xscrollcommand=sx.set)
+        sx.pack(side="bottom", fill="x")
         self._gallery_canvas.pack(fill="x", padx=4, pady=4)
 
         self._gallery_frame = ttk.Frame(self._gallery_canvas)
-        self._gallery_canvas.create_window((0, 0), window=self._gallery_frame,
-                                           anchor="nw")
+        self._gallery_canvas.create_window(
+            (0, 0), window=self._gallery_frame, anchor="nw")
         self._gallery_frame.bind("<Configure>", self._on_gallery_resize)
 
         self._empty_label = ttk.Label(
             self._gallery_frame,
-            text="NGTMediPlus에서 환자를 연 후 [+ 화면 캡처 추가]를 클릭하세요.\n"
-                 "탭마다 반복해서 여러 화면을 추가할 수 있습니다.",
-            foreground="gray", font=("맑은 고딕", 10),
-        )
+            text="[🤖 자동 수집] 버튼을 클릭하면 NGTMediPlus 창을 자동으로 탐색합니다.\n"
+                 "수동으로 추가하려면 [📷 수동 캡처 추가]를 이용하세요.",
+            foreground="gray", font=("맑은 고딕", 10))
 
         # 요약 결과
         result_frame = ttk.LabelFrame(self, text="AI 종합 요약 결과")
@@ -276,7 +367,7 @@ class App(tk.Tk):
         self._gallery_canvas.configure(
             scrollregion=self._gallery_canvas.bbox("all"))
 
-    def _refresh_capture_area(self):
+    def _refresh_gallery(self):
         for card in self._thumb_cards:
             card.destroy()
         self._thumb_cards.clear()
@@ -289,39 +380,132 @@ class App(tk.Tk):
         self._empty_label.pack_forget()
         self._summary_btn.config(state="normal")
 
-        for i, img in enumerate(self._captures, 1):
-            card = ThumbCard(self._gallery_frame, i, img,
-                             on_delete=self._delete_capture)
+        for i, (label, img) in enumerate(self._captures):
+            idx = i
+            card = ThumbCard(
+                self._gallery_frame, label, img,
+                on_delete=lambda i=idx: self._delete_capture(i))
             card.pack(side="left", padx=6, pady=4)
             self._thumb_cards.append(card)
 
-        self._status(f"캡처 {len(self._captures)}장 — [전체 요약] 버튼으로 요약하세요.")
+        self._status(f"수집된 화면 {len(self._captures)}장 — [요약] 버튼으로 분석하세요.")
 
-    def _delete_capture(self, index: int):
-        idx = index - 1
+    def _delete_capture(self, idx: int):
         if 0 <= idx < len(self._captures):
             self._captures.pop(idx)
-            self._refresh_capture_area()
+            self._refresh_gallery()
 
-    # ── 캡처 ─────────────────────────────────────────────────────────────────
+    # ── 자동 수집 ─────────────────────────────────────────────────────────────
 
-    def _start_capture(self):
-        if not self._settings.get("claude_api_key"):
-            messagebox.showerror("API 키 없음",
-                                 "먼저 [⚙ 설정]에서 Claude API 키를 입력하세요.")
+    def _start_auto(self):
+        if not self._check_api_key_prompt():
+            return
+
+        self._auto_btn.config(state="disabled")
+        self._status("NGTMediPlus 창 탐색 중...")
+
+        def _run():
+            # 창 탐색
+            window = auto_navigate.find_ngt_window()
+            if not window:
+                # 창 못 찾으면 사용자가 직접 선택
+                self.after(0, self._pick_window_and_auto)
+                self.after(0, lambda: self._auto_btn.config(state="normal"))
+                return
+            self.after(0, lambda w=window: self._run_auto_with_window(w.title))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _pick_window_and_auto(self):
+        WindowPickerDialog(self, on_selected=self._run_auto_with_window)
+
+    def _run_auto_with_window(self, window_title: str):
+        self._auto_btn.config(state="disabled")
+        self._status("Claude가 탭 구조 분석 중...")
+
+        def _analyze():
+            import auto_navigate as an
+            wins = an.pyautogui.getWindowsWithTitle(window_title)
+            if not wins:
+                self.after(0, lambda: (
+                    self._status("창을 찾을 수 없습니다."),
+                    messagebox.showerror("오류", f"'{window_title}' 창을 찾을 수 없습니다."),
+                    self._auto_btn.config(state="normal"),
+                ))
+                return
+
+            window = wins[0]
+            window.activate()
+            import time; time.sleep(0.5)
+
+            screenshot = an.capture_window(window)
+            self.after(0, lambda: self._status("탭 위치 분석 중..."))
+
+            tabs = an.identify_tabs(
+                screenshot,
+                api_key=self._settings["claude_api_key"],
+                model=self._settings.get("claude_model", "claude-sonnet-4-6"),
+            )
+
+            if not tabs:
+                self.after(0, lambda: (
+                    self._status("탭을 찾지 못했습니다."),
+                    messagebox.showerror(
+                        "탭 미발견",
+                        "탭을 찾지 못했습니다.\n"
+                        "NGTMediPlus에서 환자 챠트가 열려 있는지 확인하세요.\n\n"
+                        "수동 캡처 추가를 이용해 주세요."),
+                    self._auto_btn.config(state="normal"),
+                ))
+                return
+
+            # 탭 확인 다이얼로그
+            self.after(0, lambda t=tabs, w=window: self._confirm_and_collect(t, w))
+
+        threading.Thread(target=_analyze, daemon=True).start()
+
+    def _confirm_and_collect(self, tabs: list[dict], window):
+        TabConfirmDialog(
+            self, tabs,
+            on_confirm=lambda: self._do_collect(tabs, window))
+
+    def _do_collect(self, tabs: list[dict], window):
+        self._auto_btn.config(state="disabled")
+        self._add_btn.config(state="disabled")
+
+        def _run():
+            results = auto_navigate.collect_all_tabs(
+                window, tabs, status_cb=lambda m: self.after(0, lambda msg=m: self._status(msg)))
+            self.after(0, lambda r=results: self._on_collected(r))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_collected(self, results: list[tuple[str, Image.Image]]):
+        self._captures.extend(results)
+        self._refresh_gallery()
+        self._auto_btn.config(state="normal")
+        self._add_btn.config(state="normal")
+        self._status(f"자동 수집 완료 ({len(results)}개 탭) — [요약] 버튼을 클릭하세요.")
+        # 바로 요약 시작
+        self._run_summary()
+
+    # ── 수동 캡처 ─────────────────────────────────────────────────────────────
+
+    def _start_manual_capture(self):
+        if not self._check_api_key_prompt():
             return
 
         self._add_btn.config(state="disabled")
-        self._status("3초 후 화면을 캡처합니다. NGTMediPlus 화면으로 이동하세요...")
+        self._status("3초 후 캡처합니다. NGTMediPlus 화면으로 이동하세요...")
 
         def _run():
             import time
+            from PIL import ImageGrab
             for i in (3, 2, 1):
                 self.after(0, lambda n=i: self._status(f"{n}초 후 캡처합니다..."))
                 time.sleep(1)
             self.after(0, self.withdraw)
             time.sleep(0.3)
-            from PIL import ImageGrab
             screenshot = ImageGrab.grab(all_screens=True)
             self.after(0, lambda s=screenshot: self._show_selector(s))
 
@@ -329,20 +513,22 @@ class App(tk.Tk):
 
     def _show_selector(self, screenshot: Image.Image):
         self.deiconify()
-        RegionSelector(self, screenshot, self._on_region_selected)
+        RegionSelector(self, screenshot, self._on_manual_region)
 
-    def _on_region_selected(self, region: Image.Image):
-        self._captures.append(region)
+    def _on_manual_region(self, region: Image.Image):
+        n = len(self._captures) + 1
+        self._captures.append((f"수동 캡처 {n}", region))
         self._add_btn.config(state="normal")
-        self._refresh_capture_area()
+        self._refresh_gallery()
 
     # ── 요약 ─────────────────────────────────────────────────────────────────
 
     def _run_summary(self):
         if not self._captures:
-            messagebox.showwarning("캡처 없음", "먼저 화면을 캡처해주세요.")
+            messagebox.showwarning("수집 없음", "먼저 화면을 수집해주세요.")
             return
 
+        self._auto_btn.config(state="disabled")
         self._add_btn.config(state="disabled")
         self._summary_btn.config(state="disabled")
         n = len(self._captures)
@@ -365,6 +551,7 @@ class App(tk.Tk):
                 ))
             finally:
                 self.after(0, lambda: (
+                    self._auto_btn.config(state="normal"),
                     self._add_btn.config(state="normal"),
                     self._summary_btn.config(state="normal"),
                 ))
@@ -373,16 +560,23 @@ class App(tk.Tk):
 
     def _display_result(self, text: str):
         self._set_result(text)
-        self._status(f"요약 완료 (화면 {len(self._captures)}장 분석)")
+        self._status(f"요약 완료 — 화면 {len(self._captures)}장 분석")
 
     # ── 유틸 ─────────────────────────────────────────────────────────────────
 
+    def _check_api_key_prompt(self) -> bool:
+        if not self._settings.get("claude_api_key"):
+            messagebox.showerror("API 키 없음",
+                                 "먼저 [⚙ 설정]에서 Claude API 키를 입력하세요.")
+            return False
+        return True
+
     def _reset(self):
         if self._captures and not messagebox.askyesno(
-                "초기화 확인", f"캡처된 화면 {len(self._captures)}장을 모두 삭제할까요?"):
+                "초기화", f"수집된 화면 {len(self._captures)}장을 모두 삭제할까요?"):
             return
         self._captures.clear()
-        self._refresh_capture_area()
+        self._refresh_gallery()
         self._clear_result()
         self._status("초기화 완료")
 

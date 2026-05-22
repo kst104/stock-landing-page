@@ -31,29 +31,27 @@ _PROMPT = """아래 이미지들은 같은 환자의 EMR 챠트 여러 화면입
 (현재 및 과거 진단명, 주요 병력)
 
 ## 현재 복용 약물
-(최근 처방된 약물, 용량, 복용 횟수 — 중복 제거)
+(최근 처방된 약물, 용량, 복용 횟수)
 
 ## 검사 결과 요약
 (이상 소견 위주, 추세 포함, 정상 항목은 "나머지 정상"으로 처리)
 
 ## 내원 경과 요약
-(최근 내원 주호소 및 경과, 시간 순서대로)
+(최근 내원 주호소 및 경과)
 
 ## 임상적 주의사항
-(알레르기, 금기약물, 중요 병력 등)
+(알레르기, 금기약물, 중요 병력)
 
 ## 종합 소견
-(전체 이력을 바탕으로 한 임상적 핵심 요약 2-3줄)
+(전체 이력 핵심 요약 2-3줄)
 
 화면에 없는 항목은 "(정보 없음)"으로 표시하세요."""
 
 
 def _resize(image: Image.Image, max_width: int = 1280) -> Image.Image:
-    """전송 전 이미지 크기 제한 (토큰 절약)"""
     if image.width > max_width:
         ratio = max_width / image.width
-        new_size = (max_width, int(image.height * ratio))
-        return image.resize(new_size, Image.LANCZOS)
+        return image.resize((max_width, int(image.height * ratio)), Image.LANCZOS)
     return image
 
 
@@ -63,18 +61,28 @@ def _to_b64(image: Image.Image) -> str:
     return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
 
 
-def summarize_images(images: list[Image.Image], api_key: str, model: str) -> str:
-    """여러 EMR 화면 이미지 → Claude Vision → 종합 요약 텍스트"""
-    if not images:
+def summarize_images(
+    items: list[tuple[str, Image.Image]] | list[Image.Image],
+    api_key: str,
+    model: str,
+) -> str:
+    """
+    [(탭명, Image), ...] 또는 [Image, ...] → 종합 요약 텍스트
+    """
+    if not items:
         raise ValueError("캡처된 이미지가 없습니다.")
 
-    # 이미지 content 블록 구성
+    # 형식 통일: (label, image) 튜플로
+    pairs: list[tuple[str, Image.Image]] = []
+    for i, item in enumerate(items, 1):
+        if isinstance(item, tuple):
+            pairs.append(item)
+        else:
+            pairs.append((f"화면 {i}", item))
+
     content: list[dict] = []
-    for i, img in enumerate(images, 1):
-        content.append({
-            "type": "text",
-            "text": f"[화면 {i}/{len(images)}]",
-        })
+    for label, img in pairs:
+        content.append({"type": "text", "text": f"[{label}]"})
         content.append({
             "type": "image",
             "source": {
