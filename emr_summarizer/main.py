@@ -1,9 +1,38 @@
 """
 NGTMediPlus EMR 챠트 자동 요약 프로그램
-실행: python main.py
+실행: emr_summarizer 폴더 안에서 → python main.py
+      또는 어느 위치에서든 → 실행.bat 더블클릭 (Windows)
 """
 
 from __future__ import annotations
+
+import sys
+import os
+
+# emr_summarizer 폴더를 import 경로에 추가 (어느 디렉터리에서 실행해도 동작)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+# 필수 패키지 확인
+_MISSING = []
+for _pkg, _import in [("anthropic", "anthropic"), ("pyodbc", "pyodbc"), ("python-dotenv", "dotenv")]:
+    try:
+        __import__(_import)
+    except ImportError:
+        _MISSING.append(_pkg)
+
+if _MISSING:
+    print("=" * 60)
+    print("[오류] 다음 패키지가 설치되어 있지 않습니다:")
+    for p in _MISSING:
+        print(f"  - {p}")
+    print()
+    print("아래 명령어로 설치 후 다시 실행하세요:")
+    print(f"  pip install -r {os.path.join(_HERE, 'requirements.txt')}")
+    print("=" * 60)
+    input("\nEnter 키를 누르면 종료합니다...")
+    sys.exit(1)
 
 import threading
 import tkinter as tk
