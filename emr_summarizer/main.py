@@ -459,17 +459,21 @@ class App(tk.Tk):
 
         def _analyze():
             try:
-                auto_navigate.activate_window(hwnd)
-                screenshot = auto_navigate.capture_window(hwnd)
+                # 우리 앱 최소화 → NGT 창 전면으로
+                self.after(0, self.iconify)
+                import time as _t; _t.sleep(0.6)
 
-                self.after(0, lambda: self._status(
-                    "Claude Vision으로 왼쪽 메뉴 항목 파악 중..."))
+                screenshot = auto_navigate.capture_screen(hwnd)
+
+                self.after(0, lambda: (
+                    self.deiconify(),
+                    self._status("Claude Vision으로 왼쪽 메뉴 항목 파악 중..."),
+                ))
 
                 items = auto_navigate.find_all_menu_items_by_vision(
                     screenshot, api_key=api_key, model=model)
 
                 if not items:
-                    # Vision으로 메뉴 못 찾음 — 현재 화면 그대로 요약
                     self.after(0, lambda s=screenshot: (
                         self._captures.append(("현재 화면", s)),
                         self._refresh_gallery(),
@@ -479,12 +483,12 @@ class App(tk.Tk):
                     ))
                     return
 
-                # 확인 다이얼로그 → 수집 시작
                 self.after(0, lambda it=items, h=hwnd:
                            self._confirm_and_collect(it, h))
 
             except Exception as e:
                 self.after(0, lambda err=e: (
+                    self.deiconify(),
                     self._status(f"분석 오류: {err}"),
                     messagebox.showerror("오류", f"화면 분석 중 오류:\n{err}"),
                     self._enable_auto_btn(),
@@ -504,12 +508,20 @@ class App(tk.Tk):
 
         def _run():
             try:
+                self.after(0, self.iconify)   # 수집 중 앱 최소화
+                import time as _t; _t.sleep(0.5)
+
                 results = auto_navigate.collect_menu_items(
                     hwnd, items,
                     status_cb=lambda m: self.after(0, lambda msg=m: self._status(msg)))
-                self.after(0, lambda r=results: self._on_collected(r))
+
+                self.after(0, lambda r=results: (
+                    self.deiconify(),
+                    self._on_collected(r),
+                ))
             except Exception as e:
                 self.after(0, lambda err=e: (
+                    self.deiconify(),
                     self._status(f"수집 오류: {err}"),
                     messagebox.showerror("수집 오류", str(err)),
                     self._enable_auto_btn(),
