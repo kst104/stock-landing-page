@@ -15,12 +15,19 @@ import json
 import os
 import time
 
+import ctypes
+import ctypes.wintypes
+
 import anthropic
 import pyautogui
 import win32con
 import win32gui
 import win32process
 from PIL import Image, ImageGrab
+
+# FailSafe 비활성화 (좌표가 모서리여도 중단하지 않음)
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.05
 
 _NGT_KEYWORDS = [
     "neomed", "ngt", "전자챠트", "전자차트", "emr",
@@ -76,6 +83,81 @@ def get_hwnd_by_title(title: str) -> int | None:
         if t == title:
             return hwnd
     return None
+
+
+# ── 마우스 클릭 (권한 문제 대응) ─────────────────────────────────────────────
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx",          ctypes.wintypes.LONG),
+        ("dy",          ctypes.wintypes.LONG),
+        ("mouseData",   ctypes.wintypes.DWORD),
+        ("dwFlags",     ctypes.wintypes.DWORD),
+        ("time",        ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+class _INPUT(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [("mi", _MOUSEINPUT)]
+    _anonymous_ = ("_u",)
+    _fields_    = [("type", ctypes.wintypes.DWORD), ("_u", _U)]
+
+_MOUSEEVENTF_MOVE     = 0x0001
+_MOUSEEVENTF_LDOWN    = 0x0002
+_MOUSEEVENTF_LUP      = 0x0004
+_MOUSEEVENTF_ABSOLUTE = 0x8000
+_INPUT_MOUSE          = 0
+
+
+def _send_input_click(x: int, y: int, double: bool = False):
+    """
+    ctypes.SendInput으로 마우스 클릭.
+    pyautogui가 UAC/권한 문제로 막힐 때 사용.
+    """
+    sw = ctypes.windll.user32.GetSystemMetrics(0)
+    sh = ctypes.windll.user32.GetSystemMetrics(1)
+    nx = int(x * 65535 / max(sw, 1))
+    ny = int(y * 65535 / max(sh, 1))
+
+    def _send(flags):
+        inp = _INPUT()
+        inp.type    = _INPUT_MOUSE
+        inp.mi.dx   = nx
+        inp.mi.dy   = ny
+        inp.mi.dwFlags = flags
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+    _send(_MOUSEEVENTF_MOVE | _MOUSEEVENTF_ABSOLUTE)
+    time.sleep(0.05)
+    _send(_MOUSEEVENTF_LDOWN | _MOUSEEVENTF_ABSOLUTE)
+    time.sleep(0.05)
+    _send(_MOUSEEVENTF_LUP | _MOUSEEVENTF_ABSOLUTE)
+
+    if double:
+        time.sleep(0.12)
+        _send(_MOUSEEVENTF_LDOWN | _MOUSEEVENTF_ABSOLUTE)
+        time.sleep(0.05)
+        _send(_MOUSEEVENTF_LUP | _MOUSEEVENTF_ABSOLUTE)
+
+
+def _safe_click(x: int, y: int, double: bool = False):
+    """
+    pyautogui 우선 클릭, 실패 시 ctypes.SendInput 폴백.
+    좌표가 화면 밖이면 건너뜀.
+    """
+    sw = ctypes.windll.user32.GetSystemMetrics(0)
+    sh = ctypes.windll.user32.GetSystemMetrics(1)
+    if not (0 <= x < sw and 0 <= y < sh):
+        return  # 화면 밖 좌표 무시
+
+    try:
+        if double:
+            pyautogui.doubleClick(x, y)
+        else:
+            pyautogui.click(x, y)
+    except Exception:
+        _send_input_click(x, y, double=double)
 
 
 # ── 창 활성화 + 캡처 (멀티모니터 대응) ───────────────────────────────────────
@@ -274,19 +356,19 @@ def collect_menu_items(
         # 클릭 (단일 + 더블 — 트리뷰/리스트 모두 대응)
         activate_window(hwnd)
         time.sleep(0.2)
-        pyautogui.click(abs_x, abs_y)
+        _safe_click(abs_x, abs_y)
         time.sleep(0.4)
-        pyautogui.doubleClick(abs_x, abs_y)
+        _safe_click(abs_x, abs_y, double=True)
         time.sleep(_WAIT_AFTER_CLICK)
 
         img = capture_screen(hwnd)
 
-        # 화면이 바뀌지 않았으면 단순 클릭 재시도
+        # 화면이 바뀌지 않았으면 재시도
         if not _images_differ(prev_img, img):
             if status_cb:
                 status_cb(f"[{i+1}/{total}] {name} — 재시도...")
             activate_window(hwnd)
-            pyautogui.click(abs_x, abs_y)
+            _safe_click(abs_x, abs_y)
             time.sleep(_WAIT_AFTER_CLICK)
             img = capture_screen(hwnd)
 
