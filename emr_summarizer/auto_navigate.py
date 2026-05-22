@@ -1,5 +1,10 @@
 """
 NGTMediPlus 창 자동 탐색 및 화면 수집 (pywin32 기반)
+
+탭 탐색 우선순위:
+  1. Windows 자식 컨트롤 열거 (가장 정확 — Delphi/WinForms 앱에 효과적)
+  2. Claude Vision 분석 (폴백)
+  3. 두 방법 모두 실패 시 → 현재 화면 그대로 반환
 """
 
 from __future__ import annotations
@@ -22,7 +27,6 @@ _WAIT_AFTER_CLICK = 2.0
 # ── 창 탐색 ───────────────────────────────────────────────────────────────────
 
 def _enum_windows() -> list[tuple[int, str]]:
-    """보이는 모든 창 열거 → [(hwnd, title), ...]"""
     result = []
     def cb(hwnd, _):
         if win32gui.IsWindowVisible(hwnd):
@@ -35,7 +39,6 @@ def _enum_windows() -> list[tuple[int, str]]:
 
 
 def find_ngt_window() -> tuple[int, str] | None:
-    """NGTMediPlus 창 자동 탐색. (hwnd, title) 또는 None."""
     for hwnd, title in _enum_windows():
         if any(kw in title.lower() for kw in _NGT_KEYWORDS):
             return hwnd, title
@@ -43,12 +46,10 @@ def find_ngt_window() -> tuple[int, str] | None:
 
 
 def get_all_windows() -> list[str]:
-    """현재 열린 모든 창 제목 목록"""
     return [title for _, title in _enum_windows()]
 
 
 def get_hwnd_by_title(title: str) -> int | None:
-    """제목으로 hwnd 조회"""
     for hwnd, t in _enum_windows():
         if t == title:
             return hwnd
@@ -58,44 +59,102 @@ def get_hwnd_by_title(title: str) -> int | None:
 # ── 창 제어 + 캡처 ────────────────────────────────────────────────────────────
 
 def activate_window(hwnd: int):
-    """창 활성화 (최소화된 경우 복원)"""
     placement = win32gui.GetWindowPlacement(hwnd)
     if placement[1] == win32con.SW_SHOWMINIMIZED:
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
     win32gui.SetForegroundWindow(hwnd)
-    time.sleep(0.4)
+    time.sleep(0.5)
 
 
 def capture_window(hwnd: int) -> Image.Image:
-    """창 영역만 캡처"""
     rect = win32gui.GetWindowRect(hwnd)
     return ImageGrab.grab(bbox=rect)
 
 
-# ── Claude Vision으로 탭 위치 파악 ───────────────────────────────────────────
+# ── 방법 1: Windows 자식 컨트롤 열거 ─────────────────────────────────────────
 
-def identify_tabs(screenshot: Image.Image,
-                  api_key: str, model: str) -> list[dict]:
+# Delphi / WinForms / 일반 Win32 탭·버튼 클래스명
+_TAB_CLASSES = {
+    "TPageControl", "TTabSheet", "TTabControl",
+    "SysTabControl32", "TabControl",
+    "TButton", "TBitBtn", "TSpeedButton", "Button",
+    "TPanel",
+}
+
+
+def find_tabs_by_enum(hwnd: int) -> list[dict]:
     """
-    Claude Vision으로 탭/메뉴 위치 파악.
-    반환: [{"name": "탭명", "x_ratio": 0.15, "y_ratio": 0.05}, ...]
+    Windows 자식 컨트롤 직접 열거로 탭/버튼 위치 파악.
+    반환: [{"name": ..., "x_ratio": ..., "y_ratio": ...}, ...]
+    """
+    parent_rect = win32gui.GetWindowRect(hwnd)
+    px, py = parent_rect[0], parent_rect[1]
+    pw = parent_rect[2] - px
+    ph = parent_rect[3] - py
+    if pw == 0 or ph == 0:
+        return []
+
+    controls: list[dict] = []
+
+    def cb(child, _):
+        try:
+            if not win32gui.IsWindowVisible(child):
+                return True
+            cls  = win32gui.GetClassName(child)
+            text = win32gui.GetWindowText(child).strip()
+            if cls in _TAB_CLASSES and text:
+                r = win32gui.GetWindowRect(child)
+                w, h = r[2] - r[0], r[3] - r[1]
+                if 15 < w < 400 and 10 < h < 80:
+                    cx = r[0] + w // 2
+                    cy = r[1] + h // 2
+                    controls.append({
+                        "name":    text,
+                        "x_ratio": (cx - px) / pw,
+                        "y_ratio": (cy - py) / ph,
+                    })
+        except Exception:
+            pass
+        return True
+
+    try:
+        win32gui.EnumChildWindows(hwnd, cb, None)
+    except Exception:
+        pass
+
+    # 중복 제거 (같은 이름)
+    seen, unique = set(), []
+    for c in controls:
+        if c["name"] not in seen:
+            seen.add(c["name"])
+            unique.append(c)
+    return unique
+
+
+# ── 방법 2: Claude Vision 분석 ────────────────────────────────────────────────
+
+def find_tabs_by_vision(screenshot: Image.Image,
+                        api_key: str, model: str) -> list[dict]:
+    """
+    Claude Vision으로 탭/메뉴 버튼 위치 파악.
+    반환: [{"name": ..., "x_ratio": ..., "y_ratio": ...}, ...]
     """
     buf = io.BytesIO()
     screenshot.save(buf, format="PNG")
     b64 = base64.standard_b64encode(buf.getvalue()).decode()
 
     prompt = (
-        "이 NGTMediPlus EMR 화면에서 클릭 가능한 탭, 메뉴, 버튼을 모두 찾아주세요.\n"
-        "각 항목의 이름과 위치를 이미지 크기 대비 비율(0.0~1.0)로 반환하세요.\n"
-        "JSON 배열만 반환 (다른 텍스트 없이):\n"
-        '[{"name":"탭이름","x_ratio":0.15,"y_ratio":0.05},...]\n\n'
-        "없으면 [] 반환."
+        "이 EMR 프로그램 화면에서 클릭할 수 있는 탭, 메뉴 버튼, 사이드바 항목을 모두 찾아주세요.\n"
+        "각 항목의 이름과 위치를 이미지 너비/높이 대비 비율(0.0~1.0)로 반환하세요.\n"
+        "JSON 배열만 응답 (다른 텍스트 없이):\n"
+        '[{"name":"항목이름","x_ratio":0.1,"y_ratio":0.05},...]\n\n'
+        "탭이나 버튼이 없으면 [] 반환."
     )
 
     client = anthropic.Anthropic(api_key=api_key)
     resp = client.messages.create(
         model=model,
-        max_tokens=800,
+        max_tokens=1000,
         messages=[{"role": "user", "content": [
             {"type": "image", "source": {
                 "type": "base64", "media_type": "image/png", "data": b64}},
@@ -116,6 +175,29 @@ def identify_tabs(screenshot: Image.Image,
         return []
 
 
+# ── 통합: 탭 탐색 (열거 → Vision → 폴백) ─────────────────────────────────────
+
+def identify_tabs(hwnd: int, screenshot: Image.Image,
+                  api_key: str, model: str) -> tuple[list[dict], str]:
+    """
+    탭 탐색 통합 함수.
+    반환: (tabs, method)
+      method: "enum" | "vision" | "fallback"
+    """
+    # 1. Windows 컨트롤 열거
+    tabs = find_tabs_by_enum(hwnd)
+    if tabs:
+        return tabs, "enum"
+
+    # 2. Claude Vision
+    tabs = find_tabs_by_vision(screenshot, api_key, model)
+    if tabs:
+        return tabs, "vision"
+
+    # 3. 폴백: 현재 화면 그대로
+    return [], "fallback"
+
+
 # ── 탭 자동 순회 ──────────────────────────────────────────────────────────────
 
 def collect_all_tabs(
@@ -124,10 +206,10 @@ def collect_all_tabs(
     status_cb=None,
 ) -> list[tuple[str, Image.Image]]:
     """탭 목록을 순서대로 클릭하며 화면 수집"""
-    rect  = win32gui.GetWindowRect(hwnd)
+    rect = win32gui.GetWindowRect(hwnd)
     ox, oy = rect[0], rect[1]
-    w = rect[2] - rect[0]
-    h = rect[3] - rect[1]
+    w = rect[2] - ox
+    h = rect[3] - oy
 
     results = []
     for i, tab in enumerate(tabs):

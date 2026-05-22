@@ -160,9 +160,9 @@ class WindowPickerDialog(tk.Toplevel):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TabConfirmDialog(tk.Toplevel):
-    def __init__(self, parent, tabs: list[dict], on_confirm):
+    def __init__(self, parent, tabs: list[dict], on_confirm, title: str = "발견된 탭 확인"):
         super().__init__(parent)
-        self.title("발견된 탭 확인")
+        self.title(title)
         self.geometry("360x280")
         self.resizable(False, False)
         self.grab_set()
@@ -445,27 +445,27 @@ class App(tk.Tk):
                 auto_navigate.activate_window(hwnd)
                 screenshot = auto_navigate.capture_window(hwnd)
 
-                self.after(0, lambda: self._status("Claude가 탭 위치 분석 중..."))
+                self.after(0, lambda: self._status("탭 위치 분석 중..."))
 
-                tabs = auto_navigate.identify_tabs(
+                tabs, method = auto_navigate.identify_tabs(
+                    hwnd,
                     screenshot,
                     api_key=self._settings["claude_api_key"],
                     model=self._settings.get("claude_model", "claude-sonnet-4-6"),
                 )
 
-                if not tabs:
-                    self.after(0, lambda: (
-                        self._status("탭을 찾지 못했습니다."),
-                        messagebox.showerror(
-                            "탭 미발견",
-                            "탭을 찾지 못했습니다.\n"
-                            "NGTMediPlus에서 환자 챠트가 열려 있는지 확인하세요.\n\n"
-                            "수동 캡처를 이용해 주세요."),
+                if method == "fallback":
+                    # 탭을 찾지 못했지만 현재 화면으로 요약 진행
+                    self.after(0, lambda s=screenshot: (
+                        self._captures.append(("현재 화면", s)),
+                        self._refresh_gallery(),
+                        self._status("탭 미발견 — 현재 화면으로 요약합니다."),
                         self._enable_auto_btn(),
+                        self._run_summary(),
                     ))
                     return
 
-                self.after(0, lambda t=tabs, h=hwnd: self._confirm_and_collect(t, h))
+                self.after(0, lambda t=tabs, h=hwnd, m=method: self._confirm_and_collect(t, h, m))
 
             except Exception as e:
                 self.after(0, lambda err=e: (
@@ -476,9 +476,10 @@ class App(tk.Tk):
 
         threading.Thread(target=_analyze, daemon=True).start()
 
-    def _confirm_and_collect(self, tabs: list[dict], hwnd: int):
+    def _confirm_and_collect(self, tabs: list[dict], hwnd: int, method: str = ""):
+        label = f"발견된 탭 확인 ({method})" if method else "발견된 탭 확인"
         TabConfirmDialog(
-            self, tabs,
+            self, tabs, title=label,
             on_confirm=lambda: self._do_collect(tabs, hwnd))
 
     def _do_collect(self, tabs: list[dict], hwnd: int):
