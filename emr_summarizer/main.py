@@ -163,8 +163,8 @@ class TabConfirmDialog(tk.Toplevel):
     def __init__(self, parent, tabs: list[dict], on_confirm, title: str = "발견된 탭 확인"):
         super().__init__(parent)
         self.title(title)
-        self.geometry("360x280")
-        self.resizable(False, False)
+        self.geometry("400x420")
+        self.resizable(True, True)
         self.grab_set()
         self._tabs = tabs
         self._on_confirm = on_confirm
@@ -172,19 +172,24 @@ class TabConfirmDialog(tk.Toplevel):
 
     def _build(self):
         ttk.Label(self,
-                  text=f"아래 {len(self._tabs)}개 탭을 자동으로 순회합니다.\n진행할까요?",
+                  text=f"아래 {len(self._tabs)}개 항목을 자동으로 순회합니다.\n진행할까요?",
                   font=("맑은 고딕", 10)).pack(pady=10)
 
         frame = ttk.Frame(self)
-        frame.pack(fill="both", expand=True, padx=16)
+        frame.pack(fill="both", expand=True, padx=16, pady=(0, 6))
+
+        sb = ttk.Scrollbar(frame)
+        sb.pack(side="right", fill="y")
+        lb = tk.Listbox(frame, yscrollcommand=sb.set, font=("맑은 고딕", 9), height=16)
+        lb.pack(fill="both", expand=True)
+        sb.config(command=lb.yview)
 
         for i, tab in enumerate(self._tabs, 1):
-            ttk.Label(frame,
-                      text=f"  {i}. {tab['name']}",
-                      font=("맑은 고딕", 10)).pack(anchor="w", pady=2)
+            lb.insert("end", f"  {i}. {tab['name']}")
 
+        # 버튼은 항상 하단에 고정
         btn = ttk.Frame(self)
-        btn.pack(fill="x", padx=16, pady=10)
+        btn.pack(fill="x", padx=16, pady=10, side="bottom")
         ttk.Button(btn, text="자동 수집 시작",
                    command=self._confirm).pack(side="right", padx=4)
         ttk.Button(btn, text="취소",
