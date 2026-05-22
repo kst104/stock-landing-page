@@ -397,6 +397,9 @@ class App(tk.Tk):
 
     # ── 자동 수집 ─────────────────────────────────────────────────────────────
 
+    def _enable_auto_btn(self):
+        self._auto_btn.config(state="normal")
+
     def _start_auto(self):
         if not self._check_api_key_prompt():
             return
@@ -405,78 +408,96 @@ class App(tk.Tk):
         self._status("NGTMediPlus 창 탐색 중...")
 
         def _run():
-            # 창 탐색
-            window = auto_navigate.find_ngt_window()
-            if not window:
-                # 창 못 찾으면 사용자가 직접 선택
-                self.after(0, self._pick_window_and_auto)
-                self.after(0, lambda: self._auto_btn.config(state="normal"))
-                return
-            self.after(0, lambda w=window: self._run_auto_with_window(w.title))
+            try:
+                found = auto_navigate.find_ngt_window()
+                if not found:
+                    self.after(0, self._pick_window_and_auto)
+                    self.after(0, self._enable_auto_btn)
+                    return
+                hwnd, title = found
+                self.after(0, lambda h=hwnd: self._run_auto_with_hwnd(h))
+            except Exception as e:
+                self.after(0, lambda err=e: (
+                    self._status(f"창 탐색 오류: {err}"),
+                    messagebox.showerror("오류", f"창 탐색 중 오류:\n{err}"),
+                    self._enable_auto_btn(),
+                ))
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _pick_window_and_auto(self):
-        WindowPickerDialog(self, on_selected=self._run_auto_with_window)
+        WindowPickerDialog(self, on_selected=self._run_auto_with_title)
 
-    def _run_auto_with_window(self, window_title: str):
+    def _run_auto_with_title(self, title: str):
+        hwnd = auto_navigate.get_hwnd_by_title(title)
+        if not hwnd:
+            messagebox.showerror("오류", f"'{title}' 창을 찾을 수 없습니다.")
+            self._enable_auto_btn()
+            return
+        self._run_auto_with_hwnd(hwnd)
+
+    def _run_auto_with_hwnd(self, hwnd: int):
         self._auto_btn.config(state="disabled")
-        self._status("Claude가 탭 구조 분석 중...")
+        self._status("NGTMediPlus 화면 분석 중...")
 
         def _analyze():
-            import auto_navigate as an
-            wins = an.pyautogui.getWindowsWithTitle(window_title)
-            if not wins:
-                self.after(0, lambda: (
-                    self._status("창을 찾을 수 없습니다."),
-                    messagebox.showerror("오류", f"'{window_title}' 창을 찾을 수 없습니다."),
-                    self._auto_btn.config(state="normal"),
+            try:
+                auto_navigate.activate_window(hwnd)
+                screenshot = auto_navigate.capture_window(hwnd)
+
+                self.after(0, lambda: self._status("Claude가 탭 위치 분석 중..."))
+
+                tabs = auto_navigate.identify_tabs(
+                    screenshot,
+                    api_key=self._settings["claude_api_key"],
+                    model=self._settings.get("claude_model", "claude-sonnet-4-6"),
+                )
+
+                if not tabs:
+                    self.after(0, lambda: (
+                        self._status("탭을 찾지 못했습니다."),
+                        messagebox.showerror(
+                            "탭 미발견",
+                            "탭을 찾지 못했습니다.\n"
+                            "NGTMediPlus에서 환자 챠트가 열려 있는지 확인하세요.\n\n"
+                            "수동 캡처를 이용해 주세요."),
+                        self._enable_auto_btn(),
+                    ))
+                    return
+
+                self.after(0, lambda t=tabs, h=hwnd: self._confirm_and_collect(t, h))
+
+            except Exception as e:
+                self.after(0, lambda err=e: (
+                    self._status(f"분석 오류: {err}"),
+                    messagebox.showerror("오류", f"화면 분석 중 오류:\n{err}"),
+                    self._enable_auto_btn(),
                 ))
-                return
-
-            window = wins[0]
-            window.activate()
-            import time; time.sleep(0.5)
-
-            screenshot = an.capture_window(window)
-            self.after(0, lambda: self._status("탭 위치 분석 중..."))
-
-            tabs = an.identify_tabs(
-                screenshot,
-                api_key=self._settings["claude_api_key"],
-                model=self._settings.get("claude_model", "claude-sonnet-4-6"),
-            )
-
-            if not tabs:
-                self.after(0, lambda: (
-                    self._status("탭을 찾지 못했습니다."),
-                    messagebox.showerror(
-                        "탭 미발견",
-                        "탭을 찾지 못했습니다.\n"
-                        "NGTMediPlus에서 환자 챠트가 열려 있는지 확인하세요.\n\n"
-                        "수동 캡처 추가를 이용해 주세요."),
-                    self._auto_btn.config(state="normal"),
-                ))
-                return
-
-            # 탭 확인 다이얼로그
-            self.after(0, lambda t=tabs, w=window: self._confirm_and_collect(t, w))
 
         threading.Thread(target=_analyze, daemon=True).start()
 
-    def _confirm_and_collect(self, tabs: list[dict], window):
+    def _confirm_and_collect(self, tabs: list[dict], hwnd: int):
         TabConfirmDialog(
             self, tabs,
-            on_confirm=lambda: self._do_collect(tabs, window))
+            on_confirm=lambda: self._do_collect(tabs, hwnd))
 
-    def _do_collect(self, tabs: list[dict], window):
+    def _do_collect(self, tabs: list[dict], hwnd: int):
         self._auto_btn.config(state="disabled")
         self._add_btn.config(state="disabled")
 
         def _run():
-            results = auto_navigate.collect_all_tabs(
-                window, tabs, status_cb=lambda m: self.after(0, lambda msg=m: self._status(msg)))
-            self.after(0, lambda r=results: self._on_collected(r))
+            try:
+                results = auto_navigate.collect_all_tabs(
+                    hwnd, tabs,
+                    status_cb=lambda m: self.after(0, lambda msg=m: self._status(msg)))
+                self.after(0, lambda r=results: self._on_collected(r))
+            except Exception as e:
+                self.after(0, lambda err=e: (
+                    self._status(f"수집 오류: {err}"),
+                    messagebox.showerror("수집 오류", str(err)),
+                    self._enable_auto_btn(),
+                    self._add_btn.config(state="normal"),
+                ))
 
         threading.Thread(target=_run, daemon=True).start()
 
