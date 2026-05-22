@@ -186,7 +186,7 @@ class TabConfirmDialog(tk.Toplevel):
         sb.config(command=lb.yview)
 
         for i, tab in enumerate(self._tabs, 1):
-            lb.insert("end", f"  {i}. {tab['name']}")
+            lb.insert("end", f"  {i}. {tab.get('name', tab.get('name',''))}")
 
         # 버튼은 항상 하단에 고정
         btn = ttk.Frame(self)
@@ -529,32 +529,35 @@ class App(tk.Tk):
 
     def _run_auto_with_hwnd(self, hwnd: int):
         self._auto_btn.config(state="disabled")
-        self._status("EMR 화면 메뉴 분석 중...")
+        self._status("EMR 화면 분석 시작...")
 
         api_key = self._settings["claude_api_key"]
         model   = self._settings.get("claude_model", "claude-sonnet-4-6")
 
         def _analyze():
+            import win32gui as _wg
             try:
-                # 우리 앱 최소화 → NGT 창 전면으로
+                # 앱 최소화 → EMR 창 전면
                 self.after(0, self.iconify)
-                import time as _t; _t.sleep(0.6)
+                import time as _t; _t.sleep(0.8)
 
                 screenshot = auto_navigate.capture_screen(hwnd)
+                hwnd_rect  = _wg.GetWindowRect(hwnd)
 
                 self.after(0, lambda: (
                     self.deiconify(),
-                    self._status("Claude Vision으로 왼쪽 메뉴 항목 파악 중..."),
+                    self._status("1단계: 노란 메뉴 패널 위치 파악 중..."),
                 ))
 
                 items = auto_navigate.find_all_menu_items_by_vision(
-                    screenshot, api_key=api_key, model=model)
+                    screenshot, api_key=api_key, model=model,
+                    hwnd_rect=hwnd_rect)
 
                 if not items:
                     self.after(0, lambda s=screenshot: (
                         self._captures.append(("현재 화면", s)),
                         self._refresh_gallery(),
-                        self._status("메뉴 항목 미발견 — 현재 화면으로 요약합니다."),
+                        self._status("서브메뉴 미발견 — 현재 화면으로 요약합니다."),
                         self._enable_auto_btn(),
                         self._run_summary(),
                     ))
