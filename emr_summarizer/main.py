@@ -410,12 +410,13 @@ class App(tk.Tk):
         def _run():
             try:
                 found = auto_navigate.find_ngt_window()
-                if not found:
+                if found:
+                    hwnd, title = found
+                    # 자동 발견됐어도 확인 후 진행
+                    self.after(0, lambda h=hwnd, t=title: self._confirm_window_and_auto(h, t))
+                else:
                     self.after(0, self._pick_window_and_auto)
                     self.after(0, self._enable_auto_btn)
-                    return
-                hwnd, title = found
-                self.after(0, lambda h=hwnd: self._run_auto_with_hwnd(h))
             except Exception as e:
                 self.after(0, lambda err=e: (
                     self._status(f"창 탐색 오류: {err}"),
@@ -424,6 +425,19 @@ class App(tk.Tk):
                 ))
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _confirm_window_and_auto(self, hwnd: int, title: str):
+        from tkinter import messagebox as mb
+        ok = mb.askyesno(
+            "창 확인",
+            f"아래 창에서 EMR 정보를 수집합니다.\n\n"
+            f"  {title}\n\n"
+            f"맞으면 [예], 다른 창을 선택하려면 [아니오]를 클릭하세요.")
+        if ok:
+            self._run_auto_with_hwnd(hwnd)
+        else:
+            self._pick_window_and_auto()
+            self._enable_auto_btn()
 
     def _pick_window_and_auto(self):
         WindowPickerDialog(self, on_selected=self._run_auto_with_title)
@@ -438,7 +452,7 @@ class App(tk.Tk):
 
     def _run_auto_with_hwnd(self, hwnd: int):
         self._auto_btn.config(state="disabled")
-        self._status("EMR 문서 목록 분석 중...")
+        self._status("EMR 화면 메뉴 분석 중...")
 
         api_key = self._settings["claude_api_key"]
         model   = self._settings.get("claude_model", "claude-sonnet-4-6")
@@ -446,31 +460,28 @@ class App(tk.Tk):
         def _analyze():
             try:
                 auto_navigate.activate_window(hwnd)
+                screenshot = auto_navigate.capture_window(hwnd)
+
                 self.after(0, lambda: self._status(
-                    "Claude Vision으로 문서 목록 항목 위치 파악 중..."))
+                    "Claude Vision으로 왼쪽 메뉴 항목 파악 중..."))
 
-                results, found_items = auto_navigate.collect_doc_list(
-                    hwnd,
-                    target_docs=auto_navigate.DEFAULT_TARGET_DOCS,
-                    api_key=api_key,
-                    model=model,
-                    status_cb=lambda m: self.after(
-                        0, lambda msg=m: self._status(msg)),
-                )
+                items = auto_navigate.find_all_menu_items_by_vision(
+                    screenshot, api_key=api_key, model=model)
 
-                if not results:
-                    # Vision으로 문서 못 찾음 — 현재 화면 캡처 후 요약
-                    screenshot = auto_navigate.capture_window(hwnd)
+                if not items:
+                    # Vision으로 메뉴 못 찾음 — 현재 화면 그대로 요약
                     self.after(0, lambda s=screenshot: (
                         self._captures.append(("현재 화면", s)),
                         self._refresh_gallery(),
-                        self._status("문서 항목 미발견 — 현재 화면으로 요약합니다."),
+                        self._status("메뉴 항목 미발견 — 현재 화면으로 요약합니다."),
                         self._enable_auto_btn(),
                         self._run_summary(),
                     ))
                     return
 
-                self.after(0, lambda r=results: self._on_collected(r))
+                # 확인 다이얼로그 → 수집 시작
+                self.after(0, lambda it=items, h=hwnd:
+                           self._confirm_and_collect(it, h))
 
             except Exception as e:
                 self.after(0, lambda err=e: (
@@ -487,14 +498,14 @@ class App(tk.Tk):
             self, tabs, title=label,
             on_confirm=lambda: self._do_collect(tabs, hwnd))
 
-    def _do_collect(self, tabs: list[dict], hwnd: int):
+    def _do_collect(self, items: list[dict], hwnd: int):
         self._auto_btn.config(state="disabled")
         self._add_btn.config(state="disabled")
 
         def _run():
             try:
-                results = auto_navigate.collect_all_tabs(
-                    hwnd, tabs,
+                results = auto_navigate.collect_menu_items(
+                    hwnd, items,
                     status_cb=lambda m: self.after(0, lambda msg=m: self._status(msg)))
                 self.after(0, lambda r=results: self._on_collected(r))
             except Exception as e:
