@@ -44,6 +44,7 @@ from PIL import Image, ImageEnhance, ImageTk
 
 import config
 import summarizer
+import pyautogui
 import auto_navigate
 
 
@@ -582,32 +583,47 @@ class App(tk.Tk):
         self._auto_btn.config(state="disabled")
         self._add_btn.config(state="disabled")
 
-        # 진행 다이얼로그 생성
         prog_dlg = CollectProgressDialog(self, total=len(items))
-
-        def _on_item(idx, total, name, img):
-            self.after(0, lambda i=idx, n=name, im=img:
-                       prog_dlg.update_item(i, n, im))
-            # 갤러리에도 실시간 추가
-            self.after(0, lambda n=name, im=img: (
-                self._captures.append((n, im)),
-                self._refresh_gallery(),
-            ))
+        sw, sh = pyautogui.size()
 
         def _run():
+            import time as _t
             try:
+                # 모든 창 숨기기 — EMR 창만 남김
                 self.after(0, self.iconify)
-                import time as _t; _t.sleep(0.5)
+                self.after(0, prog_dlg.withdraw)
+                _t.sleep(0.8)
 
-                results = auto_navigate.collect_menu_items(
-                    hwnd, items,
-                    status_cb=lambda m: self.after(
-                        0, lambda msg=m: (
-                            self._status(msg),
-                            prog_dlg.set_status(msg),
-                        )),
-                    item_cb=_on_item,
-                )
+                results = []
+                for i, item in enumerate(items):
+                    name  = item.get("name", f"항목{i+1}")
+                    abs_x = int(item["x_ratio"] * sw)
+                    abs_y = int(item["y_ratio"] * sh)
+
+                    # EMR 창 활성화 후 클릭
+                    auto_navigate.activate_window(hwnd)
+                    _t.sleep(0.3)
+                    pyautogui.click(abs_x, abs_y)
+                    _t.sleep(2.0)   # 콘텐츠 로드 대기
+
+                    # EMR 창 전면으로 다시 올리고 캡처
+                    auto_navigate.activate_window(hwnd)
+                    _t.sleep(0.3)
+                    img = auto_navigate.capture_screen(hwnd)
+                    results.append((name, img))
+
+                    # 진행 다이얼로그 잠깐 표시 (1초)
+                    idx = i + 1
+                    self.after(0, lambda i=idx, n=name, im=img: (
+                        self._captures.append((n, im)),
+                        self._refresh_gallery(),
+                        prog_dlg.deiconify(),
+                        prog_dlg.update_item(i, n, im),
+                    ))
+                    _t.sleep(1.0)
+                    # 다음 캡처 전 다시 숨김
+                    self.after(0, prog_dlg.withdraw)
+                    _t.sleep(0.3)
 
                 self.after(0, lambda: (
                     prog_dlg.destroy(),
