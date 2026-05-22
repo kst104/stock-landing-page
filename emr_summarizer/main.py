@@ -438,46 +438,39 @@ class App(tk.Tk):
 
     def _run_auto_with_hwnd(self, hwnd: int):
         self._auto_btn.config(state="disabled")
-        self._status("NGTMediPlus 화면 분석 중...")
+        self._status("EMR 문서 목록 분석 중...")
+
+        api_key = self._settings["claude_api_key"]
+        model   = self._settings.get("claude_model", "claude-sonnet-4-6")
 
         def _analyze():
             try:
                 auto_navigate.activate_window(hwnd)
+                self.after(0, lambda: self._status(
+                    "Claude Vision으로 문서 목록 항목 위치 파악 중..."))
 
-                # 1단계: EMR/챠트 버튼 클릭 → 새 창 열기 시도
-                self.after(0, lambda: self._status("EMR 챠트 창 열기 시도 중..."))
-                chart_hwnd = auto_navigate.open_emr_and_get_hwnd(hwnd)
-                if chart_hwnd:
-                    target_hwnd = chart_hwnd
-                    self.after(0, lambda: self._status("챠트 창 발견 — 탭 분석 중..."))
-                    time.sleep(1.0)
-                else:
-                    target_hwnd = hwnd
-                    self.after(0, lambda: self._status("탭 위치 분석 중..."))
-
-                screenshot = auto_navigate.capture_window(target_hwnd)
-
-                # 2단계: 탭 목록 파악
-                tabs, method = auto_navigate.identify_tabs(
-                    target_hwnd,
-                    screenshot,
-                    api_key=self._settings["claude_api_key"],
-                    model=self._settings.get("claude_model", "claude-sonnet-4-6"),
+                results, found_items = auto_navigate.collect_doc_list(
+                    hwnd,
+                    target_docs=auto_navigate.DEFAULT_TARGET_DOCS,
+                    api_key=api_key,
+                    model=model,
+                    status_cb=lambda m: self.after(
+                        0, lambda msg=m: self._status(msg)),
                 )
 
-                if method == "fallback":
-                    # 탭 미발견 — 현재 화면 그대로 요약
+                if not results:
+                    # Vision으로 문서 못 찾음 — 현재 화면 캡처 후 요약
+                    screenshot = auto_navigate.capture_window(hwnd)
                     self.after(0, lambda s=screenshot: (
                         self._captures.append(("현재 화면", s)),
                         self._refresh_gallery(),
-                        self._status("탭 미발견 — 현재 화면으로 요약합니다."),
+                        self._status("문서 항목 미발견 — 현재 화면으로 요약합니다."),
                         self._enable_auto_btn(),
                         self._run_summary(),
                     ))
                     return
 
-                self.after(0, lambda t=tabs, h=target_hwnd, m=method:
-                           self._confirm_and_collect(t, h, m))
+                self.after(0, lambda r=results: self._on_collected(r))
 
             except Exception as e:
                 self.after(0, lambda err=e: (

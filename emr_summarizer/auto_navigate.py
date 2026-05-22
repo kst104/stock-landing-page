@@ -1,11 +1,8 @@
 """
-NGTMediPlus 창 자동 탐색 및 화면 수집 (pywin32 기반)
+NGTMediPlus EMR 챠트 자동 탐색 및 화면 수집 (pywin32 기반)
 
 캡처: PrintWindow(PW_RENDERFULLCONTENT) → ImageGrab 폴백
-탭 탐색:
-  1. Windows 자식 컨트롤 열거 (Delphi/WinForms 앱에 효과적)
-  2. Claude Vision 분석 (폴백)
-  3. 두 방법 모두 실패 → 현재 화면 그대로
+문서 탐색: Claude Vision으로 작성문서 목록 항목 위치 파악 후 클릭
 """
 
 from __future__ import annotations
@@ -23,9 +20,21 @@ import win32gui
 import win32ui
 from PIL import Image, ImageGrab
 
-_NGT_KEYWORDS = ["neomed", "ngt", "전자챠트", "전자차트", "emr", "차트", "medit"]
-_EMR_BUTTON_KEYWORDS = ["emr", "전자챠트", "전자차트", "챠트", "차트", "의무기록"]
+_NGT_KEYWORDS = [
+    "neomed", "ngt", "전자챠트", "전자차트", "emr",
+    "차트", "medit", "문서 작성",
+]
 _WAIT_AFTER_CLICK = 2.0
+
+# 기본 수집 문서 목록 (없는 항목은 Vision이 자동 제외)
+DEFAULT_TARGET_DOCS = [
+    "응급실 진료기록지",
+    "진료부-공통-입원경과기록지",
+    "내과-외래경과기록지",
+    "외과_외래경과기록지",
+    "정형외과_외래경과기록지",
+    "검사결과",
+]
 
 
 # ── 창 탐색 ───────────────────────────────────────────────────────────────────
@@ -89,7 +98,6 @@ def capture_window(hwnd: int) -> Image.Image:
         bmp.CreateCompatibleBitmap(mfc_dc, w, h)
         save_dc.SelectObject(bmp)
 
-        # PW_RENDERFULLCONTENT = 2 : 하드웨어 가속 창도 캡처 가능
         ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
 
         info = bmp.GetInfo()
@@ -111,123 +119,30 @@ def capture_window(hwnd: int) -> Image.Image:
         return ImageGrab.grab(bbox=rect)
 
 
-# ── EMR 버튼 클릭 → 챠트 창 열기 ─────────────────────────────────────────────
+# ── Claude Vision: 문서 목록 항목 위치 파악 ──────────────────────────────────
 
-# Delphi / WinForms / 일반 Win32 탭·버튼 클래스명
-_TAB_CLASSES = {
-    "TPageControl", "TTabSheet", "TTabControl",
-    "SysTabControl32", "TabControl",
-    "TButton", "TBitBtn", "TSpeedButton", "Button",
-    "TPanel",
-}
-
-
-def find_tabs_by_enum(hwnd: int) -> list[dict]:
+def find_doc_items_by_vision(
+    screenshot: Image.Image,
+    target_docs: list[str],
+    api_key: str,
+    model: str,
+) -> list[dict]:
     """
-    Windows 자식 컨트롤 직접 열거로 탭/버튼 위치 파악.
-    반환: [{"name": ..., "x_ratio": ..., "y_ratio": ...}, ...]
-    """
-    parent_rect = win32gui.GetWindowRect(hwnd)
-    px, py = parent_rect[0], parent_rect[1]
-    pw = parent_rect[2] - px
-    ph = parent_rect[3] - py
-    if pw == 0 or ph == 0:
-        return []
-
-    controls: list[dict] = []
-
-    def cb(child, _):
-        try:
-            if not win32gui.IsWindowVisible(child):
-                return True
-            cls  = win32gui.GetClassName(child)
-            text = win32gui.GetWindowText(child).strip()
-            if cls in _TAB_CLASSES and text:
-                r = win32gui.GetWindowRect(child)
-                w, h = r[2] - r[0], r[3] - r[1]
-                if 15 < w < 400 and 10 < h < 80:
-                    cx = r[0] + w // 2
-                    cy = r[1] + h // 2
-                    controls.append({
-                        "name":    text,
-                        "x_ratio": (cx - px) / pw,
-                        "y_ratio": (cy - py) / ph,
-                    })
-        except Exception:
-            pass
-        return True
-
-    try:
-        win32gui.EnumChildWindows(hwnd, cb, None)
-    except Exception:
-        pass
-
-    seen, unique = set(), []
-    for c in controls:
-        if c["name"] not in seen:
-            seen.add(c["name"])
-            unique.append(c)
-    return unique
-
-
-def find_emr_button(hwnd: int) -> dict | None:
-    """메인 창에서 EMR/챠트 열기 버튼 찾기"""
-    for tab in find_tabs_by_enum(hwnd):
-        if any(kw in tab["name"].lower() for kw in _EMR_BUTTON_KEYWORDS):
-            return tab
-    return None
-
-
-def open_emr_and_get_hwnd(hwnd: int, timeout: float = 6.0) -> int | None:
-    """
-    EMR 버튼 클릭 후 새로 생긴 창의 hwnd 반환.
-    새 창이 열리지 않으면 None.
-    """
-    btn = find_emr_button(hwnd)
-    if not btn:
-        return None
-
-    rect = win32gui.GetWindowRect(hwnd)
-    ox, oy = rect[0], rect[1]
-    w = rect[2] - ox
-    h = rect[3] - oy
-    abs_x = int(ox + btn["x_ratio"] * w)
-    abs_y = int(oy + btn["y_ratio"] * h)
-
-    before = {h for h, _ in _enum_windows()}
-
-    activate_window(hwnd)
-    pyautogui.click(abs_x, abs_y)
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(0.4)
-        after = {h for h, _ in _enum_windows()}
-        new_hwnds = after - before
-        if new_hwnds:
-            return next(iter(new_hwnds))
-
-    return None
-
-
-# ── Claude Vision 분석 ────────────────────────────────────────────────────────
-
-def find_tabs_by_vision(screenshot: Image.Image,
-                        api_key: str, model: str) -> list[dict]:
-    """
-    Claude Vision으로 탭/메뉴 버튼 위치 파악.
-    반환: [{"name": ..., "x_ratio": ..., "y_ratio": ...}, ...]
+    EMR 화면에서 작성문서 목록 항목의 위치를 Vision으로 파악.
+    반환: [{"name":..., "x_ratio":..., "y_ratio":...}, ...] (target_docs 순서)
     """
     buf = io.BytesIO()
     screenshot.save(buf, format="PNG")
     b64 = base64.standard_b64encode(buf.getvalue()).decode()
 
+    doc_list = "\n".join(f"- {d}" for d in target_docs)
     prompt = (
-        "이 EMR 프로그램 화면에서 클릭할 수 있는 탭, 메뉴 버튼, 사이드바 항목을 모두 찾아주세요.\n"
-        "각 항목의 이름과 위치를 이미지 너비/높이 대비 비율(0.0~1.0)로 반환하세요.\n"
-        "JSON 배열만 응답 (다른 텍스트 없이):\n"
-        '[{"name":"항목이름","x_ratio":0.1,"y_ratio":0.05},...]\n\n'
-        "탭이나 버튼이 없으면 [] 반환."
+        "이 EMR 화면의 좌측 또는 우측 문서 목록(트리뷰/리스트/사이드바)에서 "
+        "다음 항목들을 찾아주세요:\n"
+        f"{doc_list}\n\n"
+        "찾은 항목의 클릭 위치를 x_ratio, y_ratio (이미지 크기 대비 0.0~1.0)로 반환하세요.\n"
+        "화면에 없는 항목은 제외하고, JSON 배열만 응답:\n"
+        '[{"name":"항목이름","x_ratio":0.1,"y_ratio":0.3},...]'
     )
 
     client = anthropic.Anthropic(api_key=api_key)
@@ -247,34 +162,64 @@ def find_tabs_by_vision(screenshot: Image.Image,
             start = text.find("[")
             end   = text.rfind("]") + 1
             text  = text[start:end]
-        tabs = json.loads(text)
-        return [t for t in tabs
-                if "name" in t and "x_ratio" in t and "y_ratio" in t]
+        items = json.loads(text)
+        items = [x for x in items
+                 if "name" in x and "x_ratio" in x and "y_ratio" in x]
+        # target_docs 순서로 정렬
+        order = {d: i for i, d in enumerate(target_docs)}
+        items.sort(key=lambda x: order.get(x["name"], 999))
+        return items
     except Exception:
         return []
 
 
-# ── 통합: 탭 탐색 (열거 → Vision → 폴백) ─────────────────────────────────────
+# ── 문서 목록 자동 순회 ───────────────────────────────────────────────────────
 
-def identify_tabs(hwnd: int, screenshot: Image.Image,
-                  api_key: str, model: str) -> tuple[list[dict], str]:
+def collect_doc_list(
+    hwnd: int,
+    target_docs: list[str],
+    api_key: str,
+    model: str,
+    status_cb=None,
+) -> tuple[list[tuple[str, Image.Image]], list[dict]]:
     """
-    탭 탐색 통합 함수.
-    반환: (tabs, method)
-      method: "enum" | "vision" | "fallback"
+    작성문서 목록에서 target_docs 항목을 순서대로 클릭하며 캡처.
+    반환: ([(탭명, Image), ...], found_items)
     """
-    tabs = find_tabs_by_enum(hwnd)
-    if tabs:
-        return tabs, "enum"
+    if status_cb:
+        status_cb("문서 목록 항목 위치 분석 중 (Vision)...")
 
-    tabs = find_tabs_by_vision(screenshot, api_key, model)
-    if tabs:
-        return tabs, "vision"
+    screenshot = capture_window(hwnd)
+    items = find_doc_items_by_vision(screenshot, target_docs, api_key, model)
 
-    return [], "fallback"
+    if not items:
+        return [], []
+
+    rect = win32gui.GetWindowRect(hwnd)
+    ox, oy = rect[0], rect[1]
+    w = rect[2] - ox
+    h = rect[3] - oy
+
+    results = []
+    for i, item in enumerate(items):
+        name  = item.get("name", f"문서{i+1}")
+        abs_x = int(ox + item["x_ratio"] * w)
+        abs_y = int(oy + item["y_ratio"] * h)
+
+        if status_cb:
+            status_cb(f"[{i+1}/{len(items)}] {name} 캡처 중...")
+
+        activate_window(hwnd)
+        pyautogui.click(abs_x, abs_y)
+        time.sleep(_WAIT_AFTER_CLICK)
+
+        img = capture_window(hwnd)
+        results.append((name, img))
+
+    return results, items
 
 
-# ── 탭 자동 순회 ──────────────────────────────────────────────────────────────
+# ── 하위 호환: 탭 기반 수집 (수동 지정 탭 목록용) ────────────────────────────
 
 def collect_all_tabs(
     hwnd: int,
