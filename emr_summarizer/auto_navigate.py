@@ -13,10 +13,13 @@ import io
 import json
 import time
 
+import os
+
 import anthropic
 import pyautogui
 import win32con
 import win32gui
+import win32process
 import win32ui
 from PIL import Image, ImageGrab
 
@@ -52,7 +55,14 @@ def _enum_windows() -> list[tuple[int, str]]:
 
 
 def find_ngt_window() -> tuple[int, str] | None:
+    my_pid = os.getpid()
     for hwnd, title in _enum_windows():
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid == my_pid:
+                continue  # 자기 자신(요약 앱) 제외
+        except Exception:
+            pass
         if any(kw in title.lower() for kw in _NGT_KEYWORDS):
             return hwnd, title
     return None

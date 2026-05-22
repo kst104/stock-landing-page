@@ -268,7 +268,7 @@ class SettingsDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("NGTMediPlus EMR 자동 요약")
+        self.title("AI 진료기록 요약")
         self.geometry("900x720")
         self.minsize(750, 550)
 
