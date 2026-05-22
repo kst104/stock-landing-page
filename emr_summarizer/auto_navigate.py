@@ -158,10 +158,15 @@ def collect_menu_items(
     """
     메뉴 항목 목록을 순서대로 클릭하며 전체화면 캡처.
 
-    status_cb(msg)           — 상태 문자열 콜백
-    item_cb(idx, total, name, img) — 항목 캡처 완료 콜백 (미리보기용)
+    좌표 기준: ImageGrab.grab() 캡처 크기 (pyautogui.size() 사용 시
+    멀티모니터 환경에서 좌표 불일치 발생 → 실제 캡처 이미지 크기 사용).
+
+    status_cb(msg)                 — 상태 문자열 콜백
+    item_cb(idx, total, name, img) — 항목 캡처 완료 콜백
     """
-    sw, sh = pyautogui.size()
+    # Vision이 분석한 스크린샷과 동일한 기준으로 좌표 계산
+    ref = ImageGrab.grab()
+    sw, sh = ref.size
     total  = len(items)
 
     results = []
@@ -171,10 +176,14 @@ def collect_menu_items(
         abs_y = int(item["y_ratio"] * sh)
 
         if status_cb:
-            status_cb(f"[{i+1}/{total}] {name} 캡처 중...")
+            status_cb(f"[{i+1}/{total}] {name} 클릭 중...")
 
+        # 창 활성화 후 단일 클릭 → 더블클릭 (트리뷰/리스트 호환)
         activate_window(hwnd)
+        time.sleep(0.2)
         pyautogui.click(abs_x, abs_y)
+        time.sleep(0.3)
+        pyautogui.doubleClick(abs_x, abs_y)
         time.sleep(_WAIT_AFTER_CLICK)
 
         img = capture_screen(hwnd)
