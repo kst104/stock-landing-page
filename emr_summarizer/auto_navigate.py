@@ -640,6 +640,13 @@ def _content_region(img: Image.Image) -> Image.Image:
 # 괄호 숫자 없어도 항상 전체 페이지 수집을 강제하는 문서 키워드
 ALWAYS_PAGINATE = ["간호기록지", "응급실 진료기록지", "응급실진료기록지", "응급실기록지"]
 
+# 절대 클릭하면 안 되는 위험 버튼 (저장/삭제 등) — 페이지 이동과 혼동 금지
+DANGER_BUTTON_KEYWORDS = [
+    "저장", "삭제", "수정", "등록", "확인", "닫기", "출력", "인쇄",
+    "전송", "발송", "승인", "취소", "신규", "추가", "복사", "잠금",
+    "save", "delete", "remove", "submit", "print", "confirm", "close",
+]
+
 
 def _parse_item_count(raw_name: str) -> tuple[str, int]:
     """
@@ -706,30 +713,55 @@ def _find_nav_buttons_abs(hwnd: int, rect: tuple,
 
         prompt = (
             "이 이미지는 EMR 프로그램 화면의 상단 부분입니다.\n"
-            "문서 페이지를 이동하는 버튼을 찾아주세요:\n"
+            "문서 페이지를 이동하는 버튼만 찾아주세요:\n"
             "  • '이전' 또는 '◀' 또는 '<' — 이전 페이지 버튼\n"
             "  • '다음' 또는 '▶' 또는 '>' — 다음 페이지 버튼\n"
-            "버튼은 상단 툴바나 문서 헤더 근처에 있습니다.\n"
+            "버튼은 상단 툴바나 문서 헤더 근처에 있습니다.\n\n"
+            "주의: '저장','삭제','수정','등록','출력','인쇄','확인','닫기' 같은 버튼은\n"
+            "페이지 이동 버튼이 아니므로 prev/next 로 절대 반환하지 마세요.\n"
+            "이 버튼들의 위치는 danger 배열에 따로 담아주세요(혼동 방지용).\n\n"
             "이 이미지 전체 크기 기준 비율(0.0~1.0)로 반환:\n"
-            '{"prev_x":0.3,"prev_y":0.5,"next_x":0.4,"next_y":0.5}\n'
-            "버튼을 찾을 수 없으면: null"
+            '{"prev_x":0.3,"prev_y":0.5,"next_x":0.4,"next_y":0.5,'
+            '"danger":[{"x":0.8,"y":0.5},{"x":0.9,"y":0.5}]}\n'
+            "이동 버튼을 찾을 수 없으면: null"
         )
         client = anthropic.Anthropic(api_key=api_key)
-        text = _vision_call(client, model, header, prompt, max_tokens=120)
+        text = _vision_call(client, model, header, prompt, max_tokens=250)
 
         if "null" not in text.lower():
             data = _parse_json(text)
             if isinstance(data, dict):
                 log_w = rect[2] - rect[0]
                 log_h = rect[3] - rect[1]
+
+                def _abs(rx, ry):
+                    return (rect[0] + int(rx * log_w),
+                            rect[1] + int(ry * HEADER_H_RATIO * log_h))
+
+                # 위험 버튼 절대 좌표 목록
+                danger_pts: list[tuple[int, int]] = []
+                for d in (data.get("danger") or []):
+                    try:
+                        danger_pts.append(_abs(d["x"], d["y"]))
+                    except Exception:
+                        pass
+
+                # 이동 버튼이 위험 버튼과 너무 가까우면 오인식으로 보고 버림
+                near_thresh = max(int(log_w * 0.03), 25)   # px
+
+                def _too_close(px, py):
+                    return any(abs(px - dx) <= near_thresh and
+                               abs(py - dy) <= near_thresh
+                               for dx, dy in danger_pts)
+
                 if "prev_x" in data and "prev_y" in data:
-                    result["prev_abs_x"] = rect[0] + int(data["prev_x"] * log_w)
-                    result["prev_abs_y"] = rect[1] + int(
-                        data["prev_y"] * HEADER_H_RATIO * log_h)
+                    px, py = _abs(data["prev_x"], data["prev_y"])
+                    if not _too_close(px, py):
+                        result["prev_abs_x"], result["prev_abs_y"] = px, py
                 if "next_x" in data and "next_y" in data:
-                    result["next_abs_x"] = rect[0] + int(data["next_x"] * log_w)
-                    result["next_abs_y"] = rect[1] + int(
-                        data["next_y"] * HEADER_H_RATIO * log_h)
+                    nx, ny = _abs(data["next_x"], data["next_y"])
+                    if not _too_close(nx, ny):
+                        result["next_abs_x"], result["next_abs_y"] = nx, ny
     except Exception:
         pass
 
@@ -775,54 +807,32 @@ def _collect_pages(
     collected:    int = 0
     use_keyboard: bool = False   # Page Up 키 사용 여부
 
-    # 버튼을 못 찾았으면 후보 좌표를 순서대로 눌러 보며 실제 작동 좌표 탐색
+    # 이전 버튼 좌표를 못 찾았으면 Page Up 키만 사용한다.
+    # (좌표 무작위 클릭은 저장/삭제 버튼을 누를 위험이 있어 금지)
     if prev_x is None:
         if status_cb:
             status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
-                      "— 이전 버튼 위치 탐색 중...")
-        # 툴바 전형 위치: y=4~15%, x=25~70%
-        candidates = [
-            (rect[0] + int(log_w * xr), rect[1] + int(log_h * yr))
-            for yr in (0.05, 0.07, 0.09, 0.11, 0.13, 0.04, 0.15)
-            for xr in (0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65)
-        ]
-        for cx, cy in candidates:
-            activate_window(hwnd)
-            _safe_click(cx, cy)
-            time.sleep(max(_WAIT_AFTER_CLICK, 1.2))
-            test = capture_screen(hwnd)
-            if _images_differ(prev_content, _content_region(test)):
-                prev_x, prev_y = cx, cy
-                pages.append(("_pg_", test))
-                prev_content = _content_region(test)
-                collected = 1
-                break
+                      "— 이전 버튼 미발견, Page Up 키 시도...")
+        activate_window(hwnd)
+        try:
+            pyautogui.press("pageup")
+        except Exception:
+            ctypes.windll.user32.keybd_event(0x21, 0, 0, 0)   # VK_PRIOR
+            time.sleep(0.05)
+            ctypes.windll.user32.keybd_event(0x21, 0, 0x0002, 0)
+        time.sleep(_WAIT_AFTER_CLICK)
+        test_kb = capture_screen(hwnd)
+        if _images_differ(prev_content, _content_region(test_kb)):
+            use_keyboard = True
+            pages.append(("_pg_", test_kb))
+            prev_content = _content_region(test_kb)
+            collected = 1
 
-        # 좌표 탐색 실패 → Page Up 키보드 시도
-        if prev_x is None:
+        if not use_keyboard:
+            # Page Up 무효 → 단일 페이지 (위험 버튼 클릭 방지 위해 추측 클릭 안 함)
             if status_cb:
                 status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
-                          "— Page Up 키 시도...")
-            activate_window(hwnd)
-            try:
-                pyautogui.press("pageup")
-            except Exception:
-                ctypes.windll.user32.keybd_event(0x21, 0, 0, 0)   # VK_PRIOR
-                time.sleep(0.05)
-                ctypes.windll.user32.keybd_event(0x21, 0, 0x0002, 0)
-            time.sleep(_WAIT_AFTER_CLICK)
-            test_kb = capture_screen(hwnd)
-            if _images_differ(prev_content, _content_region(test_kb)):
-                use_keyboard = True
-                pages.append(("_pg_", test_kb))
-                prev_content = _content_region(test_kb)
-                collected = 1
-
-        if prev_x is None and not use_keyboard:
-            # 어떤 방법도 효과 없음 → 단일 페이지
-            if status_cb:
-                status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
-                          "— 이전 버튼 미발견, 1페이지만 수집")
+                          "— 페이지 이동 불가, 1페이지만 수집")
             if item_cb:
                 item_cb(menu_idx, menu_total, base_name, first_img)
             return [(base_name, first_img)]
