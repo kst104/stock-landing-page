@@ -13,6 +13,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 
 import ctypes
@@ -633,17 +634,23 @@ def _content_region(img: Image.Image) -> Image.Image:
     return img.crop((int(w * 0.22), 0, w, h))
 
 
-# 항상 전체 페이지 수집을 시도할 문서 키워드 (이름에 포함되면 적용)
-PAGINATED_KEYWORDS = [
-    "간호기록지", "응급실 진료기록지", "응급실진료기록지",
-    "진료기록지", "경과기록지", "수술기록지", "투약기록지",
-    "VS기록지", "BST기록지", "I&O기록지",
-]
+# 괄호 숫자 없어도 항상 전체 페이지 수집을 강제하는 문서 키워드
+ALWAYS_PAGINATE = ["간호기록지", "응급실 진료기록지", "응급실진료기록지", "응급실기록지"]
 
 
-def _is_paginated_doc(name: str) -> bool:
-    """이 문서는 항상 이전 버튼으로 전체 페이지를 수집해야 하는 타입인지 확인."""
-    return any(kw in name for kw in PAGINATED_KEYWORDS)
+def _parse_item_count(raw_name: str) -> tuple[str, int]:
+    """
+    왼쪽 메뉴 항목 이름에서 괄호 안 장수를 추출한다.
+    '간호기록지(15)'  → ('간호기록지', 15)
+    '응급실 진료기록지(3)' → ('응급실 진료기록지', 3)
+    '간호초기평가기록'      → ('간호초기평가기록', 1)
+    """
+    m = re.search(r'\((\d+)\)\s*$', raw_name.strip())
+    if m:
+        count = int(m.group(1))
+        base  = raw_name[:m.start()].strip()
+        return base, count
+    return raw_name.strip(), 1
 
 
 def _images_differ(img1: Image.Image, img2: Image.Image,
@@ -658,27 +665,26 @@ def _images_differ(img1: Image.Image, img2: Image.Image,
         return True
 
 
-def _find_prev_button(img: Image.Image, api_key: str, model: str) -> dict | None:
+def _find_nav_buttons(img: Image.Image, api_key: str, model: str) -> dict | None:
     """
-    화면에서 '이전(◀)' 버튼 위치를 찾는다.
-    페이지 총 개수를 알 필요 없이 버튼 좌표만 반환.
-    반환: {"prev_x":0.65, "prev_y":0.08}  (전체 이미지 비율) 또는 None
+    화면 상단에서 '이전(◀)' / '다음(▶)' 버튼 위치를 찾는다.
+    반환: {"prev_x":0.55,"prev_y":0.07,"next_x":0.65,"next_y":0.07}
+          (전체 이미지 비율) 또는 None
     """
     prompt = (
-        "이 EMR 화면에서 문서 페이지를 이전으로 이동하는 버튼을 찾아주세요.\n"
-        "버튼 텍스트: '이전', '◀', '<', '←', 또는 이전 방향 화살표.\n"
-        "페이지 번호(예: 15/15, 3/5)가 있으면 같이 반환하세요.\n\n"
-        "반환 형식 (이미지 전체 크기 기준 비율 0.0~1.0):\n"
-        '{"prev_x":0.65,"prev_y":0.08,"current":15,"total":15}\n'
-        "'이전' 버튼이 전혀 없으면: null"
+        "이 EMR 화면 상단에서 페이지 이동 버튼을 찾아주세요.\n"
+        "이전(◀ 또는 '이전' 텍스트)과 다음(▶ 또는 '다음' 텍스트) 버튼 위치를 반환하세요.\n\n"
+        "반환 형식 (전체 이미지 기준 비율 0.0~1.0):\n"
+        '{"prev_x":0.55,"prev_y":0.07,"next_x":0.65,"next_y":0.07}\n'
+        "버튼이 없으면: null"
     )
     client = anthropic.Anthropic(api_key=api_key)
-    text = _vision_call(client, model, img, prompt, max_tokens=120)
+    text = _vision_call(client, model, img, prompt, max_tokens=100)
     try:
         if "null" in text.lower():
             return None
         data = _parse_json(text)
-        if isinstance(data, dict) and "prev_x" in data and "prev_y" in data:
+        if isinstance(data, dict) and "prev_x" in data:
             return data
     except Exception:
         pass
@@ -688,7 +694,8 @@ def _find_prev_button(img: Image.Image, api_key: str, model: str) -> dict | None
 def _collect_pages(
     hwnd: int,
     rect: tuple,
-    name: str,
+    base_name: str,
+    page_count: int,            # 메뉴 항목 이름에서 파싱한 장수 (1이면 단일)
     first_img: Image.Image,
     api_key: str,
     model: str,
@@ -698,23 +705,21 @@ def _collect_pages(
     item_cb=None,
 ) -> list[tuple[str, Image.Image]]:
     """
-    '이전(◀)' 버튼을 반복 클릭해 모든 페이지 수집.
-    페이지가 바뀌지 않을 때까지 계속 → 총 페이지 수를 몰라도 동작.
-    간호기록지·진료기록지 등 다중 페이지 문서는 항상 전체 수집 시도.
+    page_count 장수만큼 이전(◀) 버튼을 클릭해 전체 페이지를 수집한다.
+    - page_count > 1 : 메뉴 이름의 괄호 숫자를 그대로 사용
+    - ALWAYS_PAGINATE : 숫자 없어도 화면이 바뀌는 동안 계속 수집
+    - 그 외            : 단일 페이지로 처리
     """
-    if not api_key:
-        if item_cb:
-            item_cb(menu_idx, menu_total, name, first_img)
-        return [(name, first_img)]
+    force = any(kw in base_name for kw in ALWAYS_PAGINATE)
 
-    # 이전 버튼 위치 찾기
-    nav = _find_prev_button(first_img, api_key, model)
-
-    # 이전 버튼을 못 찾았고, 다중 페이지 문서 키워드도 아니면 단일 페이지로 처리
-    if not nav and not _is_paginated_doc(name):
+    if page_count <= 1 and not force:
+        # 단일 페이지 — 바로 반환
         if item_cb:
-            item_cb(menu_idx, menu_total, name, first_img)
-        return [(name, first_img)]
+            item_cb(menu_idx, menu_total, base_name, first_img)
+        return [(base_name, first_img)]
+
+    # 이전/다음 버튼 위치를 Vision으로 찾기 (첫 페이지에서 1회)
+    nav = _find_nav_buttons(first_img, api_key, model) if api_key else None
 
     log_w = rect[2] - rect[0]
     log_h = rect[3] - rect[1]
@@ -722,58 +727,60 @@ def _collect_pages(
     if nav:
         prev_x = rect[0] + int(nav["prev_x"] * log_w)
         prev_y = rect[1] + int(nav["prev_y"] * log_h)
-        total_hint = int(nav.get("total", 0))   # Vision이 알려준 총 페이지(참고용)
-        current    = int(nav.get("current", total_hint or 1))
     else:
-        # 버튼 위치 미확인 — 이전 버튼이 보통 있는 위치(상단 중앙~우측)를 추정
-        prev_x = rect[0] + int(log_w * 0.60)
-        prev_y = rect[1] + int(log_h * 0.08)
-        total_hint = 0
-        current    = 1
+        # 버튼 위치 미확인 — EMR 상단 좌측 추정 위치
+        prev_x = rect[0] + int(log_w * 0.55)
+        prev_y = rect[1] + int(log_h * 0.07)
 
-    label0 = f"{name} p{current}" if total_hint else f"{name} (최신)"
-    pages: list[tuple[str, Image.Image]] = [(label0, first_img)]
-    if item_cb:
-        item_cb(menu_idx, menu_total, label0, first_img)
+    # 최신 페이지(첫 캡처) 저장
+    pages: list[tuple[str, Image.Image]] = [("_latest_", first_img)]
 
-    prev_content = _content_region(first_img)
-    pg_offset = 1
-    MAX_PAGES = 60   # 안전 상한
+    prev_content  = _content_region(first_img)
+    needed        = page_count - 1   # 이미 1장 있으므로 나머지
+    collected     = 0
+    MAX_PAGES     = max(needed, 60) if page_count > 1 else 60
 
-    while pg_offset <= MAX_PAGES:
+    while collected < MAX_PAGES:
         if status_cb:
-            hint = f"/{total_hint}" if total_hint else ""
-            status_cb(f"  [{menu_idx}/{menu_total}] {name} — 이전 {pg_offset}번째{hint}...")
+            if page_count > 1:
+                status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
+                          f"— 이전 클릭 ({collected+1}/{needed})...")
+            else:
+                status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
+                          f"— 이전 클릭 ({collected+1})...")
 
         activate_window(hwnd)
         _safe_click(prev_x, prev_y)
         time.sleep(_WAIT_AFTER_CLICK)
 
-        img = capture_screen(hwnd)
+        img     = capture_screen(hwnd)
         content = _content_region(img)
 
-        # 화면이 바뀌지 않으면 더 이상 이전 페이지 없음
         if not _images_differ(prev_content, content):
+            break   # 화면이 안 바뀜 → 더 이상 이전 없음
+
+        pages.append(("_pg_", img))
+        prev_content = content
+        collected += 1
+
+        # 장수를 알고 있으면 정확히 그 수만큼만 수집
+        if page_count > 1 and collected >= needed:
             break
 
-        pg_num = current - pg_offset if total_hint else pg_offset
-        lbl = (f"{name} p{pg_num}" if total_hint
-               else f"{name} (이전{pg_offset})")
-        pages.append((lbl, img))
-        if item_cb:
-            item_cb(menu_idx, menu_total, lbl, img)
-
-        prev_content = content
-        pg_offset += 1
-
-    # 오래된→최신 순으로 정렬 후 1/N, 2/N ... 으로 재레이블
+    # 오래된→최신 순으로 정렬
     pages.reverse()
     total = len(pages)
-    if total > 1:
-        pages = [(f"{name} ({i+1}/{total})", img)
-                 for i, (_, img) in enumerate(pages)]
 
-    return pages
+    # 레이블 확정: "간호기록지 (1/15)", "간호기록지 (2/15)" ...
+    labeled = [(f"{base_name} ({i+1}/{total})", img)
+               for i, (_, img) in enumerate(pages)]
+
+    # item_cb 호출 (순서대로)
+    if item_cb:
+        for lbl, img in labeled:
+            item_cb(menu_idx, menu_total, lbl, img)
+
+    return labeled
 
 
 def collect_menu_items(
@@ -798,11 +805,15 @@ def collect_menu_items(
     for i, item in enumerate(items):
         name  = item["name"]
         abs_x = item["abs_x"]
-        abs_y = item["abs_y"]
+        abs_y    = item["abs_y"]
         menu_idx = i + 1
 
+        # 메뉴 이름에서 장수 파싱: '간호기록지(15)' → base='간호기록지', count=15
+        base_name, page_count = _parse_item_count(name)
+
         if status_cb:
-            status_cb(f"[{menu_idx}/{menu_total}] {name} 여는 중...")
+            cnt_str = f" ({page_count}장)" if page_count > 1 else ""
+            status_cb(f"[{menu_idx}/{menu_total}] {base_name}{cnt_str} 여는 중...")
 
         # 창 활성화 → 단일 클릭
         activate_window(hwnd)
@@ -814,19 +825,16 @@ def collect_menu_items(
         changed = _images_differ(_content_region(prev_img), _content_region(img))
         if not changed:
             if status_cb:
-                status_cb(f"[{menu_idx}/{menu_total}] {name} — 재시도...")
+                status_cb(f"[{menu_idx}/{menu_total}] {base_name} — 재시도...")
             activate_window(hwnd)
             _safe_click(abs_x, abs_y, double=True)
             _send_key(0x0D)
             time.sleep(_WAIT_AFTER_CLICK)
             img = capture_screen(hwnd)
-            changed = _images_differ(_content_region(prev_img), _content_region(img))
 
-        label = name if changed else f"{name} (확인필요)"
-
-        # 페이지네이션 확인 및 전 페이지 수집
+        # 전체 페이지 수집 (page_count > 1 또는 ALWAYS_PAGINATE 키워드면 이전 반복)
         pages = _collect_pages(
-            hwnd, rect, label, img,
+            hwnd, rect, base_name, page_count, img,
             api_key, model,
             menu_idx, menu_total,
             status_cb=status_cb,
