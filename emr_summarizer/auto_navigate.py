@@ -633,6 +633,19 @@ def _content_region(img: Image.Image) -> Image.Image:
     return img.crop((int(w * 0.22), 0, w, h))
 
 
+# 항상 전체 페이지 수집을 시도할 문서 키워드 (이름에 포함되면 적용)
+PAGINATED_KEYWORDS = [
+    "간호기록지", "응급실 진료기록지", "응급실진료기록지",
+    "진료기록지", "경과기록지", "수술기록지", "투약기록지",
+    "VS기록지", "BST기록지", "I&O기록지",
+]
+
+
+def _is_paginated_doc(name: str) -> bool:
+    """이 문서는 항상 이전 버튼으로 전체 페이지를 수집해야 하는 타입인지 확인."""
+    return any(kw in name for kw in PAGINATED_KEYWORDS)
+
+
 def _images_differ(img1: Image.Image, img2: Image.Image,
                    threshold: float = 0.01) -> bool:
     """두 이미지가 threshold 이상 다르면 True (콘텐츠 변경 감지)"""
@@ -645,21 +658,19 @@ def _images_differ(img1: Image.Image, img2: Image.Image,
         return True
 
 
-def _find_pagination(img: Image.Image,
-                     api_key: str, model: str) -> dict | None:
+def _find_prev_button(img: Image.Image, api_key: str, model: str) -> dict | None:
     """
-    화면에서 '현재/전체' 페이지 표시(예: 15/15)와 '이전(◀)' 버튼 위치를 찾는다.
-    EMR은 보통 최신(마지막) 페이지로 열리므로 이전 버튼으로 역방향 탐색.
-    반환: {"current":15, "total":15, "prev_x":0.65, "prev_y":0.08}
-          (이미지 전체 기준 비율) 또는 None(단일 페이지)
+    화면에서 '이전(◀)' 버튼 위치를 찾는다.
+    페이지 총 개수를 알 필요 없이 버튼 좌표만 반환.
+    반환: {"prev_x":0.65, "prev_y":0.08}  (전체 이미지 비율) 또는 None
     """
     prompt = (
-        "이 EMR 화면에서 문서 페이지 네비게이션을 찾아주세요.\n"
-        "'1/3', '15/15' 처럼 '현재/전체' 형식의 페이지 번호가 있는지 확인하세요.\n"
-        "있으면 '이전' 또는 '◀' 버튼의 클릭 위치도 찾아주세요.\n\n"
+        "이 EMR 화면에서 문서 페이지를 이전으로 이동하는 버튼을 찾아주세요.\n"
+        "버튼 텍스트: '이전', '◀', '<', '←', 또는 이전 방향 화살표.\n"
+        "페이지 번호(예: 15/15, 3/5)가 있으면 같이 반환하세요.\n\n"
         "반환 형식 (이미지 전체 크기 기준 비율 0.0~1.0):\n"
-        '{"current":15,"total":15,"prev_x":0.65,"prev_y":0.08}\n'
-        "페이지 표시가 없거나 total이 1이면 반드시: null"
+        '{"prev_x":0.65,"prev_y":0.08,"current":15,"total":15}\n'
+        "'이전' 버튼이 전혀 없으면: null"
     )
     client = anthropic.Anthropic(api_key=api_key)
     text = _vision_call(client, model, img, prompt, max_tokens=120)
@@ -667,7 +678,7 @@ def _find_pagination(img: Image.Image,
         if "null" in text.lower():
             return None
         data = _parse_json(text)
-        if isinstance(data, dict) and int(data.get("total", 1)) > 1:
+        if isinstance(data, dict) and "prev_x" in data and "prev_y" in data:
             return data
     except Exception:
         pass
@@ -687,49 +698,81 @@ def _collect_pages(
     item_cb=None,
 ) -> list[tuple[str, Image.Image]]:
     """
-    문서를 열면 최신(마지막) 페이지로 뜨는 EMR 특성에 맞춰
-    '이전(◀)' 버튼을 반복 클릭해 모든 페이지를 수집한다.
-    수집 순서는 최신→과거 순이므로 결과는 역순으로 정렬 반환.
+    '이전(◀)' 버튼을 반복 클릭해 모든 페이지 수집.
+    페이지가 바뀌지 않을 때까지 계속 → 총 페이지 수를 몰라도 동작.
+    간호기록지·진료기록지 등 다중 페이지 문서는 항상 전체 수집 시도.
     """
-    pagination = _find_pagination(first_img, api_key, model) if api_key else None
-
-    if not pagination:
-        # 단일 페이지
+    if not api_key:
         if item_cb:
             item_cb(menu_idx, menu_total, name, first_img)
         return [(name, first_img)]
 
-    total_pages = int(pagination["total"])
-    current     = int(pagination.get("current", total_pages))
+    # 이전 버튼 위치 찾기
+    nav = _find_prev_button(first_img, api_key, model)
+
+    # 이전 버튼을 못 찾았고, 다중 페이지 문서 키워드도 아니면 단일 페이지로 처리
+    if not nav and not _is_paginated_doc(name):
+        if item_cb:
+            item_cb(menu_idx, menu_total, name, first_img)
+        return [(name, first_img)]
+
     log_w = rect[2] - rect[0]
     log_h = rect[3] - rect[1]
-    prev_x = rect[0] + int(pagination["prev_x"] * log_w)
-    prev_y = rect[1] + int(pagination["prev_y"] * log_h)
 
-    # 현재 페이지(최신) 저장
-    pages: list[tuple[str, Image.Image]] = []
-    label = f"{name} ({current}/{total_pages})"
-    pages.append((label, first_img))
+    if nav:
+        prev_x = rect[0] + int(nav["prev_x"] * log_w)
+        prev_y = rect[1] + int(nav["prev_y"] * log_h)
+        total_hint = int(nav.get("total", 0))   # Vision이 알려준 총 페이지(참고용)
+        current    = int(nav.get("current", total_hint or 1))
+    else:
+        # 버튼 위치 미확인 — 이전 버튼이 보통 있는 위치(상단 중앙~우측)를 추정
+        prev_x = rect[0] + int(log_w * 0.60)
+        prev_y = rect[1] + int(log_h * 0.08)
+        total_hint = 0
+        current    = 1
+
+    label0 = f"{name} p{current}" if total_hint else f"{name} (최신)"
+    pages: list[tuple[str, Image.Image]] = [(label0, first_img)]
     if item_cb:
-        item_cb(menu_idx, menu_total, label, first_img)
+        item_cb(menu_idx, menu_total, label0, first_img)
 
-    # 이전 버튼으로 current-1 → ... → 1 까지 수집
-    for pg in range(current - 1, 0, -1):
+    prev_content = _content_region(first_img)
+    pg_offset = 1
+    MAX_PAGES = 60   # 안전 상한
+
+    while pg_offset <= MAX_PAGES:
         if status_cb:
-            status_cb(f"  [{menu_idx}/{menu_total}] {name} — {pg}/{total_pages} 페이지...")
+            hint = f"/{total_hint}" if total_hint else ""
+            status_cb(f"  [{menu_idx}/{menu_total}] {name} — 이전 {pg_offset}번째{hint}...")
 
         activate_window(hwnd)
         _safe_click(prev_x, prev_y)
         time.sleep(_WAIT_AFTER_CLICK)
 
         img = capture_screen(hwnd)
-        lbl = f"{name} ({pg}/{total_pages})"
+        content = _content_region(img)
+
+        # 화면이 바뀌지 않으면 더 이상 이전 페이지 없음
+        if not _images_differ(prev_content, content):
+            break
+
+        pg_num = current - pg_offset if total_hint else pg_offset
+        lbl = (f"{name} p{pg_num}" if total_hint
+               else f"{name} (이전{pg_offset})")
         pages.append((lbl, img))
         if item_cb:
             item_cb(menu_idx, menu_total, lbl, img)
 
-    # 오래된→최신 순으로 뒤집어서 반환
+        prev_content = content
+        pg_offset += 1
+
+    # 오래된→최신 순으로 정렬 후 1/N, 2/N ... 으로 재레이블
     pages.reverse()
+    total = len(pages)
+    if total > 1:
+        pages = [(f"{name} ({i+1}/{total})", img)
+                 for i, (_, img) in enumerate(pages)]
+
     return pages
 
 
@@ -743,7 +786,8 @@ def collect_menu_items(
 ) -> list[tuple[str, Image.Image]]:
     """
     메뉴 항목을 순서대로 클릭하며 오른쪽 콘텐츠를 캡처.
-    각 항목에서 N/M 페이지 표시가 있으면 '다음'을 반복해 전 페이지 수집.
+    각 항목에서 이전(◀) 버튼을 클릭해 페이지가 바뀌는 동안 전 페이지 수집.
+    간호기록지·진료기록지 등 PAGINATED_KEYWORDS 항목은 항상 전체 수집 시도.
     """
     menu_total = len(items)
     results: list[tuple[str, Image.Image]] = []
