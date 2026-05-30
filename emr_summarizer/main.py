@@ -749,7 +749,21 @@ class App(tk.Tk):
 
         def _do_capture():
             import time as _t
+            import win32gui as _wg
             from PIL import ImageGrab
+
+            # 현재 포그라운드 창 제목으로 제외 여부 확인
+            try:
+                fg = _wg.GetForegroundWindow()
+                title = _wg.GetWindowText(fg)
+            except Exception:
+                title = ""
+
+            if auto_navigate.is_excluded(title):
+                self._status(f"제외 항목 건너뜀: {title}")
+                bar.deiconify()
+                return
+
             # 캡처 바를 잠시 숨겨서 찍히지 않게
             bar.withdraw()
             _t.sleep(0.3)

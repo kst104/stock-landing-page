@@ -35,6 +35,13 @@ _NGT_KEYWORDS = [
 ]
 _WAIT_AFTER_CLICK = 2.5
 
+# 캡처 제외 항목 (이름에 포함되면 건너뜀)
+EXCLUDED_KEYWORDS = ["동의서", "욕창", "상처기록", "영양", "제증명"]
+
+
+def is_excluded(name: str) -> bool:
+    return any(kw in name for kw in EXCLUDED_KEYWORDS)
+
 
 # ── 창 탐색 ───────────────────────────────────────────────────────────────────
 
@@ -357,8 +364,11 @@ def find_all_menu_items_by_vision(screenshot: Image.Image,
 
     result = []
     for item in items:
+        name = item["name"]
+        if is_excluded(name):
+            continue   # 제외 항목 건너뜀
         result.append({
-            "name":  item["name"],
+            "name":  name,
             "abs_x": ox + int(item["x_ratio"] * pw),
             "abs_y": oy + int(item["y_ratio"] * ph),
         })
