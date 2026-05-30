@@ -179,10 +179,10 @@ class TabConfirmDialog(tk.Toplevel):
 
     def _build(self):
         ttk.Label(self,
-                  text="수집할 항목을 클릭해서 선택하세요:",
+                  text="스캔할 항목을 확인하세요 (선택된 항목만 스캔됩니다):",
                   font=("맑은 고딕", 10, "bold")).pack(pady=(12, 4), padx=16, anchor="w")
         ttk.Label(self,
-                  text="클릭 → 선택(파란색)   다시 클릭 → 선택 해제",
+                  text="기본적으로 전체 선택됨 · 제외할 항목은 클릭해서 해제",
                   font=("맑은 고딕", 8), foreground="gray").pack(padx=16, anchor="w")
 
         # 전체 선택/해제 + 카운터
@@ -221,6 +221,9 @@ class TabConfirmDialog(tk.Toplevel):
         for tab in self._tabs:
             self._lb.insert(tk.END, f"  {tab.get('name', '')}")
 
+        # 기본값: 전체 선택 (스캔 확인 게이트 — 빼고 싶은 것만 해제)
+        self._lb.select_set(0, tk.END)
+
         # 마우스 휠
         self._lb.bind("<MouseWheel>",
                       lambda e: self._lb.yview_scroll(-1 * (e.delta // 120), "units"))
@@ -232,7 +235,7 @@ class TabConfirmDialog(tk.Toplevel):
         # 하단 버튼
         btn_bar = ttk.Frame(self)
         btn_bar.pack(fill="x", padx=16, pady=10, side="bottom")
-        ttk.Button(btn_bar, text="선택 항목 수집 시작",
+        ttk.Button(btn_bar, text="선택 항목 스캔 시작",
                    command=self._confirm).pack(side="right", padx=4)
         ttk.Button(btn_bar, text="취소",
                    command=self.destroy).pack(side="right")
