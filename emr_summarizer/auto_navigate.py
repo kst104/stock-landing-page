@@ -634,16 +634,17 @@ def _images_differ(img1: Image.Image, img2: Image.Image,
 def _find_pagination(img: Image.Image,
                      api_key: str, model: str) -> dict | None:
     """
-    화면에서 '현재/전체' 페이지 표시(예: 1/3)와 '다음(▶)' 버튼 위치를 찾는다.
-    반환: {"current":1, "total":3, "next_x":0.72, "next_y":0.08}
+    화면에서 '현재/전체' 페이지 표시(예: 15/15)와 '이전(◀)' 버튼 위치를 찾는다.
+    EMR은 보통 최신(마지막) 페이지로 열리므로 이전 버튼으로 역방향 탐색.
+    반환: {"current":15, "total":15, "prev_x":0.65, "prev_y":0.08}
           (이미지 전체 기준 비율) 또는 None(단일 페이지)
     """
     prompt = (
         "이 EMR 화면에서 문서 페이지 네비게이션을 찾아주세요.\n"
-        "'1/3', '2/5' 처럼 '현재/전체' 형식의 페이지 번호가 있는지 확인하세요.\n"
-        "있으면 '다음' 또는 '▶' 버튼의 클릭 위치도 찾아주세요.\n\n"
+        "'1/3', '15/15' 처럼 '현재/전체' 형식의 페이지 번호가 있는지 확인하세요.\n"
+        "있으면 '이전' 또는 '◀' 버튼의 클릭 위치도 찾아주세요.\n\n"
         "반환 형식 (이미지 전체 크기 기준 비율 0.0~1.0):\n"
-        '{"current":1,"total":3,"next_x":0.72,"next_y":0.08}\n'
+        '{"current":15,"total":15,"prev_x":0.65,"prev_y":0.08}\n'
         "페이지 표시가 없거나 total이 1이면 반드시: null"
     )
     client = anthropic.Anthropic(api_key=api_key)
@@ -672,50 +673,50 @@ def _collect_pages(
     item_cb=None,
 ) -> list[tuple[str, Image.Image]]:
     """
-    첫 페이지 캡처 후 N/M 페이지네이션을 감지하고
-    '다음' 버튼을 반복 클릭해 모든 페이지를 수집한다.
+    문서를 열면 최신(마지막) 페이지로 뜨는 EMR 특성에 맞춰
+    '이전(◀)' 버튼을 반복 클릭해 모든 페이지를 수집한다.
+    수집 순서는 최신→과거 순이므로 결과는 역순으로 정렬 반환.
     """
-    results = []
-
     pagination = _find_pagination(first_img, api_key, model) if api_key else None
 
     if not pagination:
         # 단일 페이지
-        results.append((name, first_img))
         if item_cb:
             item_cb(menu_idx, menu_total, name, first_img)
-        return results
+        return [(name, first_img)]
 
     total_pages = int(pagination["total"])
-    # 논리 픽셀 기준 창 크기로 좌표 계산 (DPI 스케일 오차 방지)
+    current     = int(pagination.get("current", total_pages))
     log_w = rect[2] - rect[0]
     log_h = rect[3] - rect[1]
+    prev_x = rect[0] + int(pagination["prev_x"] * log_w)
+    prev_y = rect[1] + int(pagination["prev_y"] * log_h)
 
-    # 첫 페이지
-    label0 = f"{name} (1/{total_pages})"
-    results.append((label0, first_img))
+    # 현재 페이지(최신) 저장
+    pages: list[tuple[str, Image.Image]] = []
+    label = f"{name} ({current}/{total_pages})"
+    pages.append((label, first_img))
     if item_cb:
-        item_cb(menu_idx, menu_total, label0, first_img)
+        item_cb(menu_idx, menu_total, label, first_img)
 
-    # 2페이지~마지막 페이지
-    for pg in range(2, total_pages + 1):
+    # 이전 버튼으로 current-1 → ... → 1 까지 수집
+    for pg in range(current - 1, 0, -1):
         if status_cb:
             status_cb(f"  [{menu_idx}/{menu_total}] {name} — {pg}/{total_pages} 페이지...")
 
-        next_x = rect[0] + int(pagination["next_x"] * log_w)
-        next_y = rect[1] + int(pagination["next_y"] * log_h)
-
         activate_window(hwnd)
-        _safe_click(next_x, next_y)
+        _safe_click(prev_x, prev_y)
         time.sleep(_WAIT_AFTER_CLICK)
 
         img = capture_screen(hwnd)
-        label = f"{name} ({pg}/{total_pages})"
-        results.append((label, img))
+        lbl = f"{name} ({pg}/{total_pages})"
+        pages.append((lbl, img))
         if item_cb:
-            item_cb(menu_idx, menu_total, label, img)
+            item_cb(menu_idx, menu_total, lbl, img)
 
-    return results
+    # 오래된→최신 순으로 뒤집어서 반환
+    pages.reverse()
+    return pages
 
 
 def collect_menu_items(
