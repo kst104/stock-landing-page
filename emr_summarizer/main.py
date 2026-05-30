@@ -161,44 +161,87 @@ class WindowPickerDialog(tk.Toplevel):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TabConfirmDialog(tk.Toplevel):
-    def __init__(self, parent, tabs: list[dict], on_confirm, title: str = "발견된 탭 확인"):
+    def __init__(self, parent, tabs: list[dict], on_confirm, title: str = "수집 항목 선택"):
         super().__init__(parent)
         self.title(title)
-        self.geometry("400x420")
+        self.geometry("420x480")
         self.resizable(True, True)
         self.grab_set()
         self._tabs = tabs
         self._on_confirm = on_confirm
+        self._vars: list[tk.BooleanVar] = []
         self._build()
 
     def _build(self):
         ttk.Label(self,
-                  text=f"아래 {len(self._tabs)}개 항목을 자동으로 순회합니다.\n진행할까요?",
-                  font=("맑은 고딕", 10)).pack(pady=10)
+                  text="수집할 항목을 선택하세요:",
+                  font=("맑은 고딕", 10, "bold")).pack(pady=(12, 4), padx=16, anchor="w")
 
+        # 전체 선택/해제 버튼
+        ctrl = ttk.Frame(self)
+        ctrl.pack(fill="x", padx=16, pady=(0, 4))
+        ttk.Button(ctrl, text="전체 선택", width=10,
+                   command=self._select_all).pack(side="left", padx=(0, 4))
+        ttk.Button(ctrl, text="전체 해제", width=10,
+                   command=self._deselect_all).pack(side="left")
+        self._sel_lbl = ttk.Label(ctrl, text=f"0 / {len(self._tabs)} 선택",
+                                  foreground="gray")
+        self._sel_lbl.pack(side="right")
+
+        # 체크박스 목록 (스크롤)
         frame = ttk.Frame(self)
         frame.pack(fill="both", expand=True, padx=16, pady=(0, 6))
-
         sb = ttk.Scrollbar(frame)
         sb.pack(side="right", fill="y")
-        lb = tk.Listbox(frame, yscrollcommand=sb.set, font=("맑은 고딕", 9), height=16)
-        lb.pack(fill="both", expand=True)
-        sb.config(command=lb.yview)
+        canvas = tk.Canvas(frame, yscrollcommand=sb.set, highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        sb.config(command=canvas.yview)
 
-        for i, tab in enumerate(self._tabs, 1):
-            lb.insert("end", f"  {i}. {tab.get('name', tab.get('name',''))}")
+        inner = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
 
-        # 버튼은 항상 하단에 고정
+        for i, tab in enumerate(self._tabs):
+            var = tk.BooleanVar(value=True)
+            self._vars.append(var)
+            cb = ttk.Checkbutton(inner, text=f"  {tab.get('name', '')}",
+                                 variable=var,
+                                 command=self._update_count)
+            cb.pack(anchor="w", pady=1)
+
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        self._update_count()
+
+        # 하단 버튼 (항상 고정)
         btn = ttk.Frame(self)
         btn.pack(fill="x", padx=16, pady=10, side="bottom")
-        ttk.Button(btn, text="자동 수집 시작",
+        ttk.Button(btn, text="선택 항목 수집 시작",
                    command=self._confirm).pack(side="right", padx=4)
         ttk.Button(btn, text="취소",
                    command=self.destroy).pack(side="right")
 
+    def _select_all(self):
+        for v in self._vars:
+            v.set(True)
+        self._update_count()
+
+    def _deselect_all(self):
+        for v in self._vars:
+            v.set(False)
+        self._update_count()
+
+    def _update_count(self):
+        n = sum(v.get() for v in self._vars)
+        self._sel_lbl.config(text=f"{n} / {len(self._tabs)} 선택")
+
     def _confirm(self):
+        selected = [tab for tab, var in zip(self._tabs, self._vars) if var.get()]
+        if not selected:
+            messagebox.showwarning("선택 없음", "하나 이상의 항목을 선택하세요.", parent=self)
+            return
         self.destroy()
-        self._on_confirm()
+        self._on_confirm(selected)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -665,10 +708,10 @@ class App(tk.Tk):
         threading.Thread(target=_analyze, daemon=True).start()
 
     def _confirm_and_collect(self, tabs: list[dict], hwnd: int, method: str = ""):
-        label = f"발견된 탭 확인 ({method})" if method else "발견된 탭 확인"
+        label = f"수집 항목 선택 ({method})" if method else "수집 항목 선택"
         TabConfirmDialog(
             self, tabs, title=label,
-            on_confirm=lambda: self._do_collect(tabs, hwnd))
+            on_confirm=lambda selected: self._do_collect(selected, hwnd))
 
     def _do_collect(self, items: list[dict], hwnd: int):
         self._auto_btn.config(state="disabled")
