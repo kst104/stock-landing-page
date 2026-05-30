@@ -110,42 +110,54 @@ class _INPUT(ctypes.Structure):
     _anonymous_ = ("_u",)
     _fields_    = [("type", ctypes.wintypes.DWORD), ("_u", _U)]
 
-_MOUSEEVENTF_MOVE     = 0x0001
-_MOUSEEVENTF_LDOWN    = 0x0002
-_MOUSEEVENTF_LUP      = 0x0004
-_MOUSEEVENTF_ABSOLUTE = 0x8000
-_INPUT_MOUSE          = 0
+_MOUSEEVENTF_MOVE        = 0x0001
+_MOUSEEVENTF_LDOWN       = 0x0002
+_MOUSEEVENTF_LUP         = 0x0004
+_MOUSEEVENTF_ABSOLUTE    = 0x8000
+_MOUSEEVENTF_VIRTUALDESK = 0x4000   # 전체 가상 데스크톱 기준 (멀티모니터 필수)
+_INPUT_MOUSE             = 0
+
+# 가상 데스크톱 전체 크기 (멀티모니터 합산)
+_SM_XVIRTUALSCREEN  = 76
+_SM_YVIRTUALSCREEN  = 77
+_SM_CXVIRTUALSCREEN = 78
+_SM_CYVIRTUALSCREEN = 79
 
 
 def _send_input_click(x: int, y: int, double: bool = False):
     """
     ctypes.SendInput으로 마우스 클릭.
+    가상 데스크톱 전체 기준 ABSOLUTE 좌표 사용 → 멀티모니터 + 보조모니터 정확.
     pyautogui가 UAC/권한 문제로 막힐 때 사용.
     """
-    sw = ctypes.windll.user32.GetSystemMetrics(0)
-    sh = ctypes.windll.user32.GetSystemMetrics(1)
-    nx = int(x * 65535 / max(sw, 1))
-    ny = int(y * 65535 / max(sh, 1))
+    vx = ctypes.windll.user32.GetSystemMetrics(_SM_XVIRTUALSCREEN)
+    vy = ctypes.windll.user32.GetSystemMetrics(_SM_YVIRTUALSCREEN)
+    vw = ctypes.windll.user32.GetSystemMetrics(_SM_CXVIRTUALSCREEN)
+    vh = ctypes.windll.user32.GetSystemMetrics(_SM_CYVIRTUALSCREEN)
+    nx = int((x - vx) * 65535 / max(vw, 1))
+    ny = int((y - vy) * 65535 / max(vh, 1))
 
-    def _send(flags):
+    FLAGS = _MOUSEEVENTF_ABSOLUTE | _MOUSEEVENTF_VIRTUALDESK
+
+    def _send(extra):
         inp = _INPUT()
-        inp.type    = _INPUT_MOUSE
-        inp.mi.dx   = nx
-        inp.mi.dy   = ny
-        inp.mi.dwFlags = flags
+        inp.type       = _INPUT_MOUSE
+        inp.mi.dx      = nx
+        inp.mi.dy      = ny
+        inp.mi.dwFlags = FLAGS | extra
         ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
-    _send(_MOUSEEVENTF_MOVE | _MOUSEEVENTF_ABSOLUTE)
+    _send(_MOUSEEVENTF_MOVE)
     time.sleep(0.05)
-    _send(_MOUSEEVENTF_LDOWN | _MOUSEEVENTF_ABSOLUTE)
+    _send(_MOUSEEVENTF_LDOWN)
     time.sleep(0.05)
-    _send(_MOUSEEVENTF_LUP | _MOUSEEVENTF_ABSOLUTE)
+    _send(_MOUSEEVENTF_LUP)
 
     if double:
         time.sleep(0.12)
-        _send(_MOUSEEVENTF_LDOWN | _MOUSEEVENTF_ABSOLUTE)
+        _send(_MOUSEEVENTF_LDOWN)
         time.sleep(0.05)
-        _send(_MOUSEEVENTF_LUP | _MOUSEEVENTF_ABSOLUTE)
+        _send(_MOUSEEVENTF_LUP)
 
 
 def _safe_click(x: int, y: int, double: bool = False):
@@ -386,7 +398,15 @@ def find_left_menu_items_full(screenshot: Image.Image,
 
 def _items_full_to_abs(items: list[dict], rect: tuple,
                        w: int, h: int) -> list[dict]:
-    """전체 이미지 비율 좌표 → 화면 절대 좌표 (제외 항목 필터)."""
+    """
+    전체 이미지 비율 좌표 → 화면 절대 좌표 (제외 항목 필터).
+
+    Vision은 물리 픽셀 이미지를 보므로 비율은 맞지만,
+    클릭 좌표는 GetWindowRect 기준 논리 픽셀이어야 한다.
+    rect(논리) 기준 창 크기를 사용해 DPI 스케일 오차를 제거.
+    """
+    log_w = rect[2] - rect[0]   # 논리 픽셀 폭 (DPI 무관하게 정확)
+    log_h = rect[3] - rect[1]   # 논리 픽셀 높이
     result = []
     seen = set()
     for item in items:
@@ -396,8 +416,8 @@ def _items_full_to_abs(items: list[dict], rect: tuple,
         seen.add(name)
         result.append({
             "name":  name,
-            "abs_x": rect[0] + int(item["x_ratio"] * w),
-            "abs_y": rect[1] + int(item["y_ratio"] * h),
+            "abs_x": rect[0] + int(item["x_ratio"] * log_w),
+            "abs_y": rect[1] + int(item["y_ratio"] * log_h),
         })
     return result
 
@@ -424,9 +444,11 @@ def discover_items_fast(hwnd: int, api_key: str, model: str,
     # 목록이 거의 비어 있으면 메뉴가 접혀 있을 가능성 — 후보 1개 펼치고 재시도
     if len(result) < 2:
         _status("메뉴가 접혀 있음 — 카테고리 펼치는 중...")
-        # 왼쪽 패널 상단 후보 위치 클릭 (패널 폭 ~15%, 상단 ~12%)
-        cx = rect[0] + int(w * 0.07)
-        cy = rect[1] + int(h * 0.12)
+        # 논리 픽셀 기준 왼쪽 패널 상단 후보 위치 클릭
+        log_w = rect[2] - rect[0]
+        log_h = rect[3] - rect[1]
+        cx = rect[0] + int(log_w * 0.07)
+        cy = rect[1] + int(log_h * 0.12)
         activate_window(hwnd)
         _safe_click(cx, cy)
         time.sleep(_WAIT_AFTER_CLICK)
@@ -665,7 +687,9 @@ def _collect_pages(
         return results
 
     total_pages = int(pagination["total"])
-    w, h = first_img.size
+    # 논리 픽셀 기준 창 크기로 좌표 계산 (DPI 스케일 오차 방지)
+    log_w = rect[2] - rect[0]
+    log_h = rect[3] - rect[1]
 
     # 첫 페이지
     label0 = f"{name} (1/{total_pages})"
@@ -678,8 +702,8 @@ def _collect_pages(
         if status_cb:
             status_cb(f"  [{menu_idx}/{menu_total}] {name} — {pg}/{total_pages} 페이지...")
 
-        next_x = rect[0] + int(pagination["next_x"] * w)
-        next_y = rect[1] + int(pagination["next_y"] * h)
+        next_x = rect[0] + int(pagination["next_x"] * log_w)
+        next_y = rect[1] + int(pagination["next_y"] * log_h)
 
         activate_window(hwnd)
         _safe_click(next_x, next_y)
