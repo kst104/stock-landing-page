@@ -538,6 +538,11 @@ class App(tk.Tk):
             command=self._run_summary, width=10)
         self._summary_btn.pack(side="left", padx=6, ipady=6)
 
+        self._brief_btn = ttk.Button(
+            top, text="⚡  초간단 요약",
+            command=self._run_brief_summary, width=14)
+        self._brief_btn.pack(side="left", padx=(0, 6), ipady=6)
+
         ttk.Button(top, text="🗑  초기화",
                    command=self._reset, width=10).pack(side="left", ipady=6)
 
@@ -892,7 +897,11 @@ class App(tk.Tk):
 
     # ── 요약 ─────────────────────────────────────────────────────────────────
 
-    def _run_summary(self):
+    def _run_brief_summary(self):
+        """A4 2/3 분량 초간단 요약본 생성."""
+        self._run_summary(brief=True)
+
+    def _run_summary(self, brief: bool = False):
         if not self._captures:
             messagebox.showwarning("수집 없음", "먼저 화면을 수집해주세요.")
             return
@@ -900,9 +909,12 @@ class App(tk.Tk):
         self._auto_btn.config(state="disabled")
         self._add_btn.config(state="disabled")
         self._summary_btn.config(state="disabled")
+        self._brief_btn.config(state="disabled")
         n = len(self._captures)
-        self._set_result(f"화면 {n}장을 AI가 분석 중입니다...\n\n잠시 기다려 주세요.")
-        self._status(f"화면 {n}장 종합 분석 중...")
+        kind = "초간단 요약" if brief else "종합 요약"
+        self._set_result(
+            f"화면 {n}장으로 {kind}을 AI가 작성 중입니다...\n\n잠시 기다려 주세요.")
+        self._status(f"화면 {n}장 {kind} 작성 중...")
 
         def _run():
             try:
@@ -910,8 +922,9 @@ class App(tk.Tk):
                     self._captures,
                     api_key=self._settings["claude_api_key"],
                     model=self._settings.get("claude_model", "claude-sonnet-4-6"),
+                    brief=brief,
                 )
-                self.after(0, lambda r=result: self._display_result(r))
+                self.after(0, lambda r=result: self._display_result(r, brief))
             except Exception as e:
                 self.after(0, lambda err=e: (
                     self._status(f"오류: {err}"),
@@ -923,13 +936,15 @@ class App(tk.Tk):
                     self._auto_btn.config(state="normal"),
                     self._add_btn.config(state="normal"),
                     self._summary_btn.config(state="normal"),
+                    self._brief_btn.config(state="normal"),
                 ))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _display_result(self, text: str):
+    def _display_result(self, text: str, brief: bool = False):
         self._set_result(text)
-        self._status(f"요약 완료 — 화면 {len(self._captures)}장 분석")
+        kind = "초간단 요약" if brief else "요약"
+        self._status(f"{kind} 완료 — 화면 {len(self._captures)}장 분석")
 
     # ── 유틸 ─────────────────────────────────────────────────────────────────
 

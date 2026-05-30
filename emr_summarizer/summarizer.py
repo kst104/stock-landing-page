@@ -48,6 +48,21 @@ _PROMPT = """아래 이미지들은 같은 환자의 EMR 챠트 여러 화면입
 화면에 없는 항목은 "(정보 없음)"으로 표시하세요."""
 
 
+_BRIEF_PROMPT = """아래 이미지들은 같은 환자의 EMR 챠트 여러 화면입니다.
+모든 화면을 종합하여 **A4 용지 2/3 분량(약 350~450단어)**의 '초간단 요약본'을 작성하세요.
+
+작성 규칙:
+- 의사가 30초 안에 환자를 파악할 수 있도록 핵심만
+- 섹션 제목 없이 4~6개의 짧은 단락 또는 불릿으로 구성
+- 다음 순서로 핵심만 포함:
+  ① 환자(나이/성별), 주진단 ② 주요 병력·현재 약물 핵심
+  ③ 꼭 알아야 할 이상 검사 소견(추세 포함) ④ 최근 내원 경과
+  ⑤ 임상적 주의사항(알레르기·금기·중요 병력)
+- 정상이거나 사소한 내용은 과감히 생략
+- 분량이 A4 2/3를 넘지 않도록 압축
+- 화면에 없으면 그 항목은 아예 언급하지 않음"""
+
+
 def _resize(image: Image.Image, max_width: int = 1280) -> Image.Image:
     if image.width > max_width:
         ratio = max_width / image.width
@@ -65,9 +80,13 @@ def summarize_images(
     items: list[tuple[str, Image.Image]] | list[Image.Image],
     api_key: str,
     model: str,
+    brief: bool = False,
 ) -> str:
     """
     [(탭명, Image), ...] 또는 [Image, ...] → 종합 요약 텍스트
+
+    brief=False : 섹션별 상세 종합 요약 (기본)
+    brief=True  : A4 2/3 분량 '초간단 요약본'
     """
     if not items:
         raise ValueError("캡처된 이미지가 없습니다.")
@@ -91,12 +110,13 @@ def summarize_images(
                 "data": _to_b64(img),
             },
         })
-    content.append({"type": "text", "text": _PROMPT})
+    content.append({"type": "text",
+                    "text": _BRIEF_PROMPT if brief else _PROMPT})
 
     client = anthropic.Anthropic(api_key=api_key)
     message = client.messages.create(
         model=model,
-        max_tokens=3000,
+        max_tokens=1200 if brief else 3000,
         system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": content}],
     )
