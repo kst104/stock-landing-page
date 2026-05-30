@@ -354,7 +354,92 @@ def find_submenu_items(panel_img: Image.Image,
         return []
 
 
-# ── 통합: 계층형 탐색 (최상위 클릭 → 서브메뉴 수집) ─────────────────────────
+# ── 빠른 단일 패스: 전체 이미지 기준 좌표로 왼쪽 메뉴 항목 추출 ──────────────
+
+def find_left_menu_items_full(screenshot: Image.Image,
+                              api_key: str, model: str) -> list[dict]:
+    """
+    전체 창 스크린샷에서 왼쪽 메뉴의 클릭 가능한 항목을 한 번에 추출.
+    좌표는 '전체 이미지' 기준 비율 → 변환 단계가 없어 오차가 적음.
+    반환: [{"name":..., "x_ratio":..., "y_ratio":...}, ...]
+    """
+    prompt = (
+        "이 EMR 화면의 왼쪽 메뉴/사이드바에서, 클릭하면 오른쪽에 문서·기록 내용이 표시되는 "
+        "항목을 모두 찾아주세요.\n\n"
+        "포함: 문서명, 기록지명 등 실제 내용으로 연결되는 목록 항목\n"
+        "제외: 그룹/카테고리 헤더, '보험종별' 같은 필터·드롭다운, 날짜 입력 필드, 버튼\n\n"
+        "각 항목의 클릭 위치를 '전체 이미지' 크기 기준 비율(0.0~1.0)로,\n"
+        "텍스트가 시작되는 부분 가까이(행의 세로 중앙)로 지정하세요.\n"
+        "위→아래 순서, JSON 배열만 응답:\n"
+        '[{"name":"항목이름","x_ratio":0.07,"y_ratio":0.12},...]\n'
+        "항목 없으면 [] 반환."
+    )
+    client = anthropic.Anthropic(api_key=api_key)
+    text = _vision_call(client, model, screenshot, prompt, max_tokens=1200)
+    try:
+        items = _parse_json(text)
+        return [x for x in items
+                if "name" in x and "x_ratio" in x and "y_ratio" in x]
+    except Exception:
+        return []
+
+
+def _items_full_to_abs(items: list[dict], rect: tuple,
+                       w: int, h: int) -> list[dict]:
+    """전체 이미지 비율 좌표 → 화면 절대 좌표 (제외 항목 필터)."""
+    result = []
+    seen = set()
+    for item in items:
+        name = item["name"]
+        if is_excluded(name) or name in seen:
+            continue
+        seen.add(name)
+        result.append({
+            "name":  name,
+            "abs_x": rect[0] + int(item["x_ratio"] * w),
+            "abs_y": rect[1] + int(item["y_ratio"] * h),
+        })
+    return result
+
+
+def discover_items_fast(hwnd: int, api_key: str, model: str,
+                        status_cb=None) -> list[dict]:
+    """
+    빠른 발견: Vision 1회로 왼쪽 메뉴 전체 항목을 잡는다.
+    목록이 비어 보이면(접힌 상태) 후보 카테고리 1개만 펼친 뒤 1회 재시도.
+    반환: [{"name":..., "abs_x":..., "abs_y":...}, ...]
+    """
+    def _status(msg):
+        if status_cb:
+            status_cb(msg)
+
+    _status("EMR 화면 분석 중...")
+    screenshot = capture_screen(hwnd)
+    rect = win32gui.GetWindowRect(hwnd)
+    w, h = screenshot.size
+
+    items = find_left_menu_items_full(screenshot, api_key, model)
+    result = _items_full_to_abs(items, rect, w, h)
+
+    # 목록이 거의 비어 있으면 메뉴가 접혀 있을 가능성 — 후보 1개 펼치고 재시도
+    if len(result) < 2:
+        _status("메뉴가 접혀 있음 — 카테고리 펼치는 중...")
+        # 왼쪽 패널 상단 후보 위치 클릭 (패널 폭 ~15%, 상단 ~12%)
+        cx = rect[0] + int(w * 0.07)
+        cy = rect[1] + int(h * 0.12)
+        activate_window(hwnd)
+        _safe_click(cx, cy)
+        time.sleep(_WAIT_AFTER_CLICK)
+
+        screenshot = capture_screen(hwnd)
+        items = find_left_menu_items_full(screenshot, api_key, model)
+        result = _items_full_to_abs(items, rect, w, h)
+
+    _status(f"메뉴 항목 {len(result)}개 발견")
+    return result
+
+
+# ── (구) 계층형 탐색 (느림 — 폴백용) ─────────────────────────────────────────
 
 def discover_items_hierarchical(
     hwnd: int,
@@ -506,10 +591,15 @@ def find_all_menu_items_by_vision(screenshot: Image.Image,
 
 # ── 수집: 항목 클릭 → 콘텐츠 캡처 ───────────────────────────────────────────
 
+def _content_region(img: Image.Image) -> Image.Image:
+    """왼쪽 메뉴 패널(~22%)을 뺀 오른쪽 콘텐츠 영역만 잘라낸다."""
+    w, h = img.size
+    return img.crop((int(w * 0.22), 0, w, h))
+
+
 def _images_differ(img1: Image.Image, img2: Image.Image,
                    threshold: float = 0.01) -> bool:
     """두 이미지가 threshold 이상 다르면 True (콘텐츠 변경 감지)"""
-    import struct
     try:
         a = img1.resize((64, 64)).tobytes()
         b = img2.resize((64, 64)).tobytes()
@@ -526,8 +616,9 @@ def collect_menu_items(
     item_cb=None,
 ) -> list[tuple[str, Image.Image]]:
     """
-    서브메뉴 항목을 순서대로 클릭하며 콘텐츠 캡처.
-    items는 find_all_menu_items_by_vision() 반환값.
+    메뉴 항목을 순서대로 클릭하며 오른쪽 콘텐츠를 캡처.
+    좌표가 흔들리지 않는 정적 목록을 가정 — 클릭 후 콘텐츠 영역 변화로 매칭 검증.
+    items는 discover_items_fast() 반환값.
     """
     total = len(items)
     results = []
@@ -540,33 +631,36 @@ def collect_menu_items(
         abs_y = item["abs_y"]
 
         if status_cb:
-            status_cb(f"[{i+1}/{total}] {name} 클릭 중...")
+            status_cb(f"[{i+1}/{total}] {name} 여는 중...")
 
-        # 창 활성화 → 클릭 → Enter
+        # 창 활성화 → 단일 클릭 (콘텐츠 로드)
         activate_window(hwnd)
         _safe_click(abs_x, abs_y)
-        time.sleep(0.1)
-        _safe_click(abs_x, abs_y, double=True)
-        _send_key(0x0D)
         time.sleep(_WAIT_AFTER_CLICK)
-
         img = capture_screen(hwnd)
 
-        # 화면이 바뀌지 않았으면 재시도
-        if not _images_differ(prev_img, img):
+        # 오른쪽 콘텐츠 영역이 안 바뀌면 더블클릭+Enter로 재시도
+        changed = _images_differ(_content_region(prev_img),
+                                 _content_region(img))
+        if not changed:
             if status_cb:
                 status_cb(f"[{i+1}/{total}] {name} — 재시도...")
             activate_window(hwnd)
-            _safe_click(abs_x, abs_y)
+            _safe_click(abs_x, abs_y, double=True)
             _send_key(0x0D)
             time.sleep(_WAIT_AFTER_CLICK)
             img = capture_screen(hwnd)
+            changed = _images_differ(_content_region(prev_img),
+                                     _content_region(img))
+
+        # 라벨에 매칭 신뢰도 표시 — 변화 없으면 이름 끝에 (?) 표기
+        label = name if changed else f"{name} (확인필요)"
 
         prev_img = img
-        results.append((name, img))
+        results.append((label, img))
 
         if item_cb:
-            item_cb(i + 1, total, name, img)
+            item_cb(i + 1, total, label, img)
 
     return results
 

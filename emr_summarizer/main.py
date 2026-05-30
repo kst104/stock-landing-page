@@ -699,8 +699,8 @@ class App(tk.Tk):
                 def _status_cb(msg):
                     self.after(0, lambda m=msg: self._status(m))
 
-                # 계층형 탐색: 최상위 카테고리 클릭 → 서브메뉴 수집
-                items = auto_navigate.discover_items_hierarchical(
+                # 빠른 단일 패스 탐색: Vision 1회로 왼쪽 메뉴 항목 추출
+                items = auto_navigate.discover_items_fast(
                     hwnd, api_key=api_key, model=model,
                     status_cb=_status_cb)
 
