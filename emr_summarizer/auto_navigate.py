@@ -640,12 +640,20 @@ def _content_region(img: Image.Image) -> Image.Image:
 # 괄호 숫자 없어도 항상 전체 페이지 수집을 강제하는 문서 키워드
 ALWAYS_PAGINATE = ["간호기록지", "응급실 진료기록지", "응급실진료기록지", "응급실기록지"]
 
-# 절대 클릭하면 안 되는 위험 버튼 (저장/삭제 등) — 페이지 이동과 혼동 금지
+# 절대 클릭하면 안 되는 위험 버튼 — 페이지 이동(이전/다음)과 혼동 금지
 DANGER_BUTTON_KEYWORDS = [
-    "저장", "삭제", "수정", "등록", "확인", "닫기", "출력", "인쇄",
-    "전송", "발송", "승인", "취소", "신규", "추가", "복사", "잠금",
-    "save", "delete", "remove", "submit", "print", "confirm", "close",
+    "저장", "삭제", "복사", "새문서", "새 문서", "신규문서", "신규 문서",
+    "수정", "등록", "확인", "닫기", "출력", "인쇄",
+    "전송", "발송", "승인", "취소", "신규", "추가", "잠금",
+    "save", "delete", "remove", "copy", "new", "submit",
+    "print", "confirm", "close",
 ]
+
+
+def is_danger_button(name: str) -> bool:
+    """이름에 위험 버튼 키워드가 포함되면 True (이전/다음과 절대 혼동 금지)."""
+    nl = (name or "").lower().strip()
+    return any(kw.lower() in nl for kw in DANGER_BUTTON_KEYWORDS)
 
 
 def _parse_item_count(raw_name: str) -> tuple[str, int]:
@@ -794,10 +802,8 @@ def _collect_pages(
             item_cb(menu_idx, menu_total, base_name, first_img)
         return [(base_name, first_img)]
 
-    log_w = rect[2] - rect[0]
-    log_h = rect[3] - rect[1]
-
-    # ── 이전 버튼 절대 좌표 탐색 (UIA → Vision 헤더 크롭 → 후보 시도) ──
+    # ── 이전 버튼 절대 좌표 탐색 (UIA → Vision 헤더 크롭) ──
+    # 저장/삭제/복사/새문서는 _find_nav_buttons_abs 내부에서 이미 배제됨.
     nav = _find_nav_buttons_abs(hwnd, rect, first_img, api_key, model)
     prev_x: int | None = nav.get("prev_abs_x")
     prev_y: int | None = nav.get("prev_abs_y")
@@ -805,40 +811,33 @@ def _collect_pages(
     pages:        list[tuple[str, Image.Image]] = [("_latest_", first_img)]
     prev_content: Image.Image = _content_region(first_img)
     collected:    int = 0
-    use_keyboard: bool = False   # Page Up 키 사용 여부
-
-    # 이전 버튼 좌표를 못 찾았으면 Page Up 키만 사용한다.
-    # (좌표 무작위 클릭은 저장/삭제 버튼을 누를 위험이 있어 금지)
-    if prev_x is None:
-        if status_cb:
-            status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
-                      "— 이전 버튼 미발견, Page Up 키 시도...")
-        activate_window(hwnd)
-        try:
-            pyautogui.press("pageup")
-        except Exception:
-            ctypes.windll.user32.keybd_event(0x21, 0, 0, 0)   # VK_PRIOR
-            time.sleep(0.05)
-            ctypes.windll.user32.keybd_event(0x21, 0, 0x0002, 0)
-        time.sleep(_WAIT_AFTER_CLICK)
-        test_kb = capture_screen(hwnd)
-        if _images_differ(prev_content, _content_region(test_kb)):
-            use_keyboard = True
-            pages.append(("_pg_", test_kb))
-            prev_content = _content_region(test_kb)
-            collected = 1
-
-        if not use_keyboard:
-            # Page Up 무효 → 단일 페이지 (위험 버튼 클릭 방지 위해 추측 클릭 안 함)
-            if status_cb:
-                status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
-                          "— 페이지 이동 불가, 1페이지만 수집")
-            if item_cb:
-                item_cb(menu_idx, menu_total, base_name, first_img)
-            return [(base_name, first_img)]
 
     needed    = page_count - 1   # 이미 1장(최신) 보유
     MAX_PAGES = max(needed if page_count > 1 else 60, 60)
+
+    def _press_pageup():
+        """Page Up 키 — 저장/삭제 등을 트리거하지 않는 안전한 이전 이동."""
+        try:
+            pyautogui.press("pageup")
+        except Exception:
+            ctypes.windll.user32.keybd_event(0x21, 0, 0, 0)        # VK_PRIOR
+            time.sleep(0.05)
+            ctypes.windll.user32.keybd_event(0x21, 0, 0x0002, 0)
+
+    def _go_prev():
+        """이전 페이지로 이동. 버튼 좌표가 있으면 클릭, 없으면 Page Up 키."""
+        activate_window(hwnd)
+        if prev_x is not None and prev_y is not None:
+            _safe_click(prev_x, prev_y)
+        else:
+            _press_pageup()
+        time.sleep(_WAIT_AFTER_CLICK)
+
+    if prev_x is not None and status_cb:
+        status_cb(f"  [{menu_idx}/{menu_total}] {base_name} — 이전 버튼 클릭으로 수집")
+    elif status_cb:
+        status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
+                  "— 이전 버튼 미발견, Page Up 키로 수집")
 
     while collected < MAX_PAGES:
         if status_cb:
@@ -846,17 +845,7 @@ def _collect_pages(
             status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
                       f"— 이전 이동 {collected+1}{sfx}...")
 
-        activate_window(hwnd)
-        if use_keyboard:
-            try:
-                pyautogui.press("pageup")
-            except Exception:
-                ctypes.windll.user32.keybd_event(0x21, 0, 0, 0)
-                time.sleep(0.05)
-                ctypes.windll.user32.keybd_event(0x21, 0, 0x0002, 0)
-        else:
-            _safe_click(prev_x, prev_y)
-        time.sleep(_WAIT_AFTER_CLICK)
+        _go_prev()
 
         cap     = capture_screen(hwnd)
         content = _content_region(cap)
@@ -870,6 +859,11 @@ def _collect_pages(
 
         if page_count > 1 and collected >= needed:
             break
+
+    # 1장만 수집됐고 더 가져올 게 있었는데 버튼이 안 먹은 경우 안내
+    if collected == 0 and status_cb:
+        status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
+                  "— 페이지 이동 안 됨, 1페이지만 수집")
 
     # 오래된→최신 순으로 뒤집고 레이블 확정
     pages.reverse()

@@ -104,9 +104,16 @@ def find_nav_buttons_uia(hwnd: int) -> dict | None:
     except ImportError:
         return None
 
-    _PREV_NAMES = {"이전", "◀", "prev", "<", "previous", "이전 페이지"}
-    _NEXT_NAMES = {"다음", "▶", "next", ">", "forward",  "다음 페이지"}
+    _PREV_NAMES = {"이전", "◀", "◁", "prev", "previous", "이전 페이지", "이전페이지", "<"}
+    _NEXT_NAMES = {"다음", "▶", "▷", "next", "forward",  "다음 페이지", "다음페이지", ">"}
     _BTN_TYPES  = {"ButtonControl", "CustomControl", "HyperlinkControl"}
+
+    # 저장/삭제/복사/새문서 등은 절대 이전/다음으로 잡지 않는다.
+    try:
+        from auto_navigate import is_danger_button
+    except Exception:
+        def is_danger_button(_n):   # 폴백
+            return False
 
     prev_pos: tuple | None = None
     next_pos: tuple | None = None
@@ -121,14 +128,15 @@ def find_nav_buttons_uia(hwnd: int) -> dict | None:
             try:
                 name  = (ctrl.Name or "").strip()
                 ctype = ctrl.ControlTypeName
-                if ctype in _BTN_TYPES and name:
+                if ctype in _BTN_TYPES and name and not is_danger_button(name):
                     r  = ctrl.BoundingRectangle
                     cx = (r.left + r.right)  // 2
                     cy = (r.top  + r.bottom) // 2
                     nl = name.lower()
-                    if nl in _PREV_NAMES and prev_pos is None:
+                    # 정확 일치 우선, 없으면 '이전'/'다음' 단어 포함도 허용
+                    if prev_pos is None and (nl in _PREV_NAMES or "이전" in name):
                         prev_pos = (cx, cy)
-                    elif nl in _NEXT_NAMES and next_pos is None:
+                    elif next_pos is None and (nl in _NEXT_NAMES or "다음" in name):
                         next_pos = (cx, cy)
             except Exception:
                 pass
