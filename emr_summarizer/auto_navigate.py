@@ -36,7 +36,7 @@ _NGT_KEYWORDS = [
 _WAIT_AFTER_CLICK = 1.0   # 클릭 후 콘텐츠 로드 대기 (기존 2.5s)
 
 # 캡처 제외 항목 (이름에 포함되면 건너뜀)
-EXCLUDED_KEYWORDS = ["동의서", "욕창", "상처기록", "영양", "제증명"]
+EXCLUDED_KEYWORDS = ["동의서", "욕창", "상처기록", "영양", "제증명", "보험종별"]
 
 
 def is_excluded(name: str) -> bool:
@@ -297,7 +297,35 @@ def find_left_panel_bounds(screenshot: Image.Image,
     return None
 
 
-# ── 2단계: 패널 내 서브메뉴 항목 추출 ────────────────────────────────────────
+# ── 2단계: 패널 내 최상위 카테고리 항목 추출 ─────────────────────────────────
+
+def find_top_level_menu_items(panel_img: Image.Image,
+                              api_key: str, model: str) -> list[dict]:
+    """
+    크롭된 패널에서 클릭 시 하위 서브메뉴가 펼쳐지는 최상위 카테고리 탭/항목 추출.
+    반환: [{"name":..., "x_ratio":..., "y_ratio":...}, ...]  (panel_img 기준 비율)
+    """
+    prompt = (
+        "이 이미지는 EMR 프로그램의 왼쪽 메뉴 패널입니다.\n"
+        "클릭하면 하위 서브메뉴가 펼쳐지는 최상위 카테고리 탭/항목을 모두 찾아주세요.\n\n"
+        "포함: 굵게 표시된 카테고리 제목, 탭 버튼, 폴더 역할을 하는 헤더 항목\n"
+        "제외: 이미 들여쓰기된 하위 서브메뉴 항목, '보험종별' 같은 필터·드롭다운, 날짜 입력 필드\n\n"
+        "각 항목의 클릭 위치를 이 이미지 기준 비율(0.0~1.0)로 반환.\n"
+        "위→아래 순서, JSON 배열만 응답:\n"
+        '[{"name":"항목이름","x_ratio":0.5,"y_ratio":0.08},...]\n'
+        "항목 없으면 [] 반환."
+    )
+    client = anthropic.Anthropic(api_key=api_key)
+    text = _vision_call(client, model, panel_img, prompt)
+    try:
+        items = _parse_json(text)
+        return [x for x in items
+                if "name" in x and "x_ratio" in x and "y_ratio" in x]
+    except Exception:
+        return []
+
+
+# ── 3단계: 패널 내 서브메뉴 항목 추출 ────────────────────────────────────────
 
 def find_submenu_items(panel_img: Image.Image,
                        api_key: str, model: str) -> list[dict]:
@@ -310,7 +338,7 @@ def find_submenu_items(panel_img: Image.Image,
         "이 이미지는 EMR 프로그램의 왼쪽 메뉴 패널만 크롭한 것입니다.\n"
         "이 패널에서 클릭하면 오른쪽에 내용이 표시되는 서브메뉴 항목을 모두 찾아주세요.\n\n"
         "포함: 들여쓰기된 하위 항목, 문서명, 기록지명 등 실제 내용으로 연결되는 항목\n"
-        "제외: 그룹/카테고리 제목(폴더처럼 하위 항목을 묶는 헤더)\n\n"
+        "제외: 그룹/카테고리 제목(폴더처럼 하위 항목을 묶는 헤더), '보험종별' 필터, 날짜 입력\n\n"
         "각 항목의 클릭 위치를 이 이미지(패널) 크기 기준 비율(0.0~1.0)로 반환.\n"
         "위→아래 순서로, JSON 배열만 응답:\n"
         '[{"name":"항목이름","x_ratio":0.5,"y_ratio":0.12},...]\n'
@@ -326,7 +354,108 @@ def find_submenu_items(panel_img: Image.Image,
         return []
 
 
-# ── 통합: 서브메뉴 항목 찾기 ─────────────────────────────────────────────────
+# ── 통합: 계층형 탐색 (최상위 클릭 → 서브메뉴 수집) ─────────────────────────
+
+def discover_items_hierarchical(
+    hwnd: int,
+    api_key: str,
+    model: str,
+    status_cb=None,
+) -> list[dict]:
+    """
+    왼쪽 메뉴의 최상위 카테고리를 하나씩 클릭해 펼친 뒤
+    그 아래 나타나는 서브메뉴 항목을 수집.
+    반환: [{"name":..., "abs_x":..., "abs_y":...}, ...]
+    """
+    def _status(msg):
+        if status_cb:
+            status_cb(msg)
+
+    _status("EMR 화면 캡처 중...")
+    screenshot = capture_screen(hwnd)
+    hwnd_rect = win32gui.GetWindowRect(hwnd)
+    w, h = screenshot.size
+
+    _status("왼쪽 메뉴 패널 위치 파악 중...")
+    bounds = find_left_panel_bounds(screenshot, api_key, model)
+    if bounds:
+        px0 = int(bounds["x0"] * w)
+        py0 = int(bounds["y0"] * h)
+        px1 = int(bounds["x1"] * w)
+        py1 = int(bounds["y1"] * h)
+    else:
+        px0, py0 = 0, 0
+        px1, py1 = int(w * 0.20), h
+
+    pw = px1 - px0
+    ph = py1 - py0
+    ox = hwnd_rect[0] + px0
+    oy = hwnd_rect[1] + py0
+
+    panel_img = screenshot.crop((px0, py0, px1, py1))
+
+    _status("최상위 메뉴 카테고리 탐색 중...")
+    top_items = find_top_level_menu_items(panel_img, api_key, model)
+
+    # 최상위 항목이 없으면 서브메뉴 직접 추출 (폴백)
+    if not top_items:
+        _status("카테고리 미발견 — 서브메뉴 직접 추출 중...")
+        return _panel_to_abs(
+            find_submenu_items(panel_img, api_key, model),
+            ox, oy, pw, ph)
+
+    all_items: list[dict] = []
+    seen: set[str] = set()
+
+    for i, top in enumerate(top_items):
+        name = top["name"]
+        if is_excluded(name):
+            continue
+
+        abs_x = ox + int(top["x_ratio"] * pw)
+        abs_y = oy + int(top["y_ratio"] * ph)
+
+        _status(f"[{i+1}/{len(top_items)}] '{name}' 클릭 → 서브메뉴 탐색...")
+        activate_window(hwnd)
+        _safe_click(abs_x, abs_y)
+        time.sleep(_WAIT_AFTER_CLICK)
+
+        # 클릭 후 새 스크린샷 → 패널 재크롭 → 서브메뉴 추출
+        new_shot = capture_screen(hwnd)
+        new_panel = new_shot.crop((px0, py0, px1, py1))
+        sub_items = find_submenu_items(new_panel, api_key, model)
+
+        for sub in sub_items:
+            sub_name = sub["name"]
+            if is_excluded(sub_name) or sub_name in seen:
+                continue
+            seen.add(sub_name)
+            all_items.append({
+                "name":  sub_name,
+                "abs_x": ox + int(sub["x_ratio"] * pw),
+                "abs_y": oy + int(sub["y_ratio"] * ph),
+            })
+
+    return all_items
+
+
+def _panel_to_abs(items: list[dict], ox: int, oy: int,
+                  pw: int, ph: int) -> list[dict]:
+    """패널 비율 좌표를 절대 좌표로 변환."""
+    result = []
+    for item in items:
+        name = item["name"]
+        if is_excluded(name):
+            continue
+        result.append({
+            "name":  name,
+            "abs_x": ox + int(item["x_ratio"] * pw),
+            "abs_y": oy + int(item["y_ratio"] * ph),
+        })
+    return result
+
+
+# ── (구) 단순 탐색: 서브메뉴 항목 한 번에 찾기 ───────────────────────────────
 
 def find_all_menu_items_by_vision(screenshot: Image.Image,
                                   api_key: str, model: str,

@@ -691,26 +691,24 @@ class App(tk.Tk):
         model   = self._settings.get("claude_model", "claude-sonnet-4-6")
 
         def _analyze():
-            import win32gui as _wg
             try:
                 # 앱 최소화 → EMR 창 전면
                 self.after(0, self.iconify)
                 import time as _t; _t.sleep(0.3)
 
-                screenshot = auto_navigate.capture_screen(hwnd)
-                hwnd_rect  = _wg.GetWindowRect(hwnd)
+                def _status_cb(msg):
+                    self.after(0, lambda m=msg: self._status(m))
 
-                self.after(0, lambda: (
-                    self.deiconify(),
-                    self._status("1단계: 노란 메뉴 패널 위치 파악 중..."),
-                ))
+                # 계층형 탐색: 최상위 카테고리 클릭 → 서브메뉴 수집
+                items = auto_navigate.discover_items_hierarchical(
+                    hwnd, api_key=api_key, model=model,
+                    status_cb=_status_cb)
 
-                items = auto_navigate.find_all_menu_items_by_vision(
-                    screenshot, api_key=api_key, model=model,
-                    hwnd_rect=hwnd_rect)
+                self.after(0, self.deiconify)
 
                 if not items:
-                    self.after(0, lambda s=screenshot: (
+                    fallback = auto_navigate.capture_screen(hwnd)
+                    self.after(0, lambda s=fallback: (
                         self._captures.append(("현재 화면", s)),
                         self._refresh_gallery(),
                         self._status("서브메뉴 미발견 — 현재 화면으로 요약합니다."),
