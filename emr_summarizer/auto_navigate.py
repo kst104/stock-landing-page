@@ -425,15 +425,30 @@ def _items_full_to_abs(items: list[dict], rect: tuple,
 def discover_items_fast(hwnd: int, api_key: str, model: str,
                         status_cb=None) -> list[dict]:
     """
-    빠른 발견: Vision 1회로 왼쪽 메뉴 전체 항목을 잡는다.
-    목록이 비어 보이면(접힌 상태) 후보 카테고리 1개만 펼친 뒤 1회 재시도.
+    메뉴 항목 발견 — 정확도 우선 순서로 시도:
+      1) Windows UI Automation  : 항목 이름·좌표를 OS에서 직접 읽음 (가장 정확)
+      2) Vision (폴백)           : UIA가 지원되지 않을 때 Claude Vision으로 추정
     반환: [{"name":..., "abs_x":..., "abs_y":...}, ...]
     """
     def _status(msg):
         if status_cb:
             status_cb(msg)
 
-    _status("EMR 화면 분석 중...")
+    # ── 1순위: Windows UI Automation ─────────────────────────────────────────
+    _status("UI Automation으로 메뉴 탐색 중...")
+    try:
+        import uia_navigate
+        uia_items = uia_navigate.find_menu_items_uia(hwnd)
+        if len(uia_items) >= 2:
+            _status(f"UI Automation: 항목 {len(uia_items)}개 발견 (좌표 정확)")
+            return uia_items
+        if uia_items:
+            _status(f"UI Automation: 항목 {len(uia_items)}개만 발견 — Vision으로 보완")
+    except Exception:
+        pass
+
+    # ── 2순위: Vision (폴백) ──────────────────────────────────────────────────
+    _status("Vision으로 화면 분석 중...")
     screenshot = capture_screen(hwnd)
     rect = win32gui.GetWindowRect(hwnd)
     w, h = screenshot.size
@@ -444,7 +459,6 @@ def discover_items_fast(hwnd: int, api_key: str, model: str,
     # 목록이 거의 비어 있으면 메뉴가 접혀 있을 가능성 — 후보 1개 펼치고 재시도
     if len(result) < 2:
         _status("메뉴가 접혀 있음 — 카테고리 펼치는 중...")
-        # 논리 픽셀 기준 왼쪽 패널 상단 후보 위치 클릭
         log_w = rect[2] - rect[0]
         log_h = rect[3] - rect[1]
         cx = rect[0] + int(log_w * 0.07)
@@ -457,7 +471,7 @@ def discover_items_fast(hwnd: int, api_key: str, model: str,
         items = find_left_menu_items_full(screenshot, api_key, model)
         result = _items_full_to_abs(items, rect, w, h)
 
-    _status(f"메뉴 항목 {len(result)}개 발견")
+    _status(f"Vision: 항목 {len(result)}개 발견")
     return result
 
 
