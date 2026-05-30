@@ -764,9 +764,8 @@ class App(tk.Tk):
                 bar.deiconify()
                 return
 
-            # 캡처 바를 잠시 숨겨서 찍히지 않게
             bar.withdraw()
-            _t.sleep(0.3)
+            _t.sleep(0.1)
             img = ImageGrab.grab()
             bar.deiconify()
             n = len(self._captures) + 1

@@ -33,7 +33,7 @@ _NGT_KEYWORDS = [
     "neomed", "ngt", "전자챠트", "전자차트", "emr",
     "차트", "medit", "문서 작성",
 ]
-_WAIT_AFTER_CLICK = 2.5
+_WAIT_AFTER_CLICK = 1.0   # 클릭 후 콘텐츠 로드 대기 (기존 2.5s)
 
 # 캡처 제외 항목 (이름에 포함되면 건너뜀)
 EXCLUDED_KEYWORDS = ["동의서", "욕창", "상처기록", "영양", "제증명"]
@@ -159,9 +159,9 @@ def _safe_click(x: int, y: int, double: bool = False):
     if not (0 <= x < sw and 0 <= y < sh):
         return
 
-    # 커서 이동 (SetCursorPos 는 UIPI 무관하게 항상 동작)
+    # 커서 이동
     ctypes.windll.user32.SetCursorPos(x, y)
-    time.sleep(0.3)
+    time.sleep(0.1)
 
     def _do_click(dbl=False):
         # 시도 1: pyautogui
@@ -224,7 +224,7 @@ def activate_window(hwnd: int):
     if placement[1] == win32con.SW_SHOWMINIMIZED:
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
     win32gui.SetForegroundWindow(hwnd)
-    time.sleep(0.6)
+    time.sleep(0.3)
 
 
 def capture_screen(hwnd: int) -> Image.Image:
@@ -233,7 +233,7 @@ def capture_screen(hwnd: int) -> Image.Image:
     bbox 지정 방식으로 보조모니터도 올바르게 캡처.
     """
     activate_window(hwnd)
-    time.sleep(0.3)
+    time.sleep(0.1)
     rect = win32gui.GetWindowRect(hwnd)
     return ImageGrab.grab(bbox=rect)
 
@@ -413,14 +413,12 @@ def collect_menu_items(
         if status_cb:
             status_cb(f"[{i+1}/{total}] {name} 클릭 중...")
 
-        # 창 활성화 → 클릭 → Enter (트리뷰 항목 열기)
+        # 창 활성화 → 클릭 → Enter
         activate_window(hwnd)
-        time.sleep(0.2)
-        _safe_click(abs_x, abs_y)          # 단일 클릭 (선택)
-        time.sleep(0.2)
-        _safe_click(abs_x, abs_y, double=True)  # 더블클릭 (열기)
-        time.sleep(0.2)
-        _send_key(0x0D)                    # Enter (활성화)
+        _safe_click(abs_x, abs_y)
+        time.sleep(0.1)
+        _safe_click(abs_x, abs_y, double=True)
+        _send_key(0x0D)
         time.sleep(_WAIT_AFTER_CLICK)
 
         img = capture_screen(hwnd)
