@@ -93,6 +93,64 @@ def find_menu_items_uia(hwnd: int) -> list[dict]:
         return []
 
 
+def find_nav_buttons_uia(hwnd: int) -> dict | None:
+    """
+    UIAutomation으로 '이전' / '다음' 버튼의 절대 좌표를 찾는다.
+    반환: {"prev_abs_x":..., "prev_abs_y":..., "next_abs_x":..., "next_abs_y":...}
+          찾지 못하면 None.
+    """
+    try:
+        import uiautomation as uia
+    except ImportError:
+        return None
+
+    _PREV_NAMES = {"이전", "◀", "prev", "<", "previous", "이전 페이지"}
+    _NEXT_NAMES = {"다음", "▶", "next", ">", "forward",  "다음 페이지"}
+    _BTN_TYPES  = {"ButtonControl", "CustomControl", "HyperlinkControl"}
+
+    prev_pos: tuple | None = None
+    next_pos: tuple | None = None
+
+    try:
+        root = uia.ControlFromHandle(hwnd)
+
+        def _walk(ctrl, depth: int = 0):
+            nonlocal prev_pos, next_pos
+            if depth > 10:
+                return
+            try:
+                name  = (ctrl.Name or "").strip()
+                ctype = ctrl.ControlTypeName
+                if ctype in _BTN_TYPES and name:
+                    r  = ctrl.BoundingRectangle
+                    cx = (r.left + r.right)  // 2
+                    cy = (r.top  + r.bottom) // 2
+                    nl = name.lower()
+                    if nl in _PREV_NAMES and prev_pos is None:
+                        prev_pos = (cx, cy)
+                    elif nl in _NEXT_NAMES and next_pos is None:
+                        next_pos = (cx, cy)
+            except Exception:
+                pass
+            try:
+                for child in ctrl.GetChildren():
+                    _walk(child, depth + 1)
+            except Exception:
+                pass
+
+        _walk(root)
+
+        result: dict = {}
+        if prev_pos:
+            result["prev_abs_x"], result["prev_abs_y"] = prev_pos
+        if next_pos:
+            result["next_abs_x"], result["next_abs_y"] = next_pos
+        return result if result else None
+
+    except Exception:
+        return None
+
+
 def is_available() -> bool:
     """uiautomation 패키지가 설치되어 있으면 True."""
     try:

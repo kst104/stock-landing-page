@@ -167,9 +167,12 @@ def _safe_click(x: int, y: int, double: bool = False):
     1) pyautogui  2) mouse_event  3) SendInput
     모두 실패해도 예외를 삼키고 계속 진행.
     """
-    sw = ctypes.windll.user32.GetSystemMetrics(0)
-    sh = ctypes.windll.user32.GetSystemMetrics(1)
-    if not (0 <= x < sw and 0 <= y < sh):
+    # 가상 데스크톱 전체 범위로 검사 — 보조 모니터(음수 x/y 포함) 대응
+    vx = ctypes.windll.user32.GetSystemMetrics(_SM_XVIRTUALSCREEN)
+    vy = ctypes.windll.user32.GetSystemMetrics(_SM_YVIRTUALSCREEN)
+    vw = ctypes.windll.user32.GetSystemMetrics(_SM_CXVIRTUALSCREEN)
+    vh = ctypes.windll.user32.GetSystemMetrics(_SM_CYVIRTUALSCREEN)
+    if not (vx <= x < vx + vw and vy <= y < vy + vh):
         return
 
     # 커서 이동
@@ -665,37 +668,79 @@ def _images_differ(img1: Image.Image, img2: Image.Image,
         return True
 
 
-def _find_nav_buttons(img: Image.Image, api_key: str, model: str) -> dict | None:
+def _find_nav_buttons_abs(hwnd: int, rect: tuple,
+                          img: Image.Image,
+                          api_key: str, model: str) -> dict:
     """
-    화면 상단에서 '이전(◀)' / '다음(▶)' 버튼 위치를 찾는다.
-    반환: {"prev_x":0.55,"prev_y":0.07,"next_x":0.65,"next_y":0.07}
-          (전체 이미지 비율) 또는 None
+    이전/다음 버튼의 절대 화면 좌표를 찾는다.
+    반환: {"prev_abs_x":..., "prev_abs_y":...,
+           "next_abs_x":..., "next_abs_y":...}  (찾은 것만 포함)
+
+    탐색 순서:
+      1) UIA (Windows 접근성 API) — 가장 정확
+      2) Vision — 전체 폭 × 상단 30% 크롭 (메뉴 패널 포함)
+      3) 없으면 빈 dict
     """
-    prompt = (
-        "이 EMR 화면 상단에서 페이지 이동 버튼을 찾아주세요.\n"
-        "이전(◀ 또는 '이전' 텍스트)과 다음(▶ 또는 '다음' 텍스트) 버튼 위치를 반환하세요.\n\n"
-        "반환 형식 (전체 이미지 기준 비율 0.0~1.0):\n"
-        '{"prev_x":0.55,"prev_y":0.07,"next_x":0.65,"next_y":0.07}\n'
-        "버튼이 없으면: null"
-    )
-    client = anthropic.Anthropic(api_key=api_key)
-    text = _vision_call(client, model, img, prompt, max_tokens=100)
+    result: dict = {}
+
+    # ── 1단계: UIA ────────────────────────────────────────────────────────
     try:
-        if "null" in text.lower():
-            return None
-        data = _parse_json(text)
-        if isinstance(data, dict) and "prev_x" in data:
-            return data
+        import uia_navigate
+        uia_nav = uia_navigate.find_nav_buttons_uia(hwnd)
+        if uia_nav:
+            result.update(uia_nav)
     except Exception:
         pass
-    return None
+
+    if "prev_abs_x" in result or "next_abs_x" in result:
+        return result
+
+    # ── 2단계: Vision — 전체 폭 × 상단 30% 크롭 ─────────────────────────
+    if not api_key:
+        return result
+
+    try:
+        w, h = img.size
+        HEADER_H_RATIO = 0.30   # 더 넓게 잡아 툴바 놓치지 않도록
+        header = img.crop((0, 0, w, int(h * HEADER_H_RATIO)))
+
+        prompt = (
+            "이 이미지는 EMR 프로그램 화면의 상단 부분입니다.\n"
+            "문서 페이지를 이동하는 버튼을 찾아주세요:\n"
+            "  • '이전' 또는 '◀' 또는 '<' — 이전 페이지 버튼\n"
+            "  • '다음' 또는 '▶' 또는 '>' — 다음 페이지 버튼\n"
+            "버튼은 상단 툴바나 문서 헤더 근처에 있습니다.\n"
+            "이 이미지 전체 크기 기준 비율(0.0~1.0)로 반환:\n"
+            '{"prev_x":0.3,"prev_y":0.5,"next_x":0.4,"next_y":0.5}\n'
+            "버튼을 찾을 수 없으면: null"
+        )
+        client = anthropic.Anthropic(api_key=api_key)
+        text = _vision_call(client, model, header, prompt, max_tokens=120)
+
+        if "null" not in text.lower():
+            data = _parse_json(text)
+            if isinstance(data, dict):
+                log_w = rect[2] - rect[0]
+                log_h = rect[3] - rect[1]
+                if "prev_x" in data and "prev_y" in data:
+                    result["prev_abs_x"] = rect[0] + int(data["prev_x"] * log_w)
+                    result["prev_abs_y"] = rect[1] + int(
+                        data["prev_y"] * HEADER_H_RATIO * log_h)
+                if "next_x" in data and "next_y" in data:
+                    result["next_abs_x"] = rect[0] + int(data["next_x"] * log_w)
+                    result["next_abs_y"] = rect[1] + int(
+                        data["next_y"] * HEADER_H_RATIO * log_h)
+    except Exception:
+        pass
+
+    return result
 
 
 def _collect_pages(
     hwnd: int,
     rect: tuple,
     base_name: str,
-    page_count: int,            # 메뉴 항목 이름에서 파싱한 장수 (1이면 단일)
+    page_count: int,
     first_img: Image.Image,
     api_key: str,
     model: str,
@@ -706,79 +751,125 @@ def _collect_pages(
 ) -> list[tuple[str, Image.Image]]:
     """
     page_count 장수만큼 이전(◀) 버튼을 클릭해 전체 페이지를 수집한다.
-    - page_count > 1 : 메뉴 이름의 괄호 숫자를 그대로 사용
-    - ALWAYS_PAGINATE : 숫자 없어도 화면이 바뀌는 동안 계속 수집
-    - 그 외            : 단일 페이지로 처리
+    - page_count > 1 : 메뉴 이름 괄호 숫자 사용 → 정확히 그 수만큼
+    - ALWAYS_PAGINATE: 숫자 없어도 화면이 바뀌는 동안 계속
+    - 그 외           : 단일 페이지
     """
     force = any(kw in base_name for kw in ALWAYS_PAGINATE)
 
     if page_count <= 1 and not force:
-        # 단일 페이지 — 바로 반환
         if item_cb:
             item_cb(menu_idx, menu_total, base_name, first_img)
         return [(base_name, first_img)]
 
-    # 이전/다음 버튼 위치를 Vision으로 찾기 (첫 페이지에서 1회)
-    nav = _find_nav_buttons(first_img, api_key, model) if api_key else None
-
     log_w = rect[2] - rect[0]
     log_h = rect[3] - rect[1]
 
-    if nav:
-        prev_x = rect[0] + int(nav["prev_x"] * log_w)
-        prev_y = rect[1] + int(nav["prev_y"] * log_h)
-    else:
-        # 버튼 위치 미확인 — EMR 상단 좌측 추정 위치
-        prev_x = rect[0] + int(log_w * 0.55)
-        prev_y = rect[1] + int(log_h * 0.07)
+    # ── 이전 버튼 절대 좌표 탐색 (UIA → Vision 헤더 크롭 → 후보 시도) ──
+    nav = _find_nav_buttons_abs(hwnd, rect, first_img, api_key, model)
+    prev_x: int | None = nav.get("prev_abs_x")
+    prev_y: int | None = nav.get("prev_abs_y")
 
-    # 최신 페이지(첫 캡처) 저장
-    pages: list[tuple[str, Image.Image]] = [("_latest_", first_img)]
+    pages:        list[tuple[str, Image.Image]] = [("_latest_", first_img)]
+    prev_content: Image.Image = _content_region(first_img)
+    collected:    int = 0
+    use_keyboard: bool = False   # Page Up 키 사용 여부
 
-    prev_content  = _content_region(first_img)
-    needed        = page_count - 1   # 이미 1장 있으므로 나머지
-    collected     = 0
-    MAX_PAGES     = max(needed, 60) if page_count > 1 else 60
+    # 버튼을 못 찾았으면 후보 좌표를 순서대로 눌러 보며 실제 작동 좌표 탐색
+    if prev_x is None:
+        if status_cb:
+            status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
+                      "— 이전 버튼 위치 탐색 중...")
+        # 툴바 전형 위치: y=4~15%, x=25~70%
+        candidates = [
+            (rect[0] + int(log_w * xr), rect[1] + int(log_h * yr))
+            for yr in (0.05, 0.07, 0.09, 0.11, 0.13, 0.04, 0.15)
+            for xr in (0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65)
+        ]
+        for cx, cy in candidates:
+            activate_window(hwnd)
+            _safe_click(cx, cy)
+            time.sleep(max(_WAIT_AFTER_CLICK, 1.2))
+            test = capture_screen(hwnd)
+            if _images_differ(prev_content, _content_region(test)):
+                prev_x, prev_y = cx, cy
+                pages.append(("_pg_", test))
+                prev_content = _content_region(test)
+                collected = 1
+                break
+
+        # 좌표 탐색 실패 → Page Up 키보드 시도
+        if prev_x is None:
+            if status_cb:
+                status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
+                          "— Page Up 키 시도...")
+            activate_window(hwnd)
+            try:
+                pyautogui.press("pageup")
+            except Exception:
+                ctypes.windll.user32.keybd_event(0x21, 0, 0, 0)   # VK_PRIOR
+                time.sleep(0.05)
+                ctypes.windll.user32.keybd_event(0x21, 0, 0x0002, 0)
+            time.sleep(_WAIT_AFTER_CLICK)
+            test_kb = capture_screen(hwnd)
+            if _images_differ(prev_content, _content_region(test_kb)):
+                use_keyboard = True
+                pages.append(("_pg_", test_kb))
+                prev_content = _content_region(test_kb)
+                collected = 1
+
+        if prev_x is None and not use_keyboard:
+            # 어떤 방법도 효과 없음 → 단일 페이지
+            if status_cb:
+                status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
+                          "— 이전 버튼 미발견, 1페이지만 수집")
+            if item_cb:
+                item_cb(menu_idx, menu_total, base_name, first_img)
+            return [(base_name, first_img)]
+
+    needed    = page_count - 1   # 이미 1장(최신) 보유
+    MAX_PAGES = max(needed if page_count > 1 else 60, 60)
 
     while collected < MAX_PAGES:
         if status_cb:
-            if page_count > 1:
-                status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
-                          f"— 이전 클릭 ({collected+1}/{needed})...")
-            else:
-                status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
-                          f"— 이전 클릭 ({collected+1})...")
+            sfx = f"/{needed}" if page_count > 1 else ""
+            status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
+                      f"— 이전 이동 {collected+1}{sfx}...")
 
         activate_window(hwnd)
-        _safe_click(prev_x, prev_y)
+        if use_keyboard:
+            try:
+                pyautogui.press("pageup")
+            except Exception:
+                ctypes.windll.user32.keybd_event(0x21, 0, 0, 0)
+                time.sleep(0.05)
+                ctypes.windll.user32.keybd_event(0x21, 0, 0x0002, 0)
+        else:
+            _safe_click(prev_x, prev_y)
         time.sleep(_WAIT_AFTER_CLICK)
 
-        img     = capture_screen(hwnd)
-        content = _content_region(img)
+        cap     = capture_screen(hwnd)
+        content = _content_region(cap)
 
         if not _images_differ(prev_content, content):
-            break   # 화면이 안 바뀜 → 더 이상 이전 없음
+            break   # 더 이상 이전 없음
 
-        pages.append(("_pg_", img))
+        pages.append(("_pg_", cap))
         prev_content = content
         collected += 1
 
-        # 장수를 알고 있으면 정확히 그 수만큼만 수집
         if page_count > 1 and collected >= needed:
             break
 
-    # 오래된→최신 순으로 정렬
+    # 오래된→최신 순으로 뒤집고 레이블 확정
     pages.reverse()
-    total = len(pages)
+    total   = len(pages)
+    labeled = [(f"{base_name} ({i+1}/{total})", im)
+               for i, (_, im) in enumerate(pages)]
 
-    # 레이블 확정: "간호기록지 (1/15)", "간호기록지 (2/15)" ...
-    labeled = [(f"{base_name} ({i+1}/{total})", img)
-               for i, (_, img) in enumerate(pages)]
-
-    # item_cb 호출 (순서대로)
     if item_cb:
-        for lbl, img in labeled:
-            item_cb(menu_idx, menu_total, lbl, img)
+        for lbl, im in labeled:
+            item_cb(menu_idx, menu_total, lbl, im)
 
     return labeled
 
