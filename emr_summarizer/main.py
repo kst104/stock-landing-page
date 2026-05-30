@@ -161,82 +161,133 @@ class WindowPickerDialog(tk.Toplevel):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TabConfirmDialog(tk.Toplevel):
+    """발견된 EMR 탭 목록을 보여주고 체크 선택·행 삭제 후 수집을 시작하는 다이얼로그."""
+
     def __init__(self, parent, tabs: list[dict], on_confirm, title: str = "수집 항목 선택"):
         super().__init__(parent)
         self.title(title)
-        self.geometry("420x480")
+        self.geometry("460x500")
         self.resizable(True, True)
         self.grab_set()
-        self._tabs = tabs
+        # 원본을 복사해 삭제 작업에 영향 없도록
+        self._tabs: list[dict] = list(tabs)
         self._on_confirm = on_confirm
-        self._vars: list[tk.BooleanVar] = []
+        # 각 행: (tab_dict, BooleanVar, row_frame) — 삭제 시 제거
+        self._rows: list[tuple[dict, tk.BooleanVar, tk.Frame]] = []
+        self._inner: ttk.Frame | None = None
+        self._canvas: tk.Canvas | None = None
+        self._sel_lbl: ttk.Label | None = None
         self._build()
+
+    # ── UI 구성 ──────────────────────────────────────────────────────────────
 
     def _build(self):
         ttk.Label(self,
-                  text="수집할 항목을 선택하세요:",
-                  font=("맑은 고딕", 10, "bold")).pack(pady=(12, 4), padx=16, anchor="w")
+                  text="수집할 항목을 선택하세요 (✕ 버튼으로 항목 삭제 가능):",
+                  font=("맑은 고딕", 9, "bold")).pack(pady=(12, 4), padx=16, anchor="w")
 
-        # 전체 선택/해제 버튼
+        # 전체 선택/해제 + 카운터
         ctrl = ttk.Frame(self)
         ctrl.pack(fill="x", padx=16, pady=(0, 4))
         ttk.Button(ctrl, text="전체 선택", width=10,
                    command=self._select_all).pack(side="left", padx=(0, 4))
         ttk.Button(ctrl, text="전체 해제", width=10,
                    command=self._deselect_all).pack(side="left")
-        self._sel_lbl = ttk.Label(ctrl, text=f"0 / {len(self._tabs)} 선택",
-                                  foreground="gray")
+        self._sel_lbl = ttk.Label(ctrl, text="", foreground="gray")
         self._sel_lbl.pack(side="right")
 
-        # 체크박스 목록 (스크롤)
-        frame = ttk.Frame(self)
-        frame.pack(fill="both", expand=True, padx=16, pady=(0, 6))
-        sb = ttk.Scrollbar(frame)
+        # 스크롤 가능한 항목 목록
+        list_frame = ttk.Frame(self)
+        list_frame.pack(fill="both", expand=True, padx=16, pady=(0, 6))
+
+        sb = ttk.Scrollbar(list_frame)
         sb.pack(side="right", fill="y")
-        canvas = tk.Canvas(frame, yscrollcommand=sb.set, highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
-        sb.config(command=canvas.yview)
 
-        inner = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=inner, anchor="nw")
+        self._canvas = tk.Canvas(list_frame, yscrollcommand=sb.set, highlightthickness=0)
+        self._canvas.pack(fill="both", expand=True)
+        sb.config(command=self._canvas.yview)
 
-        for i, tab in enumerate(self._tabs):
-            var = tk.BooleanVar(value=True)
-            self._vars.append(var)
-            cb = ttk.Checkbutton(inner, text=f"  {tab.get('name', '')}",
-                                 variable=var,
-                                 command=self._update_count)
-            cb.pack(anchor="w", pady=1)
+        self._inner = ttk.Frame(self._canvas)
+        self._canvas.create_window((0, 0), window=self._inner, anchor="nw")
+        self._inner.bind("<Configure>",
+                         lambda e: self._canvas.configure(
+                             scrollregion=self._canvas.bbox("all")))
 
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        # 마우스 휠 스크롤
+        self._canvas.bind("<MouseWheel>",
+                          lambda e: self._canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+
+        for tab in self._tabs:
+            self._add_row(tab)
 
         self._update_count()
 
-        # 하단 버튼 (항상 고정)
-        btn = ttk.Frame(self)
-        btn.pack(fill="x", padx=16, pady=10, side="bottom")
-        ttk.Button(btn, text="선택 항목 수집 시작",
+        # 하단 버튼 (고정)
+        btn_bar = ttk.Frame(self)
+        btn_bar.pack(fill="x", padx=16, pady=10, side="bottom")
+        ttk.Button(btn_bar, text="선택 항목 수집 시작",
                    command=self._confirm).pack(side="right", padx=4)
-        ttk.Button(btn, text="취소",
+        ttk.Button(btn_bar, text="취소",
                    command=self.destroy).pack(side="right")
 
+    def _add_row(self, tab: dict):
+        """항목 한 행 추가: [체크박스 이름]  [✕ 삭제 버튼]."""
+        row = ttk.Frame(self._inner)
+        row.pack(fill="x", pady=1)
+
+        var = tk.BooleanVar(value=True)
+
+        cb = ttk.Checkbutton(row, text=f"  {tab.get('name', '')}",
+                             variable=var,
+                             command=self._update_count)
+        cb.pack(side="left", fill="x", expand=True)
+
+        # ✕ 버튼 — 해당 행을 목록에서 영구 삭제
+        del_btn = tk.Button(
+            row, text="✕", fg="red", relief="flat", bd=0,
+            font=("맑은 고딕", 9, "bold"), cursor="hand2",
+            activeforeground="darkred",
+        )
+        # command는 row 참조가 결정된 후 설정
+        entry = (tab, var, row)
+        del_btn.config(command=lambda e=entry: self._delete_row(e))
+        del_btn.pack(side="right", padx=(4, 0))
+
+        self._rows.append(entry)
+
+    # ── 행 삭제 ──────────────────────────────────────────────────────────────
+
+    def _delete_row(self, entry: tuple):
+        if entry in self._rows:
+            self._rows.remove(entry)
+            _, _, row_frame = entry
+            row_frame.destroy()
+            self._update_count()
+
+    # ── 전체 선택/해제 ───────────────────────────────────────────────────────
+
     def _select_all(self):
-        for v in self._vars:
-            v.set(True)
+        for _, var, _ in self._rows:
+            var.set(True)
         self._update_count()
 
     def _deselect_all(self):
-        for v in self._vars:
-            v.set(False)
+        for _, var, _ in self._rows:
+            var.set(False)
         self._update_count()
 
+    # ── 카운터 갱신 ──────────────────────────────────────────────────────────
+
     def _update_count(self):
-        n = sum(v.get() for v in self._vars)
-        self._sel_lbl.config(text=f"{n} / {len(self._tabs)} 선택")
+        total   = len(self._rows)
+        checked = sum(var.get() for _, var, _ in self._rows)
+        if self._sel_lbl:
+            self._sel_lbl.config(text=f"{checked} / {total} 선택")
+
+    # ── 확인 ─────────────────────────────────────────────────────────────────
 
     def _confirm(self):
-        selected = [tab for tab, var in zip(self._tabs, self._vars) if var.get()]
+        selected = [tab for tab, var, _ in self._rows if var.get()]
         if not selected:
             messagebox.showwarning("선택 없음", "하나 이상의 항목을 선택하세요.", parent=self)
             return
