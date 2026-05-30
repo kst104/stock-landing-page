@@ -578,14 +578,20 @@ class App(tk.Tk):
 
         btn_row = ttk.Frame(result_frame)
         btn_row.pack(fill="x", padx=6, pady=(4, 0))
-        ttk.Button(btn_row, text="복사",   command=self._copy).pack(side="right", padx=4)
-        ttk.Button(btn_row, text="지우기", command=self._clear_result).pack(side="right")
+        self._copy_btn = ttk.Button(
+            btn_row, text="📋  복사", width=12, command=self._copy)
+        self._copy_btn.pack(side="right", padx=4)
+        ttk.Button(btn_row, text="🗑  지우기",
+                   command=self._clear_result).pack(side="right", padx=4)
 
         self._result_txt = scrolledtext.ScrolledText(
             result_frame, font=("맑은 고딕", 10), wrap="word", state="disabled")
         self._result_txt.pack(fill="both", expand=True, padx=6, pady=6)
         self._result_txt.tag_config(
             "heading", font=("맑은 고딕", 11, "bold"), foreground="#1d4ed8")
+        # Ctrl+C 로도 전체 복사 (텍스트가 비활성 상태라 기본 복사가 안 될 수 있음)
+        self._result_txt.bind("<Control-c>", lambda e: (self._copy(), "break")[1])
+        self._result_txt.bind("<Control-C>", lambda e: (self._copy(), "break")[1])
 
         # 상태바
         bar = ttk.Frame(self, relief="sunken")
@@ -969,10 +975,17 @@ class App(tk.Tk):
 
     def _copy(self):
         text = self._result_txt.get("1.0", "end").strip()
-        if text:
-            self.clipboard_clear()
-            self.clipboard_append(text)
-            self._status("클립보드에 복사되었습니다.")
+        if not text:
+            self._status("복사할 요약 내용이 없습니다.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()   # 클립보드 내용 확정 (창 닫혀도 유지)
+        self._status(f"클립보드에 복사되었습니다 ({len(text):,}자). Ctrl+V로 붙여넣기.")
+
+        # 버튼에 잠시 확인 표시 후 원래대로 복원
+        self._copy_btn.config(text="✅  복사됨")
+        self.after(1500, lambda: self._copy_btn.config(text="📋  복사"))
 
     def _clear_result(self):
         self._set_result("")
