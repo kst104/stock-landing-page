@@ -627,7 +627,7 @@ class App(tk.Tk):
             try:
                 # 앱 최소화 → EMR 창 전면
                 self.after(0, self.iconify)
-                import time as _t; _t.sleep(0.8)
+                import time as _t; _t.sleep(0.3)
 
                 screenshot = auto_navigate.capture_screen(hwnd)
                 hwnd_rect  = _wg.GetWindowRect(hwnd)
@@ -682,22 +682,20 @@ class App(tk.Tk):
                 # 모든 창 숨기기 — EMR 창만 화면에 남음
                 self.after(0, self.iconify)
                 self.after(0, prog_dlg.withdraw)
-                _t.sleep(0.8)
+                _t.sleep(0.3)
 
                 results = auto_navigate.collect_menu_items(
                     hwnd, items,
                     status_cb=lambda m: self.after(0, lambda msg=m: self._status(msg)),
                     item_cb=lambda idx, total, name, img: (
-                        # 메인 스레드에서 갤러리 + 진행 다이얼로그 업데이트
                         self.after(0, lambda i=idx, n=name, im=img: (
                             self._captures.append((n, im)),
                             self._refresh_gallery(),
                             prog_dlg.deiconify(),
                             prog_dlg.update_item(i, n, im),
                         )),
-                        _t.sleep(1.0),                      # 미리보기 표시
-                        self.after(0, prog_dlg.withdraw),   # 다음 캡처 전 숨김
-                        _t.sleep(0.3),
+                        _t.sleep(0.2),
+                        self.after(0, prog_dlg.withdraw),
                     ),
                 )
 
