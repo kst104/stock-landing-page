@@ -741,6 +741,8 @@ class App(tk.Tk):
         self._add_btn.config(state="disabled")
 
         prog_dlg = CollectProgressDialog(self, total=len(items))
+        api_key = self._settings["claude_api_key"]
+        model   = self._settings.get("claude_model", "claude-sonnet-4-6")
 
         def _run():
             import time as _t
@@ -752,6 +754,8 @@ class App(tk.Tk):
 
                 results = auto_navigate.collect_menu_items(
                     hwnd, items,
+                    api_key=api_key,
+                    model=model,
                     status_cb=lambda m: self.after(0, lambda msg=m: self._status(msg)),
                     item_cb=lambda idx, total, name, img: (
                         self.after(0, lambda i=idx, n=name, im=img: (

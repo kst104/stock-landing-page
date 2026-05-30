@@ -609,19 +609,106 @@ def _images_differ(img1: Image.Image, img2: Image.Image,
         return True
 
 
+def _find_pagination(img: Image.Image,
+                     api_key: str, model: str) -> dict | None:
+    """
+    화면에서 '현재/전체' 페이지 표시(예: 1/3)와 '다음(▶)' 버튼 위치를 찾는다.
+    반환: {"current":1, "total":3, "next_x":0.72, "next_y":0.08}
+          (이미지 전체 기준 비율) 또는 None(단일 페이지)
+    """
+    prompt = (
+        "이 EMR 화면에서 문서 페이지 네비게이션을 찾아주세요.\n"
+        "'1/3', '2/5' 처럼 '현재/전체' 형식의 페이지 번호가 있는지 확인하세요.\n"
+        "있으면 '다음' 또는 '▶' 버튼의 클릭 위치도 찾아주세요.\n\n"
+        "반환 형식 (이미지 전체 크기 기준 비율 0.0~1.0):\n"
+        '{"current":1,"total":3,"next_x":0.72,"next_y":0.08}\n'
+        "페이지 표시가 없거나 total이 1이면 반드시: null"
+    )
+    client = anthropic.Anthropic(api_key=api_key)
+    text = _vision_call(client, model, img, prompt, max_tokens=120)
+    try:
+        if "null" in text.lower():
+            return None
+        data = _parse_json(text)
+        if isinstance(data, dict) and int(data.get("total", 1)) > 1:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _collect_pages(
+    hwnd: int,
+    rect: tuple,
+    name: str,
+    first_img: Image.Image,
+    api_key: str,
+    model: str,
+    menu_idx: int,
+    menu_total: int,
+    status_cb=None,
+    item_cb=None,
+) -> list[tuple[str, Image.Image]]:
+    """
+    첫 페이지 캡처 후 N/M 페이지네이션을 감지하고
+    '다음' 버튼을 반복 클릭해 모든 페이지를 수집한다.
+    """
+    results = []
+
+    pagination = _find_pagination(first_img, api_key, model) if api_key else None
+
+    if not pagination:
+        # 단일 페이지
+        results.append((name, first_img))
+        if item_cb:
+            item_cb(menu_idx, menu_total, name, first_img)
+        return results
+
+    total_pages = int(pagination["total"])
+    w, h = first_img.size
+
+    # 첫 페이지
+    label0 = f"{name} (1/{total_pages})"
+    results.append((label0, first_img))
+    if item_cb:
+        item_cb(menu_idx, menu_total, label0, first_img)
+
+    # 2페이지~마지막 페이지
+    for pg in range(2, total_pages + 1):
+        if status_cb:
+            status_cb(f"  [{menu_idx}/{menu_total}] {name} — {pg}/{total_pages} 페이지...")
+
+        next_x = rect[0] + int(pagination["next_x"] * w)
+        next_y = rect[1] + int(pagination["next_y"] * h)
+
+        activate_window(hwnd)
+        _safe_click(next_x, next_y)
+        time.sleep(_WAIT_AFTER_CLICK)
+
+        img = capture_screen(hwnd)
+        label = f"{name} ({pg}/{total_pages})"
+        results.append((label, img))
+        if item_cb:
+            item_cb(menu_idx, menu_total, label, img)
+
+    return results
+
+
 def collect_menu_items(
     hwnd: int,
-    items: list[dict],          # [{"name":..., "abs_x":..., "abs_y":...}]
+    items: list[dict],
+    api_key: str = "",
+    model: str = "",
     status_cb=None,
     item_cb=None,
 ) -> list[tuple[str, Image.Image]]:
     """
     메뉴 항목을 순서대로 클릭하며 오른쪽 콘텐츠를 캡처.
-    좌표가 흔들리지 않는 정적 목록을 가정 — 클릭 후 콘텐츠 영역 변화로 매칭 검증.
-    items는 discover_items_fast() 반환값.
+    각 항목에서 N/M 페이지 표시가 있으면 '다음'을 반복해 전 페이지 수집.
     """
-    total = len(items)
-    results = []
+    menu_total = len(items)
+    results: list[tuple[str, Image.Image]] = []
+    rect = win32gui.GetWindowRect(hwnd)
 
     prev_img = capture_screen(hwnd)   # 클릭 전 기준 화면
 
@@ -629,38 +716,41 @@ def collect_menu_items(
         name  = item["name"]
         abs_x = item["abs_x"]
         abs_y = item["abs_y"]
+        menu_idx = i + 1
 
         if status_cb:
-            status_cb(f"[{i+1}/{total}] {name} 여는 중...")
+            status_cb(f"[{menu_idx}/{menu_total}] {name} 여는 중...")
 
-        # 창 활성화 → 단일 클릭 (콘텐츠 로드)
+        # 창 활성화 → 단일 클릭
         activate_window(hwnd)
         _safe_click(abs_x, abs_y)
         time.sleep(_WAIT_AFTER_CLICK)
         img = capture_screen(hwnd)
 
-        # 오른쪽 콘텐츠 영역이 안 바뀌면 더블클릭+Enter로 재시도
-        changed = _images_differ(_content_region(prev_img),
-                                 _content_region(img))
+        # 오른쪽 콘텐츠 영역이 안 바뀌면 더블클릭+Enter 재시도
+        changed = _images_differ(_content_region(prev_img), _content_region(img))
         if not changed:
             if status_cb:
-                status_cb(f"[{i+1}/{total}] {name} — 재시도...")
+                status_cb(f"[{menu_idx}/{menu_total}] {name} — 재시도...")
             activate_window(hwnd)
             _safe_click(abs_x, abs_y, double=True)
             _send_key(0x0D)
             time.sleep(_WAIT_AFTER_CLICK)
             img = capture_screen(hwnd)
-            changed = _images_differ(_content_region(prev_img),
-                                     _content_region(img))
+            changed = _images_differ(_content_region(prev_img), _content_region(img))
 
-        # 라벨에 매칭 신뢰도 표시 — 변화 없으면 이름 끝에 (?) 표기
         label = name if changed else f"{name} (확인필요)"
 
+        # 페이지네이션 확인 및 전 페이지 수집
+        pages = _collect_pages(
+            hwnd, rect, label, img,
+            api_key, model,
+            menu_idx, menu_total,
+            status_cb=status_cb,
+            item_cb=item_cb,
+        )
+        results.extend(pages)
         prev_img = img
-        results.append((label, img))
-
-        if item_cb:
-            item_cb(i + 1, total, label, img)
 
     return results
 
