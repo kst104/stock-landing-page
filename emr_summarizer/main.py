@@ -202,6 +202,89 @@ class TabConfirmDialog(tk.Toplevel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 플로팅 캡처 바 (항상 위에 표시 — 사용자가 메뉴 클릭 후 누름)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FloatingCaptureBar(tk.Toplevel):
+    """
+    EMR 창 위에 항상 떠 있는 작은 캡처 바.
+    사용자가 NGTMediPlus 메뉴 항목을 직접 클릭한 뒤
+    [📷 캡처] 버튼을 눌러 화면을 수집한다.
+    """
+    def __init__(self, parent, on_capture, on_done):
+        super().__init__(parent)
+        self.overrideredirect(True)      # 제목 표시줄 없음
+        self.attributes("-topmost", True)
+        self.attributes("-alpha", 0.92)
+        self._on_capture = on_capture
+        self._on_done    = on_done
+        self._count      = 0
+        self._drag_x     = 0
+        self._drag_y     = 0
+        self._build()
+        # 화면 우측 상단에 배치
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        self.geometry(f"+{sw - 280}+20")
+
+    def _build(self):
+        bg = "#1e3a5f"
+        self.configure(bg=bg)
+
+        header = tk.Frame(self, bg=bg, cursor="fleur")
+        header.pack(fill="x", padx=2, pady=(4, 0))
+        tk.Label(header, text="📋 EMR 캡처 바  (드래그로 이동)",
+                 bg=bg, fg="white", font=("맑은 고딕", 8)).pack(side="left", padx=6)
+        header.bind("<ButtonPress-1>",   self._drag_start)
+        header.bind("<B1-Motion>",       self._drag_move)
+
+        body = tk.Frame(self, bg=bg)
+        body.pack(padx=6, pady=6)
+
+        self._count_lbl = tk.Label(body, text="캡처: 0장",
+                                   bg=bg, fg="#7dd3fc",
+                                   font=("맑은 고딕", 9, "bold"))
+        self._count_lbl.pack(pady=(0, 6))
+
+        tk.Label(body, text="① NGTMediPlus에서 메뉴 항목 클릭\n② 내용이 바뀌면 아래 버튼 클릭",
+                 bg=bg, fg="#cbd5e1", font=("맑은 고딕", 8),
+                 justify="left").pack(pady=(0, 8))
+
+        btn_f = tk.Frame(body, bg=bg)
+        btn_f.pack(fill="x")
+
+        cap_btn = tk.Button(btn_f, text="📷  지금 캡처",
+                            bg="#2563eb", fg="white",
+                            font=("맑은 고딕", 10, "bold"),
+                            relief="flat", padx=10, pady=6,
+                            command=self._capture)
+        cap_btn.pack(fill="x", pady=(0, 4))
+
+        done_btn = tk.Button(btn_f, text="✅  완료 → AI 요약",
+                             bg="#16a34a", fg="white",
+                             font=("맑은 고딕", 9, "bold"),
+                             relief="flat", padx=10, pady=5,
+                             command=self._done)
+        done_btn.pack(fill="x")
+
+    def _drag_start(self, e):
+        self._drag_x = e.x_root - self.winfo_x()
+        self._drag_y = e.y_root - self.winfo_y()
+
+    def _drag_move(self, e):
+        self.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
+
+    def _capture(self):
+        self._on_capture()
+        self._count += 1
+        self._count_lbl.config(text=f"캡처: {self._count}장")
+
+    def _done(self):
+        self.destroy()
+        self._on_done()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 수집 진행 다이얼로그
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -376,6 +459,11 @@ class App(tk.Tk):
             top, text="📷  수동 캡처 추가",
             command=self._start_manual_capture, width=18)
         self._add_btn.pack(side="left", ipady=6)
+
+        self._seq_btn = ttk.Button(
+            top, text="🖱  순차 캡처 모드",
+            command=self._start_sequential, width=16)
+        self._seq_btn.pack(side="left", padx=(4, 0), ipady=6)
 
         self._summary_btn = ttk.Button(
             top, text="🤖  요약",
@@ -649,6 +737,39 @@ class App(tk.Tk):
         self._refresh_gallery()
         self._status(f"자동 수집 완료 ({len(results)}개) — AI 요약 시작 중...")
         self._run_summary()
+
+    # ── 순차 캡처 모드 (사용자가 메뉴 클릭 → 캡처 버튼) ─────────────────────────
+
+    def _start_sequential(self):
+        """
+        플로팅 캡처 바를 띄운다.
+        사용자가 NGTMediPlus 메뉴 항목을 직접 클릭 후 [📷 지금 캡처] 누름.
+        """
+        self._seq_btn.config(state="disabled")
+
+        def _do_capture():
+            import time as _t
+            from PIL import ImageGrab
+            # 캡처 바를 잠시 숨겨서 찍히지 않게
+            bar.withdraw()
+            _t.sleep(0.3)
+            img = ImageGrab.grab()
+            bar.deiconify()
+            n = len(self._captures) + 1
+            self._captures.append((f"캡처 {n}", img))
+            self._refresh_gallery()
+            self._status(f"{n}장 캡처 완료 — 다음 항목 클릭 후 다시 [📷 지금 캡처]")
+
+        def _do_done():
+            self._seq_btn.config(state="normal")
+            if self._captures:
+                self._status(f"총 {len(self._captures)}장 수집 완료 — AI 요약 시작")
+                self._run_summary()
+            else:
+                self._status("캡처된 화면이 없습니다.")
+
+        bar = FloatingCaptureBar(self, on_capture=_do_capture, on_done=_do_done)
+        self._status("순차 캡처 모드: NGTMediPlus 메뉴 클릭 → [📷 지금 캡처] 반복 → [✅ 완료]")
 
     # ── 수동 캡처 ─────────────────────────────────────────────────────────────
 
