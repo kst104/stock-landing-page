@@ -687,18 +687,18 @@ def _find_nav_buttons_abs(hwnd: int, rect: tuple,
                           img: Image.Image,
                           api_key: str, model: str) -> dict:
     """
-    이전/다음 버튼의 절대 화면 좌표를 찾는다.
+    이전/다음 버튼의 절대 화면 좌표 + 툴바 페이지 표시(1/N)를 찾는다.
     반환: {"prev_abs_x":..., "prev_abs_y":...,
-           "next_abs_x":..., "next_abs_y":...}  (찾은 것만 포함)
+           "next_abs_x":..., "next_abs_y":...,
+           "page_current":1, "page_total":15}   (찾은 것만 포함)
 
     탐색 순서:
-      1) UIA (Windows 접근성 API) — 가장 정확
-      2) Vision — 전체 폭 × 상단 30% 크롭 (메뉴 패널 포함)
-      3) 없으면 빈 dict
+      1) UIA (Windows 접근성 API) — 버튼 좌표
+      2) Vision — 전체 폭 × 상단 30% 크롭 (버튼 좌표 + 1/N 페이지 표시)
     """
     result: dict = {}
 
-    # ── 1단계: UIA ────────────────────────────────────────────────────────
+    # ── 1단계: UIA — 버튼 좌표 ───────────────────────────────────────────
     try:
         import uia_navigate
         uia_nav = uia_navigate.find_nav_buttons_uia(hwnd)
@@ -707,10 +707,8 @@ def _find_nav_buttons_abs(hwnd: int, rect: tuple,
     except Exception:
         pass
 
-    if "prev_abs_x" in result or "next_abs_x" in result:
-        return result
-
-    # ── 2단계: Vision — 전체 폭 × 상단 30% 크롭 ─────────────────────────
+    # ── 2단계: Vision — 버튼 좌표(없을 때) + 툴바 1/N 페이지 표시 ─────────
+    # 버튼 좌표를 UIA로 이미 찾았더라도, 툴바의 1/N 숫자를 읽기 위해 Vision 호출.
     if not api_key:
         return result
 
@@ -720,21 +718,24 @@ def _find_nav_buttons_abs(hwnd: int, rect: tuple,
         header = img.crop((0, 0, w, int(h * HEADER_H_RATIO)))
 
         prompt = (
-            "이 이미지는 EMR 프로그램 화면의 상단 부분입니다.\n"
-            "문서 페이지를 이동하는 버튼만 찾아주세요:\n"
-            "  • '이전' 또는 '◀' 또는 '<' — 이전 페이지 버튼\n"
-            "  • '다음' 또는 '▶' 또는 '>' — 다음 페이지 버튼\n"
-            "버튼은 상단 툴바나 문서 헤더 근처에 있습니다.\n\n"
-            "주의: '저장','삭제','수정','등록','출력','인쇄','확인','닫기' 같은 버튼은\n"
-            "페이지 이동 버튼이 아니므로 prev/next 로 절대 반환하지 마세요.\n"
+            "이 이미지는 EMR 프로그램 화면의 상단(툴바·헤더) 부분입니다.\n\n"
+            "1) 문서 페이지를 이동하는 버튼만 찾아주세요:\n"
+            "   • '이전' 또는 '◀' 또는 '<' — 이전(왼쪽) 페이지 버튼\n"
+            "   • '다음' 또는 '▶' 또는 '>' — 다음(오른쪽) 페이지 버튼\n"
+            "2) 툴바에 'N/M' 또는 'N / M' 형태의 페이지 표시가 있으면\n"
+            "   현재 페이지(N)와 전체 페이지(M)를 읽어주세요. 예: '1/15' → cur=1,total=15\n\n"
+            "주의: '저장','삭제','복사','새문서','수정','등록','출력','인쇄','확인','닫기'\n"
+            "같은 버튼은 페이지 이동 버튼이 아니므로 prev/next 로 절대 반환하지 마세요.\n"
             "이 버튼들의 위치는 danger 배열에 따로 담아주세요(혼동 방지용).\n\n"
             "이 이미지 전체 크기 기준 비율(0.0~1.0)로 반환:\n"
             '{"prev_x":0.3,"prev_y":0.5,"next_x":0.4,"next_y":0.5,'
+            '"page_current":1,"page_total":15,'
             '"danger":[{"x":0.8,"y":0.5},{"x":0.9,"y":0.5}]}\n'
-            "이동 버튼을 찾을 수 없으면: null"
+            "이동 버튼·페이지 표시를 모두 못 찾으면: null\n"
+            "(일부만 있으면 있는 항목만 채워서 반환)"
         )
         client = anthropic.Anthropic(api_key=api_key)
-        text = _vision_call(client, model, header, prompt, max_tokens=250)
+        text = _vision_call(client, model, header, prompt, max_tokens=300)
 
         if "null" not in text.lower():
             data = _parse_json(text)
@@ -745,6 +746,17 @@ def _find_nav_buttons_abs(hwnd: int, rect: tuple,
                 def _abs(rx, ry):
                     return (rect[0] + int(rx * log_w),
                             rect[1] + int(ry * HEADER_H_RATIO * log_h))
+
+                # 툴바 1/N 페이지 표시 읽기
+                try:
+                    pt = int(data.get("page_total", 0))
+                    if pt > 1:
+                        result["page_total"] = pt
+                    pc = int(data.get("page_current", 0))
+                    if pc >= 1:
+                        result["page_current"] = pc
+                except Exception:
+                    pass
 
                 # 위험 버튼 절대 좌표 목록
                 danger_pts: list[tuple[int, int]] = []
@@ -762,11 +774,14 @@ def _find_nav_buttons_abs(hwnd: int, rect: tuple,
                                abs(py - dy) <= near_thresh
                                for dx, dy in danger_pts)
 
-                if "prev_x" in data and "prev_y" in data:
+                # UIA가 좌표를 못 줬을 때만 Vision 좌표 사용
+                if "prev_abs_x" not in result and \
+                        "prev_x" in data and "prev_y" in data:
                     px, py = _abs(data["prev_x"], data["prev_y"])
                     if not _too_close(px, py):
                         result["prev_abs_x"], result["prev_abs_y"] = px, py
-                if "next_x" in data and "next_y" in data:
+                if "next_abs_x" not in result and \
+                        "next_x" in data and "next_y" in data:
                     nx, ny = _abs(data["next_x"], data["next_y"])
                     if not _too_close(nx, ny):
                         result["next_abs_x"], result["next_abs_y"] = nx, ny
@@ -790,83 +805,129 @@ def _collect_pages(
     item_cb=None,
 ) -> list[tuple[str, Image.Image]]:
     """
-    page_count 장수만큼 이전(◀) 버튼을 클릭해 전체 페이지를 수집한다.
-    - page_count > 1 : 메뉴 이름 괄호 숫자 사용 → 정확히 그 수만큼
-    - ALWAYS_PAGINATE: 숫자 없어도 화면이 바뀌는 동안 계속
-    - 그 외           : 단일 페이지
+    전체 페이지를 이전(◀)/다음(▶) 버튼으로 수집한다.
+
+    페이지 수 결정 우선순위:
+      1) 툴바의 'N/M' 표시 분모 M  (가장 신뢰도 높음 — 화면이 실제로 알려줌)
+      2) 메뉴 이름 괄호 숫자        (예: '간호기록지(15)' → 15)
+      3) ALWAYS_PAGINATE 키워드     (숫자 없어도 바뀌는 동안 계속)
+
+    수집 방식:
+      - 다음 버튼이 있으면: 이전으로 1페이지까지 되돌린 뒤 다음으로 M장 순서대로 수집
+      - 다음 버튼이 없으면: 이전으로 바뀌는 동안 수집 후 순서 뒤집기
+    저장/삭제/복사/새문서 버튼은 _find_nav_buttons_abs 에서 이미 배제됨.
     """
     force = any(kw in base_name for kw in ALWAYS_PAGINATE)
 
-    if page_count <= 1 and not force:
+    # ── 버튼 좌표 + 툴바 N/M 페이지 표시 탐색 ──
+    nav = _find_nav_buttons_abs(hwnd, rect, first_img, api_key, model)
+    prev_x: int | None = nav.get("prev_abs_x")
+    prev_y: int | None = nav.get("prev_abs_y")
+    next_x: int | None = nav.get("next_abs_x")
+    next_y: int | None = nav.get("next_abs_y")
+    page_total = nav.get("page_total")   # 툴바 분모 M
+
+    # 최종 목표 장수: 툴바 분모 > 메뉴 괄호 숫자
+    target = page_count
+    if isinstance(page_total, int) and page_total > 1:
+        target = max(target, page_total)
+
+    # 수집할 게 없으면 단일 페이지
+    if target <= 1 and not force:
         if item_cb:
             item_cb(menu_idx, menu_total, base_name, first_img)
         return [(base_name, first_img)]
 
-    # ── 이전 버튼 절대 좌표 탐색 (UIA → Vision 헤더 크롭) ──
-    # 저장/삭제/복사/새문서는 _find_nav_buttons_abs 내부에서 이미 배제됨.
-    nav = _find_nav_buttons_abs(hwnd, rect, first_img, api_key, model)
-    prev_x: int | None = nav.get("prev_abs_x")
-    prev_y: int | None = nav.get("prev_abs_y")
+    HARD_CAP = max(target if target > 1 else 60, 60)   # 안전 상한
 
-    pages:        list[tuple[str, Image.Image]] = [("_latest_", first_img)]
-    prev_content: Image.Image = _content_region(first_img)
-    collected:    int = 0
-
-    needed    = page_count - 1   # 이미 1장(최신) 보유
-    MAX_PAGES = max(needed if page_count > 1 else 60, 60)
-
-    def _press_pageup():
-        """Page Up 키 — 저장/삭제 등을 트리거하지 않는 안전한 이전 이동."""
+    def _press_key(vk: int):
+        """Page Up(0x21)/Page Down(0x22) — 저장/삭제를 트리거하지 않는 안전 이동."""
         try:
-            pyautogui.press("pageup")
+            pyautogui.press("pageup" if vk == 0x21 else "pagedown")
         except Exception:
-            ctypes.windll.user32.keybd_event(0x21, 0, 0, 0)        # VK_PRIOR
+            ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
             time.sleep(0.05)
-            ctypes.windll.user32.keybd_event(0x21, 0, 0x0002, 0)
+            ctypes.windll.user32.keybd_event(vk, 0, 0x0002, 0)
 
     def _go_prev():
-        """이전 페이지로 이동. 버튼 좌표가 있으면 클릭, 없으면 Page Up 키."""
         activate_window(hwnd)
         if prev_x is not None and prev_y is not None:
             _safe_click(prev_x, prev_y)
         else:
-            _press_pageup()
+            _press_key(0x21)   # Page Up
         time.sleep(_WAIT_AFTER_CLICK)
 
-    if prev_x is not None and status_cb:
-        status_cb(f"  [{menu_idx}/{menu_total}] {base_name} — 이전 버튼 클릭으로 수집")
-    elif status_cb:
+    def _go_next():
+        activate_window(hwnd)
+        if next_x is not None and next_y is not None:
+            _safe_click(next_x, next_y)
+        else:
+            _press_key(0x22)   # Page Down
+        time.sleep(_WAIT_AFTER_CLICK)
+
+    has_next = (next_x is not None) or (prev_x is None)   # 다음 버튼 or 키보드 가능
+
+    if status_cb:
+        tgt_str = f"{target}장" if target > 1 else "전체"
+        via = "이전/다음 버튼" if prev_x is not None else "Page Up/Down 키"
         status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
-                  "— 이전 버튼 미발견, Page Up 키로 수집")
+                  f"— {tgt_str} 수집 ({via})")
 
-    while collected < MAX_PAGES:
-        if status_cb:
-            sfx = f"/{needed}" if page_count > 1 else ""
-            status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
-                      f"— 이전 이동 {collected+1}{sfx}...")
+    pages: list[tuple[str, Image.Image]] = []
 
-        _go_prev()
+    if has_next:
+        # ── 1) 이전으로 첫 페이지까지 되돌리기 ──
+        cur = _content_region(first_img)
+        for _ in range(HARD_CAP):
+            _go_prev()
+            cap = capture_screen(hwnd)
+            cc  = _content_region(cap)
+            if not _images_differ(cur, cc):
+                break   # 더 못 감 = 첫 페이지 도달
+            cur = cc
 
-        cap     = capture_screen(hwnd)
-        content = _content_region(cap)
+        # ── 2) 첫 페이지 캡처 후 다음으로 순서대로 수집 ──
+        first_page = capture_screen(hwnd)
+        pages.append(("_pg_", first_page))
+        prev_content = _content_region(first_page)
 
-        if not _images_differ(prev_content, content):
-            break   # 더 이상 이전 없음
+        while len(pages) < HARD_CAP:
+            if status_cb:
+                status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
+                          f"— 다음 이동 {len(pages)}/{target}...")
+            _go_next()
+            cap = capture_screen(hwnd)
+            cc  = _content_region(cap)
+            if not _images_differ(prev_content, cc):
+                break   # 마지막 페이지
+            pages.append(("_pg_", cap))
+            prev_content = cc
+            if target > 1 and len(pages) >= target:
+                break
+        # 이미 오래된→최신 순 → 뒤집지 않음
+    else:
+        # ── 다음 버튼 없음: 이전으로만 수집 후 순서 뒤집기 ──
+        pages.append(("_latest_", first_img))
+        prev_content = _content_region(first_img)
+        while len(pages) < HARD_CAP:
+            if status_cb:
+                status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
+                          f"— 이전 이동 {len(pages)}/{target}...")
+            _go_prev()
+            cap = capture_screen(hwnd)
+            cc  = _content_region(cap)
+            if not _images_differ(prev_content, cc):
+                break
+            pages.append(("_pg_", cap))
+            prev_content = cc
+            if target > 1 and len(pages) >= target:
+                break
+        pages.reverse()   # 오래된→최신 순으로
 
-        pages.append(("_pg_", cap))
-        prev_content = content
-        collected += 1
-
-        if page_count > 1 and collected >= needed:
-            break
-
-    # 1장만 수집됐고 더 가져올 게 있었는데 버튼이 안 먹은 경우 안내
-    if collected == 0 and status_cb:
+    if len(pages) <= 1 and status_cb:
         status_cb(f"  [{menu_idx}/{menu_total}] {base_name} "
                   "— 페이지 이동 안 됨, 1페이지만 수집")
 
-    # 오래된→최신 순으로 뒤집고 레이블 확정
-    pages.reverse()
     total   = len(pages)
     labeled = [(f"{base_name} ({i+1}/{total})", im)
                for i, (_, im) in enumerate(pages)]
