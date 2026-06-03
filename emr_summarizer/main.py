@@ -889,8 +889,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("AI 진료기록 요약")
-        self.geometry("900x720")
-        self.minsize(750, 550)
+        self.geometry("1040x760")
+        self.minsize(820, 560)
 
         self._settings = config.load()
         self._captures: list[tuple[str, Image.Image]] = []
@@ -903,9 +903,9 @@ class App(tk.Tk):
     # ── UI 구성 ───────────────────────────────────────────────────────────────
 
     def _build(self):
-        # 버튼 바
+        # 버튼 바 — 1행: 수집/요약
         top = ttk.Frame(self)
-        top.pack(fill="x", padx=12, pady=10)
+        top.pack(fill="x", padx=12, pady=(10, 2))
 
         self._auto_btn = ttk.Button(
             top, text="🤖  자동 수집 + 요약",
@@ -935,21 +935,25 @@ class App(tk.Tk):
             command=self._run_brief_summary, width=14)
         self._brief_btn.pack(side="left", padx=(0, 6), ipady=6)
 
-        ttk.Separator(top, orient="vertical").pack(
-            side="left", fill="y", padx=8, pady=4)
+        # 버튼 바 — 2행: 영상 리딩 / 도구
+        top2 = ttk.Frame(self)
+        top2.pack(fill="x", padx=12, pady=(0, 8))
 
-        ttk.Button(top, text="🩻  영상 리딩",
-                   command=self._open_image_reading, width=13).pack(
+        ttk.Button(top2, text="🩻  CT/X-ray 영상 리딩",
+                   command=self._open_image_reading, width=22).pack(
             side="left", ipady=6)
 
-        ttk.Button(top, text="🗑  초기화",
-                   command=self._reset, width=10).pack(side="left", padx=6, ipady=6)
+        ttk.Separator(top2, orient="vertical").pack(
+            side="left", fill="y", padx=10, pady=4)
 
-        ttk.Button(top, text="⚙  설정",
+        ttk.Button(top2, text="🗑  초기화",
+                   command=self._reset, width=10).pack(side="left", ipady=6)
+
+        ttk.Button(top2, text="⚙  설정",
                    command=self._open_settings, width=8).pack(
-            side="left", ipady=6)
+            side="left", padx=6, ipady=6)
 
-        self._api_status = ttk.Label(top, text="", foreground="gray")
+        self._api_status = ttk.Label(top2, text="", foreground="gray")
         self._api_status.pack(side="right")
 
         # 캡처 갤러리
