@@ -497,14 +497,22 @@ class ImageReadingDialog(tk.Toplevel):
     """CT·X-ray·일반 영상 파일을 불러와 AI 임상 리딩을 수행하는 독립 창."""
 
     _SUPPORTED = (
+        ("의료 영상/동영상",
+         "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp "
+         "*.avi *.mp4 *.mov *.mkv *.wmv *.mpg *.mpeg"),
         ("이미지 파일",
          "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp"),
+        ("동영상 파일",
+         "*.avi *.mp4 *.mov *.mkv *.wmv *.mpg *.mpeg"),
         ("모든 파일", "*.*"),
     )
 
+    _VIDEO_EXTS = {".avi", ".mp4", ".mov", ".mkv", ".wmv", ".mpg", ".mpeg"}
+    _VIDEO_FRAMES = 8   # 동영상에서 추출할 대표 프레임 수
+
     def __init__(self, parent, settings: dict):
         super().__init__(parent)
-        self.title("🩻  영상 임상 리딩 (CT / X-ray / 일반 영상)")
+        self.title("🩻  영상 임상 리딩 (CT / X-ray / 일반 영상 / AVI 동영상)")
         self.geometry("960x760")
         self.minsize(700, 560)
         self.grab_set()  # 모달
@@ -522,7 +530,7 @@ class ImageReadingDialog(tk.Toplevel):
         top = ttk.Frame(self)
         top.pack(fill="x", padx=12, pady=8)
 
-        ttk.Label(top, text="CT · X-ray · 일반 영상 파일을 불러와 AI 임상 리딩",
+        ttk.Label(top, text="CT · X-ray · 일반 영상/동영상(AVI 등)을 불러와 AI 임상 리딩",
                   font=("맑은 고딕", 10, "bold")).pack(side="left")
 
         self._read_btn = ttk.Button(
@@ -562,7 +570,7 @@ class ImageReadingDialog(tk.Toplevel):
 
         self._gal_empty = ttk.Label(
             self._gal_inner,
-            text="📂 파일 추가 버튼으로 CT / X-ray 이미지를 불러오세요.",
+            text="📂 파일 추가 버튼으로 CT / X-ray 이미지 또는 AVI 동영상을 불러오세요.",
             foreground="gray", font=("맑은 고딕", 9))
 
         # ── 임상 정보 입력 ──
@@ -665,23 +673,99 @@ class ImageReadingDialog(tk.Toplevel):
     def _add_files(self):
         from tkinter import filedialog
         paths = filedialog.askopenfilenames(
-            title="CT / X-ray 영상 파일 선택",
+            title="CT / X-ray 영상·동영상 파일 선택",
             filetypes=self._SUPPORTED,
             parent=self,
         )
         added = 0
         for p in paths:
+            ext = os.path.splitext(p)[1].lower()
             try:
-                img = Image.open(p).convert("RGB")
-                name = os.path.basename(p)
-                self._images.append((name, img))
-                added += 1
+                if ext in self._VIDEO_EXTS:
+                    added += self._add_video(p)
+                else:
+                    img = Image.open(p).convert("RGB")
+                    self._images.append((os.path.basename(p), img))
+                    added += 1
             except Exception as e:
                 messagebox.showwarning("파일 오류", f"{os.path.basename(p)}\n{e}",
                                        parent=self)
         if added:
             self._refresh_gallery()
-            self._status(f"파일 {added}개 추가 (총 {len(self._images)}개)")
+            self._status(f"프레임/이미지 {added}개 추가 (총 {len(self._images)}개)")
+
+    def _add_video(self, path: str) -> int:
+        """동영상(AVI 등)에서 대표 프레임을 추출해 목록에 추가. 추가된 프레임 수 반환."""
+        name = os.path.basename(path)
+        frames = self._extract_video_frames(path, self._VIDEO_FRAMES)
+        if not frames:
+            messagebox.showwarning(
+                "동영상 읽기 실패",
+                f"{name}\n\n동영상에서 프레임을 추출하지 못했습니다.\n"
+                "OpenCV(opencv-python) 또는 imageio 설치가 필요할 수 있습니다.\n\n"
+                "  pip install opencv-python",
+                parent=self)
+            return 0
+        base = os.path.splitext(name)[0]
+        for i, fr in enumerate(frames, 1):
+            self._images.append((f"{base} [프레임 {i}/{len(frames)}]", fr))
+        self._status(f"'{name}'에서 {len(frames)}개 프레임 추출")
+        return len(frames)
+
+    @staticmethod
+    def _extract_video_frames(path: str, count: int) -> list[Image.Image]:
+        """동영상에서 균등 간격으로 count개 프레임 추출 (OpenCV → imageio 폴백)."""
+        # 1순위: OpenCV
+        try:
+            import cv2
+            cap = cv2.VideoCapture(path)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+            frames: list[Image.Image] = []
+            if total > 0:
+                # 처음/끝을 살짝 피해 균등 간격으로 추출
+                idxs = [int(total * (k + 0.5) / count) for k in range(count)]
+                for fi in idxs:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+                    ok, frame = cap.read()
+                    if ok:
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frames.append(Image.fromarray(rgb))
+            else:
+                # 프레임 수 모를 때: 순차로 읽으며 일정 간격 샘플
+                step = 15
+                i = 0
+                while len(frames) < count:
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    if i % step == 0:
+                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frames.append(Image.fromarray(rgb))
+                    i += 1
+            cap.release()
+            if frames:
+                return frames
+        except Exception:
+            pass
+
+        # 2순위: imageio
+        try:
+            import imageio.v3 as iio
+            import numpy as np  # noqa: F401
+            frames = []
+            reader = iio.imiter(path)
+            allf = list(reader)
+            if allf:
+                n = len(allf)
+                idxs = [int(n * (k + 0.5) / count) for k in range(count)]
+                for fi in idxs:
+                    fi = min(fi, n - 1)
+                    frames.append(Image.fromarray(allf[fi]).convert("RGB"))
+            return frames
+        except Exception:
+            pass
+
+        return []
 
     def _clear_images(self):
         self._images.clear()
@@ -697,7 +781,7 @@ class ImageReadingDialog(tk.Toplevel):
         if not self._images:
             self._gal_empty = ttk.Label(
                 self._gal_inner,
-                text="📂 파일 추가 버튼으로 CT / X-ray 이미지를 불러오세요.",
+                text="📂 파일 추가 버튼으로 CT / X-ray 이미지 또는 AVI 동영상을 불러오세요.",
                 foreground="gray", font=("맑은 고딕", 9))
             self._gal_empty.pack(padx=20, pady=40)
             self._file_count_lbl.config(text="파일 없음")
