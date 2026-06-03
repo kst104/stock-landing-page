@@ -490,6 +490,398 @@ class SettingsDialog(tk.Toplevel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CT / X-ray 영상 임상 리딩 창
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ImageReadingDialog(tk.Toplevel):
+    """CT·X-ray·일반 영상 파일을 불러와 AI 임상 리딩을 수행하는 독립 창."""
+
+    _SUPPORTED = (
+        ("이미지 파일",
+         "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp"),
+        ("모든 파일", "*.*"),
+    )
+
+    def __init__(self, parent, settings: dict):
+        super().__init__(parent)
+        self.title("🩻  영상 임상 리딩 (CT / X-ray / 일반 영상)")
+        self.geometry("960x760")
+        self.minsize(700, 560)
+        self.grab_set()  # 모달
+
+        self._settings = settings
+        self._images: list[tuple[str, Image.Image]] = []   # (파일명, PIL Image)
+        self._thumb_imgs: list[ImageTk.PhotoImage] = []    # GC 방지용 참조
+
+        self._build()
+
+    # ── UI ───────────────────────────────────────────────────────────────────
+
+    def _build(self):
+        # 상단 안내 + 버튼
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=12, pady=8)
+
+        ttk.Label(top, text="CT · X-ray · 일반 영상 파일을 불러와 AI 임상 리딩",
+                  font=("맑은 고딕", 10, "bold")).pack(side="left")
+
+        self._read_btn = ttk.Button(
+            top, text="🔬  AI 임상 리딩 시작", width=20,
+            command=self._run_reading)
+        self._read_btn.pack(side="right", ipady=5)
+
+        # ── 파일 추가 버튼 영역 ──
+        file_row = ttk.Frame(self)
+        file_row.pack(fill="x", padx=12, pady=(0, 4))
+
+        ttk.Button(file_row, text="📂  파일 추가", width=14,
+                   command=self._add_files).pack(side="left", ipady=4)
+        ttk.Button(file_row, text="🗑  목록 지우기", width=14,
+                   command=self._clear_images).pack(side="left", padx=6, ipady=4)
+        self._file_count_lbl = ttk.Label(
+            file_row, text="파일 없음", foreground="#6b7280")
+        self._file_count_lbl.pack(side="left", padx=8)
+
+        # ── 썸네일 갤러리 ──
+        gal_frame = ttk.LabelFrame(self, text="불러온 영상")
+        gal_frame.pack(fill="x", padx=12, pady=(0, 6))
+
+        self._gal_canvas = tk.Canvas(
+            gal_frame, height=130, highlightthickness=0)
+        gal_sx = ttk.Scrollbar(gal_frame, orient="horizontal",
+                               command=self._gal_canvas.xview)
+        self._gal_canvas.configure(xscrollcommand=gal_sx.set)
+        gal_sx.pack(side="bottom", fill="x")
+        self._gal_canvas.pack(fill="x", padx=4, pady=4)
+        self._gal_inner = ttk.Frame(self._gal_canvas)
+        self._gal_canvas.create_window((0, 0), window=self._gal_inner, anchor="nw")
+        self._gal_inner.bind(
+            "<Configure>",
+            lambda e: self._gal_canvas.configure(
+                scrollregion=self._gal_canvas.bbox("all")))
+
+        self._gal_empty = ttk.Label(
+            self._gal_inner,
+            text="📂 파일 추가 버튼으로 CT / X-ray 이미지를 불러오세요.",
+            foreground="gray", font=("맑은 고딕", 9))
+
+        # ── 임상 정보 입력 ──
+        clin_frame = ttk.LabelFrame(self, text="임상 정보 입력 (선택 — 입력할수록 리딩 정확도 향상)")
+        clin_frame.pack(fill="x", padx=12, pady=(0, 6))
+
+        hint = ("예) 환자 60세 남성, 당뇨·고혈압 병력.  주호소: 호흡 곤란 3일.  "
+                "혈압 150/90, SpO₂ 92%.  WBC 12,000.  흉부 PA 및 좌측 Lat 촬영.")
+        self._clin_hint = hint
+        self._clin_txt = tk.Text(
+            clin_frame, height=4, font=("맑은 고딕", 10),
+            wrap="word", relief="flat",
+            background="#f8fafc", foreground="#374151")
+        self._clin_txt.insert("1.0", hint)
+        self._clin_txt.config(foreground="#9ca3af")   # placeholder 색
+        self._clin_txt.pack(fill="x", padx=6, pady=6)
+
+        # placeholder 동작
+        self._clin_txt.bind("<FocusIn>",  self._clin_focus_in)
+        self._clin_txt.bind("<FocusOut>", self._clin_focus_out)
+
+        # ── 리딩 결과 ──
+        res_frame = ttk.LabelFrame(self, text="AI 임상 리딩 결과")
+        res_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+        res_btn_row = ttk.Frame(res_frame)
+        res_btn_row.pack(fill="x", padx=6, pady=(4, 0))
+        self._res_copy_btn = ttk.Button(
+            res_btn_row, text="📋  전체 복사", width=14,
+            command=self._copy_result)
+        self._res_copy_btn.pack(side="right", padx=4)
+        ttk.Label(res_btn_row, text="드래그 후 Ctrl+C 로 부분 복사",
+                  foreground="#6b7280").pack(side="right", padx=8)
+        ttk.Button(res_btn_row, text="🗑  지우기",
+                   command=lambda: self._set_result("")).pack(side="right", padx=4)
+
+        self._res_txt = scrolledtext.ScrolledText(
+            res_frame, font=("맑은 고딕", 10), wrap="word")
+        self._res_txt.pack(fill="both", expand=True, padx=6, pady=6)
+        self._res_txt.tag_config(
+            "heading", font=("맑은 고딕", 11, "bold"), foreground="#1d4ed8")
+
+        # 편집 차단 (선택·복사는 허용)
+        _NAV = {"Up","Down","Left","Right","Home","End","Prior","Next",
+                "Shift_L","Shift_R","Control_L","Control_R",
+                "Alt_L","Alt_R","Caps_Lock","Escape"}
+
+        def _block(ev):
+            if ev.state & 0x4 and ev.keysym.lower() in ("c","a"):
+                return
+            if ev.keysym in _NAV:
+                return
+            return "break"
+
+        self._res_txt.bind("<Key>", _block)
+
+        def _smart_copy(ev):
+            try:
+                sel = self._res_txt.get("sel.first", "sel.last")
+                if sel.strip():
+                    self.clipboard_clear(); self.clipboard_append(sel)
+                    self.update()
+                    self._status(f"선택 복사 ({len(sel):,}자)")
+                    return "break"
+            except tk.TclError:
+                pass
+            self._copy_result()
+            return "break"
+
+        self._res_txt.bind("<Control-c>", _smart_copy)
+        self._res_txt.bind("<Control-C>", _smart_copy)
+
+        # 상태바
+        sbar = ttk.Frame(self, relief="sunken")
+        sbar.pack(fill="x", side="bottom")
+        self._status_var = tk.StringVar(value="파일을 불러온 뒤 [AI 임상 리딩 시작]을 눌러주세요.")
+        ttk.Label(sbar, textvariable=self._status_var,
+                  anchor="w").pack(fill="x", padx=8, pady=2)
+
+        self._refresh_gallery()
+
+    # ── placeholder 처리 ────────────────────────────────────────────────────
+
+    def _clin_focus_in(self, _):
+        if self._clin_txt.get("1.0", "end").strip() == self._clin_hint:
+            self._clin_txt.delete("1.0", "end")
+            self._clin_txt.config(foreground="#374151")
+
+    def _clin_focus_out(self, _):
+        if not self._clin_txt.get("1.0", "end").strip():
+            self._clin_txt.insert("1.0", self._clin_hint)
+            self._clin_txt.config(foreground="#9ca3af")
+
+    def _get_clinical_info(self) -> str:
+        txt = self._clin_txt.get("1.0", "end").strip()
+        return "" if txt == self._clin_hint else txt
+
+    # ── 파일 관리 ───────────────────────────────────────────────────────────
+
+    def _add_files(self):
+        from tkinter import filedialog
+        paths = filedialog.askopenfilenames(
+            title="CT / X-ray 영상 파일 선택",
+            filetypes=self._SUPPORTED,
+            parent=self,
+        )
+        added = 0
+        for p in paths:
+            try:
+                img = Image.open(p).convert("RGB")
+                name = os.path.basename(p)
+                self._images.append((name, img))
+                added += 1
+            except Exception as e:
+                messagebox.showwarning("파일 오류", f"{os.path.basename(p)}\n{e}",
+                                       parent=self)
+        if added:
+            self._refresh_gallery()
+            self._status(f"파일 {added}개 추가 (총 {len(self._images)}개)")
+
+    def _clear_images(self):
+        self._images.clear()
+        self._thumb_imgs.clear()
+        self._refresh_gallery()
+        self._status("목록 초기화")
+
+    def _refresh_gallery(self):
+        for w in self._gal_inner.winfo_children():
+            w.destroy()
+        self._thumb_imgs.clear()
+
+        if not self._images:
+            self._gal_empty = ttk.Label(
+                self._gal_inner,
+                text="📂 파일 추가 버튼으로 CT / X-ray 이미지를 불러오세요.",
+                foreground="gray", font=("맑은 고딕", 9))
+            self._gal_empty.pack(padx=20, pady=40)
+            self._file_count_lbl.config(text="파일 없음")
+            return
+
+        self._file_count_lbl.config(text=f"영상 {len(self._images)}개 로드됨")
+        for idx, (name, img) in enumerate(self._images):
+            card = ttk.Frame(self._gal_inner)
+            card.pack(side="left", padx=4, pady=4)
+
+            thumb = img.copy()
+            thumb.thumbnail((100, 100))
+            ph = ImageTk.PhotoImage(thumb)
+            self._thumb_imgs.append(ph)
+
+            tk.Label(card, image=ph, relief="ridge", bd=1).pack()
+            ttk.Label(card, text=name[:14] + ("…" if len(name) > 14 else ""),
+                      font=("맑은 고딕", 7), foreground="#374151").pack()
+
+            # X 삭제 버튼
+            ttk.Button(card, text="✕", width=3,
+                       command=lambda i=idx: self._remove_image(i)).pack()
+
+        self._gal_canvas.configure(
+            scrollregion=self._gal_canvas.bbox("all"))
+
+    def _remove_image(self, idx: int):
+        if 0 <= idx < len(self._images):
+            self._images.pop(idx)
+            self._refresh_gallery()
+
+    # ── AI 리딩 ─────────────────────────────────────────────────────────────
+
+    def _run_reading(self):
+        if not self._images:
+            messagebox.showwarning("영상 없음",
+                                   "먼저 [📂 파일 추가]로 영상을 불러오세요.",
+                                   parent=self)
+            return
+        api_key = self._settings.get("claude_api_key", "")
+        if not api_key:
+            messagebox.showerror("API 키 없음",
+                                 "메인 창 [⚙ 설정]에서 Claude API 키를 입력하세요.",
+                                 parent=self)
+            return
+
+        self._read_btn.config(state="disabled")
+        clin = self._get_clinical_info()
+        n = len(self._images)
+        self._set_result(
+            f"영상 {n}장을 AI가 임상 분석 중입니다...\n\n잠시 기다려 주세요.")
+        self._status(f"영상 {n}장 분석 중...")
+
+        def _worker():
+            try:
+                result = _read_images(
+                    self._images,
+                    clinical_info=clin,
+                    api_key=api_key,
+                    model=self._settings.get(
+                        "claude_model", "claude-sonnet-4-6"),
+                )
+                self.after(0, lambda r=result: (
+                    self._set_result(r),
+                    self._status(f"임상 리딩 완료 — 영상 {n}장"),
+                ))
+            except Exception as e:
+                self.after(0, lambda err=e: (
+                    self._status(f"오류: {err}"),
+                    messagebox.showerror("리딩 오류", str(err), parent=self),
+                    self._set_result(""),
+                ))
+            finally:
+                self.after(0, lambda: self._read_btn.config(state="normal"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── 결과 표시 ───────────────────────────────────────────────────────────
+
+    def _set_result(self, text: str):
+        self._res_txt.delete("1.0", "end")
+        for line in text.splitlines(keepends=True):
+            tag = "heading" if line.startswith("## ") else ""
+            self._res_txt.insert("end", line, tag)
+
+    def _copy_result(self):
+        text = self._res_txt.get("1.0", "end").strip()
+        if not text:
+            self._status("복사할 내용이 없습니다.")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update()
+        self._status(f"전체 복사 완료 ({len(text):,}자)")
+        self._res_copy_btn.config(text="✅  복사됨")
+        self.after(1500, lambda: self._res_copy_btn.config(text="📋  전체 복사"))
+
+    def _status(self, msg: str):
+        self._status_var.set(msg)
+
+
+# ── 영상 임상 리딩 AI 함수 ────────────────────────────────────────────────────
+
+def _read_images(
+    images: list[tuple[str, Image.Image]],
+    clinical_info: str,
+    api_key: str,
+    model: str,
+) -> str:
+    """CT / X-ray 영상을 Claude Vision으로 임상 분석."""
+    import base64, io as _io
+    import anthropic as _ant
+
+    def _b64(img: Image.Image) -> str:
+        buf = _io.BytesIO()
+        resized = img.copy()
+        resized.thumbnail((1280, 1280), Image.LANCZOS)
+        resized.save(buf, format="PNG")
+        return base64.standard_b64encode(buf.getvalue()).decode()
+
+    content: list[dict] = []
+
+    if clinical_info:
+        content.append({
+            "type": "text",
+            "text": f"## 임상 정보 (판독 참고)\n{clinical_info}\n",
+        })
+
+    for fname, img in images:
+        content.append({"type": "text", "text": f"[영상: {fname}]"})
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": _b64(img),
+            },
+        })
+
+    content.append({"type": "text", "text": _READING_PROMPT})
+
+    client = _ant.Anthropic(api_key=api_key)
+    msg = client.messages.create(
+        model=model,
+        max_tokens=2500,
+        system=_READING_SYSTEM,
+        messages=[{"role": "user", "content": content}],
+    )
+    return msg.content[0].text
+
+
+_READING_SYSTEM = """당신은 경험 많은 영상의학과 전문의입니다.
+CT, X-ray, MRI, 초음파 등 의료 영상을 임상적으로 판독하고
+한국어로 구조화된 판독 소견을 작성합니다.
+영상의학적으로 정확한 용어를 사용하되, 임상의가 바로 활용할 수 있도록
+명확하고 간결하게 기술합니다."""
+
+_READING_PROMPT = """위 의료 영상(들)을 임상적으로 판독해 주세요.
+임상 정보가 제공된 경우 함께 고려하여 판독하세요.
+
+다음 형식으로 작성하세요:
+
+## 영상 종류 및 촬영 부위
+(CT/X-ray/MRI 여부, 촬영 부위, 방향)
+
+## 주요 소견
+(영상에서 관찰되는 이상 소견 — 위치, 크기, 성상 포함)
+
+## 정상 소견
+(주요 해부학적 구조물 중 정상인 항목)
+
+## 감별 진단
+(소견에 근거한 가능성 높은 진단 순서대로)
+
+## 임상적 권고
+(추가 검사, 추적 관찰, 치료 방향 제안)
+
+## 종합 판독 소견
+(핵심 소견 2~3줄 요약)
+
+※ 이 판독은 AI에 의한 참고용이며, 최종 판단은 반드시 전문의가 확인해야 합니다."""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 메인 앱
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -543,12 +935,19 @@ class App(tk.Tk):
             command=self._run_brief_summary, width=14)
         self._brief_btn.pack(side="left", padx=(0, 6), ipady=6)
 
+        ttk.Separator(top, orient="vertical").pack(
+            side="left", fill="y", padx=8, pady=4)
+
+        ttk.Button(top, text="🩻  영상 리딩",
+                   command=self._open_image_reading, width=13).pack(
+            side="left", ipady=6)
+
         ttk.Button(top, text="🗑  초기화",
-                   command=self._reset, width=10).pack(side="left", ipady=6)
+                   command=self._reset, width=10).pack(side="left", padx=6, ipady=6)
 
         ttk.Button(top, text="⚙  설정",
                    command=self._open_settings, width=8).pack(
-            side="left", padx=8, ipady=6)
+            side="left", ipady=6)
 
         self._api_status = ttk.Label(top, text="", foreground="gray")
         self._api_status.pack(side="right")
@@ -1000,6 +1399,9 @@ class App(tk.Tk):
         self._refresh_gallery()
         self._clear_result()
         self._status("초기화 완료")
+
+    def _open_image_reading(self):
+        ImageReadingDialog(self, self._settings)
 
     def _open_settings(self):
         SettingsDialog(self, self._settings, self._on_settings_saved)
