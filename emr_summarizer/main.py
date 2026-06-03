@@ -508,7 +508,7 @@ class ImageReadingDialog(tk.Toplevel):
     )
 
     _VIDEO_EXTS = {".avi", ".mp4", ".mov", ".mkv", ".wmv", ".mpg", ".mpeg"}
-    _VIDEO_FRAMES = 20   # 동영상에서 추출할 대표 프레임 수 (잘게 쪼개 리딩)
+    _VIDEO_FRAMES = 30   # 동영상에서 추출할 기본 프레임 수 (UI에서 조절 가능)
 
     def __init__(self, parent, settings: dict):
         super().__init__(parent)
@@ -520,6 +520,7 @@ class ImageReadingDialog(tk.Toplevel):
         self._settings = settings
         self._images: list[tuple[str, Image.Image]] = []   # (파일명, PIL Image)
         self._thumb_imgs: list[ImageTk.PhotoImage] = []    # GC 방지용 참조
+        self._frames_var = tk.IntVar(value=self._VIDEO_FRAMES)  # 동영상 추출 프레임 수
 
         self._build()
 
@@ -546,6 +547,15 @@ class ImageReadingDialog(tk.Toplevel):
                    command=self._add_files).pack(side="left", ipady=4)
         ttk.Button(file_row, text="🗑  목록 지우기", width=14,
                    command=self._clear_images).pack(side="left", padx=6, ipady=4)
+
+        # 동영상/CT 프레임 추출 개수 조절
+        ttk.Label(file_row, text="동영상 프레임 수:").pack(side="left", padx=(12, 2))
+        ttk.Spinbox(file_row, from_=1, to=200, width=5,
+                    textvariable=self._frames_var).pack(side="left")
+        ttk.Label(file_row, text="(CT는 슬라이스가 많으면 크게)",
+                  foreground="#6b7280", font=("맑은 고딕", 8)).pack(
+            side="left", padx=4)
+
         self._file_count_lbl = ttk.Label(
             file_row, text="파일 없음", foreground="#6b7280")
         self._file_count_lbl.pack(side="left", padx=8)
@@ -697,7 +707,11 @@ class ImageReadingDialog(tk.Toplevel):
     def _add_video(self, path: str) -> int:
         """동영상(AVI 등)에서 대표 프레임을 추출해 목록에 추가. 추가된 프레임 수 반환."""
         name = os.path.basename(path)
-        frames = self._extract_video_frames(path, self._VIDEO_FRAMES)
+        try:
+            count = max(1, min(200, int(self._frames_var.get())))
+        except Exception:
+            count = self._VIDEO_FRAMES
+        frames = self._extract_video_frames(path, count)
         if not frames:
             messagebox.showwarning(
                 "동영상 읽기 실패",
