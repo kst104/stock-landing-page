@@ -584,19 +584,56 @@ class App(tk.Tk):
         btn_row = ttk.Frame(result_frame)
         btn_row.pack(fill="x", padx=6, pady=(4, 0))
         self._copy_btn = ttk.Button(
-            btn_row, text="📋  복사", width=12, command=self._copy)
+            btn_row, text="📋  전체 복사", width=14, command=self._copy)
         self._copy_btn.pack(side="right", padx=4)
+        ttk.Label(btn_row, text="드래그로 부분 선택 후 Ctrl+C",
+                  foreground="#6b7280").pack(side="right", padx=8)
         ttk.Button(btn_row, text="🗑  지우기",
                    command=self._clear_result).pack(side="right", padx=4)
 
         self._result_txt = scrolledtext.ScrolledText(
-            result_frame, font=("맑은 고딕", 10), wrap="word", state="disabled")
+            result_frame, font=("맑은 고딕", 10), wrap="word")
         self._result_txt.pack(fill="both", expand=True, padx=6, pady=6)
         self._result_txt.tag_config(
             "heading", font=("맑은 고딕", 11, "bold"), foreground="#1d4ed8")
-        # Ctrl+C 로도 전체 복사 (텍스트가 비활성 상태라 기본 복사가 안 될 수 있음)
-        self._result_txt.bind("<Control-c>", lambda e: (self._copy(), "break")[1])
-        self._result_txt.bind("<Control-C>", lambda e: (self._copy(), "break")[1])
+
+        # 편집 방지: 내비게이션·선택·복사 키만 허용, 나머지는 차단
+        _ALLOW_KEYS = {
+            "Up", "Down", "Left", "Right", "Home", "End",
+            "Prior", "Next",          # Page Up / Page Down
+            "Shift_L", "Shift_R",
+            "Control_L", "Control_R",
+            "Alt_L", "Alt_R",
+            "Caps_Lock", "Escape", "F1", "F2", "F3", "F4",
+        }
+
+        def _block_edit(event):
+            ctrl = event.state & 0x4
+            if ctrl and event.keysym.lower() in ("c", "a"):
+                return          # Ctrl+C / Ctrl+A 허용 (기본 처리로 넘김)
+            if event.keysym in _ALLOW_KEYS:
+                return          # 방향키·페이지키 허용
+            return "break"      # 그 외 모든 키 입력 차단
+
+        self._result_txt.bind("<Key>", _block_edit)
+
+        # Ctrl+C: 선택 영역이 있으면 선택만, 없으면 전체 복사
+        def _smart_copy(event):
+            try:
+                sel = self._result_txt.get("sel.first", "sel.last")
+                if sel.strip():
+                    self.clipboard_clear()
+                    self.clipboard_append(sel)
+                    self.update()
+                    self._status(f"선택 텍스트 복사 ({len(sel):,}자)")
+                    return "break"
+            except tk.TclError:
+                pass
+            self._copy()
+            return "break"
+
+        self._result_txt.bind("<Control-c>", _smart_copy)
+        self._result_txt.bind("<Control-C>", _smart_copy)
 
         # 상태바
         bar = ttk.Frame(self, relief="sunken")
@@ -981,14 +1018,13 @@ class App(tk.Tk):
         self._status_var.set(msg)
 
     def _set_result(self, text: str):
-        self._result_txt.config(state="normal")
         self._result_txt.delete("1.0", "end")
         for line in text.splitlines(keepends=True):
             tag = "heading" if line.startswith("## ") else ""
             self._result_txt.insert("end", line, tag)
-        self._result_txt.config(state="disabled")
 
     def _copy(self):
+        """전체 요약 클립보드 복사."""
         text = self._result_txt.get("1.0", "end").strip()
         if not text:
             self._status("복사할 요약 내용이 없습니다.")
@@ -996,11 +1032,11 @@ class App(tk.Tk):
         self.clipboard_clear()
         self.clipboard_append(text)
         self.update()   # 클립보드 내용 확정 (창 닫혀도 유지)
-        self._status(f"클립보드에 복사되었습니다 ({len(text):,}자). Ctrl+V로 붙여넣기.")
+        self._status(f"전체 복사 완료 ({len(text):,}자). Ctrl+V로 붙여넣기.")
 
         # 버튼에 잠시 확인 표시 후 원래대로 복원
         self._copy_btn.config(text="✅  복사됨")
-        self.after(1500, lambda: self._copy_btn.config(text="📋  복사"))
+        self.after(1500, lambda: self._copy_btn.config(text="📋  전체 복사"))
 
     def _clear_result(self):
         self._set_result("")
