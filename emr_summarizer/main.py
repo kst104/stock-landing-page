@@ -508,7 +508,7 @@ class ImageReadingDialog(tk.Toplevel):
     )
 
     _VIDEO_EXTS = {".avi", ".mp4", ".mov", ".mkv", ".wmv", ".mpg", ".mpeg"}
-    _VIDEO_FRAMES = 8   # 동영상에서 추출할 대표 프레임 수
+    _VIDEO_FRAMES = 20   # 동영상에서 추출할 대표 프레임 수 (잘게 쪼개 리딩)
 
     def __init__(self, parent, settings: dict):
         super().__init__(parent)
@@ -731,8 +731,8 @@ class ImageReadingDialog(tk.Toplevel):
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         frames.append(Image.fromarray(rgb))
             else:
-                # 프레임 수 모를 때: 순차로 읽으며 일정 간격 샘플
-                step = 15
+                # 프레임 수 모를 때: 순차로 읽으며 일정 간격 샘플 (잘게)
+                step = 5
                 i = 0
                 while len(frames) < count:
                     ok, frame = cap.read()
