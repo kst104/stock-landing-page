@@ -1,6 +1,7 @@
 beautifulsoup4
 finance-datareader
 flask
+gunicorn
 lxml
 numpy
 openpyxl
@@ -8,4 +9,3 @@ pandas
 pillow
 requests
 werkzeug
-

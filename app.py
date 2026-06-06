@@ -1342,6 +1342,24 @@ SCREENERS = {
         "color":  "#14b8a6",
         "icon":   "📈",
     },
+    49: {
+        "title":  "조건49 박문환원인점",
+        "desc":   "시총 3,000억↑ · ETF/ETN 제외 · 5일선 이탈 원인점(시가·종가 모두 MA5 하방 첫 봉의 저가) 탐색 · 전일 종가≤원인점 → 금일 종가 재돌파",
+        "color":  "#f472b6",
+        "icon":   "📍",
+    },
+    50: {
+        "title":  "조건50 김승태타점",
+        "desc":   "시총 3,000억↑ · ETF/ETN 제외 · A:120봉신고가 20봉이내 · B:양봉 · C:전일종가<SMA5 · D:전일시가<SMA5 · E:종가 SMA5 골든크로스 · G:전일저가대비종가 5%↑ · H:5봉평균거래량 30만↑ · J:SMA200 2봉연속상승",
+        "color":  "#0ea5e9",
+        "icon":   "🎯",
+    },
+    51: {
+        "title":  "조건51 김승태타점4",
+        "desc":   "시총 3,000억↑ · ETF/ETN 제외 · A~C:3일연속 종가<SMA5 · D:금일시가<SMA5 · E:금일종가<SMA5 · F:양봉 · G:SMA20 2봉연속상승 · H:SMA60 2봉연속상승 · J:5봉평균거래량 10만↑",
+        "color":  "#8b5cf6",
+        "icon":   "🎯",
+    },
 }
 
 
@@ -5489,6 +5507,399 @@ def run_screen48(date_str, prog):
     return df
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건49: 박문환원인점
+# [원인점 정의] 시가·종가 모두 5일선 아래인 '첫 번째' 봉의 저가
+#   - 역방향 탐색: 전일봉은 5일선 위(두 조건 중 하나 이상 충족) → 금일봉은 시가+종가 모두 하방
+# [재돌파 신호] 전일 종가 ≤ 원인점 저가 → 금일 종가 > 원인점 저가
+# 시총 3,000억↑, ETF/ETN 제외
+# ══════════════════════════════════════════════════════════════════════════════
+
+_S49_MIN_CAP = 300_000_000_000   # 시총 3,000억 이상
+_S49_MA_PERIOD = 5               # 5일 이동평균
+
+
+def _screen49_ticker(code, start, end):
+    try:
+        df = fetch_ohlcv(code,
+                         pd.Timestamp(start).strftime("%Y%m%d"),
+                         pd.Timestamp(end).strftime("%Y%m%d"))
+        if df is None or len(df) < _S49_MA_PERIOD + 5:
+            return None
+
+        close  = df["Close"].astype(float)
+        open_  = df["Open"].astype(float)
+        low    = df["Low"].astype(float)
+        volume = df["Volume"].astype(float)
+
+        ma5 = close.rolling(_S49_MA_PERIOD).mean()
+
+        cl  = close.values
+        op  = open_.values
+        lo  = low.values
+        ma  = ma5.values
+        vol = volume.values
+        n   = len(cl)
+
+        if n < 8:   # MA5(5) + 탐색 여유 + 거래량5일평균(1일 추가)
+            return None
+
+        # ── 거래량 조건 사전 체크 (빠른 기각) ────────────────────────────
+        vol_today = vol[n - 1]
+        vol_prev  = vol[n - 2]
+        # 금일 제외 최근 5거래일 평균 거래량 (n-6 ~ n-2)
+        if n < 7:
+            return None
+        vol5_avg = float(np.mean(vol[max(0, n - 6):n - 1]))
+
+        # ① 금일 제외 5일 평균 거래량 ≥ 30만주
+        if vol5_avg < 300_000:
+            return None
+        # ② 금일 거래량 ≥ 전일 거래량 × 200%
+        if vol_prev <= 0 or vol_today < vol_prev * 2.0:
+            return None
+
+        # ── 원인점 탐색: 오늘(n-1) 제외, 역방향 ────────────────────────────
+        # 조건: i번째 봉은 시가·종가 모두 MA5 하방,
+        #        i-1번째 봉은 MA5 하방이 아님 (첫 이탈)
+        cause_low  = None
+        cause_date = None
+        cause_idx  = None
+
+        for i in range(n - 2, 0, -1):   # 전일(n-2)부터 역방향
+            if np.isnan(ma[i]) or np.isnan(ma[i - 1]):
+                continue
+            below_now  = (op[i] < ma[i])  and (cl[i] < ma[i])
+            below_prev = (op[i-1] < ma[i-1]) and (cl[i-1] < ma[i-1])
+            if below_now and not below_prev:
+                cause_low  = lo[i]
+                cause_date = df.index[i]
+                cause_idx  = i
+                break
+
+        if cause_low is None:
+            return None
+
+        # ── 재돌파 신호 ────────────────────────────────────────────────────
+        today_close = cl[n - 1]
+        prev_close  = cl[n - 2]
+
+        if not ((today_close > cause_low) and (prev_close <= cause_low)):
+            return None
+
+        # ── 보조 지표 ──────────────────────────────────────────────────────
+        day_chg      = round((today_close / prev_close - 1) * 100, 2) if prev_close > 0 else 0.0
+        ma5_today    = round(float(ma[n - 1]), 2) if not np.isnan(ma[n - 1]) else 0.0
+        break_pct    = round((today_close - cause_low) / cause_low * 100, 2) if cause_low > 0 else 0.0
+        days_since   = (n - 1) - cause_idx
+        cause_dt_str = pd.Timestamp(cause_date).strftime("%Y-%m-%d")
+        vol_ratio    = round(vol_today / vol_prev * 100, 1) if vol_prev > 0 else 0.0
+
+        return {
+            "종목코드":       code,
+            "종가":           int(today_close),
+            "전일대비(%)":    day_chg,
+            "원인점":         int(cause_low),
+            "원인점날짜":     cause_dt_str,
+            "5일선":          ma5_today,
+            "돌파율(%)":      break_pct,
+            "경과일":         days_since,
+            "거래량비율(%)":  vol_ratio,
+            "5일평균거래량":  int(vol5_avg),
+            "신호":           "원인점재돌파",
+        }
+    except Exception:
+        return None
+
+
+def run_screen49(date_str, prog):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    end     = pd.Timestamp(date_str)
+    start   = end - pd.Timedelta(days=LOOKBACK)
+    listing = _get_listing()
+    valid   = listing[
+        (listing["Marcap"] >= _S49_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False))
+    ].copy()
+    prog["total"]  = len(valid)
+    prog["status"] = "running"
+    rows    = _run_screen_parallel(valid, _screen49_ticker, start, end, prog)
+    t_end   = datetime.now()
+    elapsed = int((t_end - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+            "원인점", "원인점날짜", "5일선", "돌파율(%)",
+            "경과일", "거래량비율(%)", "5일평균거래량", "신호"]]
+          .sort_values("돌파율(%)", ascending=True)
+          .reset_index(drop=True))
+    df["검색시각"] = t_end.strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건50: 김승태타점
+# A: 최근 120봉 중 종가 신고가가 최근 20봉 이내에 발생
+# B: 양봉 (시가 < 종가)
+# C: 전일 종가 < 전일 SMA5
+# D: 전일 시가 < 전일 SMA5
+# E: 종가 SMA5 골든크로스 (전일≤SMA5, 금일>SMA5)
+# G: 전일 저가 대비 종가 등락률 ≥ 5%
+# H: 전일 기준 5봉 평균거래량 ≥ 30만주
+# J: SMA200 2봉 연속 상승
+# (F 거래대금 순위 상위100은 조건식에서 제외)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_S50_MIN_BARS = 210   # 조건A(120봉)+조건J(SMA200) 계산에 필요한 최소 봉 수
+
+
+def _screen50_ticker(code, start, end):
+    try:
+        df = fetch_ohlcv(code,
+                         pd.Timestamp(start).strftime("%Y%m%d"),
+                         pd.Timestamp(end).strftime("%Y%m%d"))
+        if df is None or len(df) < _S50_MIN_BARS:
+            return None
+
+        close  = df["Close"].astype(float)
+        open_  = df["Open"].astype(float)
+        low    = df["Low"].astype(float)
+        volume = df["Volume"].astype(float)
+
+        ma5   = close.rolling(5).mean()
+        ma200 = close.rolling(200).mean()
+
+        cl   = close.values
+        op   = open_.values
+        lo   = low.values
+        vol  = volume.values
+        m5   = ma5.values
+        m200 = ma200.values
+        n    = len(cl)
+        i    = n - 1
+
+        if i < 5:
+            return None
+
+        # NaN 체크 (필수 값)
+        need = [m5[i], m5[i-1], m200[i], m200[i-1], m200[i-2]]
+        if any(np.isnan(v) for v in need):
+            return None
+
+        # ── A: 120봉 신고가가 최근 20봉 이내에 발생 ────────────────────
+        window_120  = cl[n - 120:n]                # 오늘 포함 최근 120봉
+        max_pos     = np.argmax(window_120)         # window 내 최고가 위치
+        bars_ago    = 119 - int(max_pos)            # 오늘=0, 어제=1, ...
+        cond_A      = bars_ago < 20
+
+        # ── B: 양봉 ─────────────────────────────────────────────────────
+        cond_B = op[i] < cl[i]
+
+        # ── C: 전일 종가 < 전일 MA5 ──────────────────────────────────────
+        cond_C = m5[i-1] > cl[i-1]
+
+        # ── D: 전일 시가 < 전일 MA5 ──────────────────────────────────────
+        cond_D = m5[i-1] > op[i-1]
+
+        # ── E: 종가 MA5 골든크로스 (전일≤MA5 → 금일>MA5) ────────────────
+        cond_E = (cl[i-1] <= m5[i-1]) and (cl[i] > m5[i])
+
+        # ── G: 전일 저가 대비 종가 등락률 ≥ 5% ──────────────────────────
+        cond_G = (lo[i-1] > 0) and ((cl[i-1] - lo[i-1]) / lo[i-1] >= 0.05)
+
+        # ── H: 전일 기준 5봉 평균거래량 ≥ 30만주 ────────────────────────
+        vol5_avg = float(np.mean(vol[n-6:n-1]))    # n-6~n-2 (5봉, 전일 포함)
+        cond_H   = vol5_avg >= 300_000
+
+        # ── J: MA200 2봉 연속 상승 ────────────────────────────────────
+        cond_J = (m200[i] > m200[i-1]) and (m200[i-1] > m200[i-2])
+
+        if not (cond_A and cond_B and cond_C and cond_D and
+                cond_E and cond_G and cond_H and cond_J):
+            return None
+
+        day_chg        = round((cl[i] / cl[i-1] - 1) * 100, 2) if cl[i-1] > 0 else 0.0
+        prev_low_pct   = round((cl[i-1] - lo[i-1]) / lo[i-1] * 100, 2) if lo[i-1] > 0 else 0.0
+
+        return {
+            "종목코드":         code,
+            "종가":             int(cl[i]),
+            "전일대비(%)":      day_chg,
+            "SMA5":             round(float(m5[i]), 2),
+            "SMA200":           round(float(m200[i]), 2),
+            "120봉신고가(봉전)": bars_ago,
+            "전일저가대비(%)":   prev_low_pct,
+            "5일평균거래량":     int(vol5_avg),
+            "신호":             "김승태타점",
+        }
+    except Exception:
+        return None
+
+
+def run_screen50(date_str, prog):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    end     = pd.Timestamp(date_str)
+    start   = end - pd.Timedelta(days=LOOKBACK)
+    listing = _get_listing()
+    valid   = listing[
+        (listing["Marcap"] >= 300_000_000_000) &
+        ~listing["Market"].isin(["ETF", "ETN"]) &
+        ~listing["Name"].str.match(_ETF_NAME_RE, na=False)
+    ].copy()
+    prog["total"]  = len(valid)
+    prog["status"] = "running"
+    rows    = _run_screen_parallel(valid, _screen50_ticker, start, end, prog)
+    t_end   = datetime.now()
+    elapsed = int((t_end - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+            "SMA5", "SMA200", "120봉신고가(봉전)", "전일저가대비(%)",
+            "5일평균거래량", "신호"]]
+          .sort_values("전일대비(%)", ascending=False)
+          .reset_index(drop=True))
+    df["검색시각"] = t_end.strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건51: 김승태타점4
+# A: 3봉전 종가 < SMA5
+# B: 2봉전 종가 < SMA5
+# C: 1봉전 종가 < SMA5
+# D: 금일 시가 < SMA5
+# E: 금일 종가 < SMA5 (5일선 아래에서 양봉)
+# F: 양봉 (시가 < 종가)
+# G: SMA20 2봉 연속 상승
+# H: SMA60 2봉 연속 상승
+# I: 시총 3,000억↑ (run_screen51 필터)
+# J: 전일 기준 5봉 평균거래량 ≥ 10만주
+# ══════════════════════════════════════════════════════════════════════════════
+
+_S51_MIN_BARS = 65   # SMA60 계산 + 이전 2봉 여유분
+
+
+def _screen51_ticker(code, start, end):
+    try:
+        df = fetch_ohlcv(code,
+                         pd.Timestamp(start).strftime("%Y%m%d"),
+                         pd.Timestamp(end).strftime("%Y%m%d"))
+        if df is None or len(df) < _S51_MIN_BARS:
+            return None
+
+        close  = df["Close"].astype(float)
+        open_  = df["Open"].astype(float)
+        volume = df["Volume"].astype(float)
+
+        ma5  = close.rolling(5).mean()
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+
+        cl   = close.values
+        op   = open_.values
+        vol  = volume.values
+        m5   = ma5.values
+        m20  = ma20.values
+        m60  = ma60.values
+        n    = len(cl)
+        i    = n - 1
+
+        if i < 5:
+            return None
+
+        # NaN 체크 (필수 값)
+        need = [m5[i], m5[i-1], m5[i-2], m5[i-3],
+                m20[i], m20[i-1], m20[i-2],
+                m60[i], m60[i-1], m60[i-2]]
+        if any(np.isnan(v) for v in need):
+            return None
+
+        # ── A: 3봉전 종가 < SMA5 ─────────────────────────────────────
+        cond_A = cl[i-3] < m5[i-3]
+
+        # ── B: 2봉전 종가 < SMA5 ─────────────────────────────────────
+        cond_B = cl[i-2] < m5[i-2]
+
+        # ── C: 1봉전 종가 < SMA5 ─────────────────────────────────────
+        cond_C = cl[i-1] < m5[i-1]
+
+        # ── D: 금일 시가 < SMA5 ───────────────────────────────────────
+        cond_D = op[i] < m5[i]
+
+        # ── E: 금일 종가 < SMA5 ───────────────────────────────────────
+        cond_E = cl[i] < m5[i]
+
+        # ── F: 양봉 (시가 < 종가) ─────────────────────────────────────
+        cond_F = op[i] < cl[i]
+
+        # ── G: SMA20 2봉 연속 상승 ────────────────────────────────────
+        cond_G = (m20[i] > m20[i-1]) and (m20[i-1] > m20[i-2])
+
+        # ── H: SMA60 2봉 연속 상승 ────────────────────────────────────
+        cond_H = (m60[i] > m60[i-1]) and (m60[i-1] > m60[i-2])
+
+        # ── J: 전일 기준 5봉 평균거래량 ≥ 10만주 ─────────────────────
+        vol5_avg = float(np.mean(vol[n-6:n-1]))
+        cond_J   = vol5_avg >= 100_000
+
+        if not (cond_A and cond_B and cond_C and cond_D and
+                cond_E and cond_F and cond_G and cond_H and cond_J):
+            return None
+
+        day_chg = round((cl[i] / cl[i-1] - 1) * 100, 2) if cl[i-1] > 0 else 0.0
+
+        return {
+            "종목코드":      code,
+            "종가":          int(cl[i]),
+            "전일대비(%)":   day_chg,
+            "SMA5":          round(float(m5[i]), 2),
+            "SMA20":         round(float(m20[i]), 2),
+            "SMA60":         round(float(m60[i]), 2),
+            "5일평균거래량":  int(vol5_avg),
+            "신호":          "김승태타점4",
+        }
+    except Exception:
+        return None
+
+
+def run_screen51(date_str, prog):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    end     = pd.Timestamp(date_str)
+    start   = end - pd.Timedelta(days=LOOKBACK)
+    listing = _get_listing()
+    valid   = listing[
+        (listing["Marcap"] >= 300_000_000_000) &
+        ~listing["Market"].isin(["ETF", "ETN"]) &
+        ~listing["Name"].str.match(_ETF_NAME_RE, na=False)
+    ].copy()
+    prog["total"]  = len(valid)
+    prog["status"] = "running"
+    rows    = _run_screen_parallel(valid, _screen51_ticker, start, end, prog)
+    t_end   = datetime.now()
+    elapsed = int((t_end - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+            "SMA5", "SMA20", "SMA60", "5일평균거래량", "신호"]]
+          .sort_values("전일대비(%)", ascending=False)
+          .reset_index(drop=True))
+    df["검색시각"] = t_end.strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
 _rt46_scan_no      = 0
 _rt46_scan_start   = ""
 _rt46_last_scan    = ""
@@ -8074,7 +8485,8 @@ RUNNER = {1: run_screen1,  2: run_screen2,  3: run_screen3,
           37: run_screen37, 38: run_screen38, 39: run_screen39,
           40: run_screen40, 41: run_screen41, 42: run_screen42,
           43: run_screen43, 44: run_screen44, 45: run_screen45,
-          46: run_screen46, 47: run_screen47, 48: run_screen48}
+          46: run_screen46, 47: run_screen47, 48: run_screen48,
+          49: run_screen49, 50: run_screen50, 51: run_screen51}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -9580,6 +9992,104 @@ function renderResult(date,rows){
     return;
   }
 
+  // 조건51 김승태타점4 (SMA60 컬럼 존재 여부로 판별)
+  if(rows.length && 'SMA60' in rows[0]){
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th>
+        <th>SMA5</th><th>SMA20</th><th>SMA60</th>
+        <th>5일평균거래량</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:#60a5fa">${Number(r['SMA5']).toLocaleString()}</td>
+        <td style="color:#a78bfa">${Number(r['SMA20']).toLocaleString()}</td>
+        <td style="color:#34d399">${Number(r['SMA60']).toLocaleString()}</td>
+        <td style="color:#8b8fa8">${Number(r['5일평균거래량']).toLocaleString()}주</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건50 김승태타점 (120봉신고가(봉전) 컬럼 존재 여부로 판별)
+  if(rows.length && '120봉신고가(봉전)' in rows[0]){
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th>
+        <th>SMA5</th><th>SMA200</th>
+        <th>120봉신고가(봉전)</th><th>전일저가대비(%)</th>
+        <th>5일평균거래량</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const ba=Number(r['120봉신고가(봉전)']);
+      const bac=ba<=5?'neg15':ba<=10?'neg10':'neg5';
+      const lp=Number(r['전일저가대비(%)']);
+      const lpc=lp>=10?'neg15':lp>=7?'neg10':'neg5';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:#60a5fa">${Number(r['SMA5']).toLocaleString()}</td>
+        <td style="color:#34d399">${Number(r['SMA200']).toLocaleString()}</td>
+        <td class="${bac}" style="font-weight:700">${ba}봉전</td>
+        <td class="${lpc}" style="font-weight:700">+${lp}%</td>
+        <td style="color:#8b8fa8">${Number(r['5일평균거래량']).toLocaleString()}주</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건49 박문환원인점 (원인점날짜 컬럼 존재 여부로 판별)
+  if(rows.length && '원인점날짜' in rows[0]){
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th>
+        <th>원인점(원)</th><th>원인점날짜</th><th>5일선</th>
+        <th>돌파율(%)</th><th>경과일</th>
+        <th>거래량비율(%)</th><th>5일평균거래량</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const bp=Number(r['돌파율(%)']);
+      const bpc=bp<=1?'neg15':bp<=3?'neg10':'neg5';
+      const vr=Number(r['거래량비율(%)']);
+      const vrc=vr>=500?'neg15':vr>=300?'neg10':'neg5';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:#f472b6;font-weight:700">${Number(r['원인점']).toLocaleString()}</td>
+        <td style="color:#8b8fa8">${r['원인점날짜']}</td>
+        <td style="color:#60a5fa">${Number(r['5일선']).toLocaleString()}</td>
+        <td class="${bpc}" style="font-weight:700">+${bp}%</td>
+        <td style="color:#8b8fa8">${r['경과일']}일</td>
+        <td class="${vrc}" style="font-weight:700">${vr}%</td>
+        <td style="color:#8b8fa8">${Number(r['5일평균거래량']).toLocaleString()}주</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
   // 조건1·2 공통 렌더러 (구간별 테이블)
   const zones=['-5%~-10%','-10%~-15%','-15% 이하'];
   const zColors=['neg5','neg10','neg15'];
@@ -9632,14 +10142,8 @@ function round2(v){return Math.round(v*100)/100;}
 
 @app.before_request
 def require_login():
-    public_paths = {"/login", "/logout"}
-    if request.path in public_paths or request.path.startswith("/auth/"):
-        return None
-    if session.get("logged_in"):
-        return None
-    if _wants_json_response():
-        return jsonify({"ok": False, "msg": "로그인이 필요합니다."}), 401
-    return redirect(url_for("login", next=request.full_path.rstrip("?")))
+    # 로그인 인증 비활성화 — 로컬 전용 모드
+    return None
 
 
 def _login_page(error: str = "") -> str:
@@ -9923,6 +10427,38 @@ COND_TAGS = {
         <span class="cond-tag" style="color:#fcd34d;border-color:#5a3a00">신호①: 종가가 Lv 상향돌파 (전일종가≤Lv, 금일종가&gt;Lv) + 양봉 (종가&gt;시가)</span>
         <span class="cond-tag" style="color:#a78bfa;border-color:#3a2a6a">신호②: VL(1) &lt; VL — VL = A+(A−A1) · A=LinReg(C,50) · A1=LinReg(A,50)</span>
         <span class="cond-tag">이메일 알림: 신규 신호 종목 발견 시 자동 발송 (10분 간격 실시간 스캔)</span>
+    """,
+    49: """
+        <span class="cond-tag">필터1: 시총 3,000억↑ · ETF/ETN 제외 (시장구분 + 종목명 패턴)</span>
+        <span class="cond-tag" style="color:#f472b6;border-color:#5a1a3a">원인점 = 시가·종가 모두 MA5 하방인 첫 번째 봉의 저가 (전봉은 MA5 상방)</span>
+        <span class="cond-tag">역방향 탐색: 최근봉부터 소급하여 5일선 첫 이탈 봉 탐지</span>
+        <span class="cond-tag" style="color:#fda4af;border-color:#5a1a3a">신호: 전일 종가 ≤ 원인점 → 금일 종가 &gt; 원인점 (재돌파)</span>
+        <span class="cond-tag" style="color:#fb923c;border-color:#5a2a00">거래량①: 금일 제외 5일 평균 거래량 ≥ 30만주</span>
+        <span class="cond-tag" style="color:#fb923c;border-color:#5a2a00">거래량②: 금일 거래량 ≥ 전일 거래량 × 200% (전일동시간대 대비)</span>
+        <span class="cond-tag">결과 정렬: 돌파율(%) 낮은 순 (원인점 바로 위에서 막 돌파한 종목 우선)</span>
+    """,
+    50: """
+        <span class="cond-tag">필터1: 시총 3,000억↑ · ETF/ETN 제외 (시장구분 + 종목명 패턴)</span>
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a3a00">A: 120봉 신고가가 최근 20봉 이내에 발생 (고점 근접 구간)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">B: 금일 양봉 (종가 &gt; 시가)</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">C: 전일 종가 &lt; 전일 SMA5 (단순이동평균5 하방)</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">D: 전일 시가 &lt; 전일 SMA5 (단순이동평균5 하방 출발)</span>
+        <span class="cond-tag" style="color:#0ea5e9;border-color:#0a2a5a">E: 금일 종가 &gt; 금일 SMA5 · 전일 종가 ≤ 전일 SMA5 (종가 SMA5 골든크로스)</span>
+        <span class="cond-tag" style="color:#a78bfa;border-color:#3a2a6a">G: 전일 저가 대비 전일 종가 등락률 ≥ 5% (저가→종가 5%↑ 이상 회복)</span>
+        <span class="cond-tag" style="color:#fb923c;border-color:#5a2a00">H: 금일 제외 5봉 평균 거래량 ≥ 30만주</span>
+        <span class="cond-tag" style="color:#34d399;border-color:#0a4a20">J: SMA200 2봉 연속 상승 (단순이동평균200 · rolling mean)</span>
+    """,
+    51: """
+        <span class="cond-tag">필터1: 시총 3,000억↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">A: 3봉전 종가 &lt; SMA5</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">B: 2봉전 종가 &lt; SMA5</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">C: 1봉전 종가 &lt; SMA5 (3일 연속 5일선 하방)</span>
+        <span class="cond-tag" style="color:#fda4af;border-color:#5a1a1a">D: 금일 시가 &lt; SMA5</span>
+        <span class="cond-tag" style="color:#fda4af;border-color:#5a1a1a">E: 금일 종가 &lt; SMA5 (5일선 아래에서 양봉 형성)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">F: 금일 양봉 (시가 &lt; 종가)</span>
+        <span class="cond-tag" style="color:#60a5fa;border-color:#0a2a5a">G: SMA20 2봉 연속 상승</span>
+        <span class="cond-tag" style="color:#34d399;border-color:#0a4a20">H: SMA60 2봉 연속 상승</span>
+        <span class="cond-tag" style="color:#fb923c;border-color:#5a2a00">J: 전일 기준 5봉 평균 거래량 ≥ 10만주</span>
     """,
     45: """
         <span class="cond-tag">필터1: 시총 1,500억↑ · ETF/ETN 제외</span>
@@ -15398,5 +15934,6 @@ def api_38_upload():
 
 
 if __name__ == "__main__":
-    print("주식 스크리너 허브 시작: http://localhost:8888")
-    app.run(host="0.0.0.0", port=8888, debug=False)
+    port = int(os.environ.get("PORT", 8888))
+    print(f"주식 스크리너 허브 시작: http://localhost:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False)

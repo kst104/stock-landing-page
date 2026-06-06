@@ -3,7 +3,7 @@ services:
     name: stock-landing-page
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
     envVars:
       - key: KIS_KEY
         sync: false
