@@ -11,4 +11,6 @@ authorized_users.json
 email_config.json
 kis_token.json
 vl_result_*.csv
+condition*_result_*.csv
+condition64_hantoo_*.csv
 start-localhost.ps1

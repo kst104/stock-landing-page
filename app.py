@@ -16,6 +16,8 @@
 
 import html as _html
 import io, json, os, time, threading, requests as _req, base64 as _base64, secrets
+import math as _math, zipfile as _zipfile
+import xml.etree.ElementTree as _ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -32,6 +34,28 @@ import FinanceDataReader as fdr
 from flask import Flask, Response, jsonify, redirect, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
+
+# ── .env 로더 (python-dotenv 미사용 — 로컬 실행 시 .env → os.environ 주입) ──────
+def _load_dotenv():
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            # 이미 환경변수로 지정된 값(예: Render)이 우선
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except Exception as e:
+        print(f"[ENV] .env 로드 실패: {e}")
+
+
+_load_dotenv()
+
 app = Flask(__name__)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -41,6 +65,12 @@ app = Flask(__name__)
 KIS_BASE   = os.environ.get("KIS_BASE", "https://openapi.koreainvestment.com:9443")
 KIS_KEY    = os.environ.get("KIS_KEY", "")
 KIS_SECRET = os.environ.get("KIS_SECRET", "")
+# KRX 정보데이터시스템 OpenAPI (AUTH_KEY 헤더 인증)
+KRX_API_KEY  = os.environ.get("KRX_API_KEY", "")
+KRX_API_BASE = os.environ.get("KRX_API_BASE", "http://data-dbg.krx.co.kr/svc/apis")
+# DART 오픈API (조건54 그래엄돌파 — 재무 데이터)
+DART_API_KEY  = os.environ.get("DART_API_KEY", "")
+DART_API_BASE = os.environ.get("DART_API_BASE", "https://opendart.fss.or.kr/api")
 _TOKEN_FILE  = Path(__file__).parent / "kis_token.json"
 _EMAIL_FILE  = Path(__file__).parent / "email_config.json"   # 이메일 설정 영구 저장
 _AUTH_FILE   = Path(__file__).parent / "authorized_users.json"
@@ -551,8 +581,238 @@ except Exception as e:
     _kis = None
 
 
-# ── 공통 OHLCV 캐시 (당일 재요청 방지) ─────────────────────────────────────
-_ohlcv_cache: dict = {}
+# ══════════════════════════════════════════════════════════════════════════════
+# KRX 정보데이터시스템 OpenAPI 클라이언트
+#   인증: 요청 헤더 AUTH_KEY=<발급키>  (ID/PW 불필요)
+#   일별 전종목 시세: sto/stk_bydd_trd(유가) · sto/ksq_bydd_trd(코스닥)
+#   → basDd(기준일) 하나당 전 종목 OHLCV·시총 스냅샷 1회 반환
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _krx_short_code(isu_cd: str) -> str:
+    """KRX 종목코드 → 6자리 단축코드. ISIN(KR7...) 이면 [3:9] 추출."""
+    s = str(isu_cd).strip()
+    if len(s) == 6 and s.isdigit():
+        return s
+    if len(s) >= 9 and s.upper().startswith("KR"):
+        return s[3:9]
+    return s
+
+
+def _krx_num(v) -> float:
+    """'1,234' / '' / '-' → float. 파싱 불가 시 NaN."""
+    try:
+        s = str(v).replace(",", "").strip()
+        if s in ("", "-", "None"):
+            return np.nan
+        return float(s)
+    except Exception:
+        return np.nan
+
+
+class KRXClient:
+    """KRX OpenAPI 일별 전종목 시세 조회"""
+
+    _PATHS = ("sto/stk_bydd_trd", "sto/ksq_bydd_trd")   # 유가증권 · 코스닥
+
+    def __init__(self, key: str):
+        self.key  = key
+        self.sess = _req.Session()
+        self.sess.headers.update({"AUTH_KEY": key})
+
+    def daily_market(self, bas_dd: str) -> pd.DataFrame:
+        """
+        기준일(YYYYMMDD) 전종목 일봉 스냅샷 (유가+코스닥 결합).
+        반환: columns=[code, name, market, Open, High, Low, Close, Volume, Marcap]
+              데이터 없음/휴장 → 빈 DataFrame
+        """
+        frames = []
+        for path in self._PATHS:
+            try:
+                r = self.sess.get(f"{KRX_API_BASE}/{path}",
+                                  params={"basDd": bas_dd}, timeout=12)
+                r.raise_for_status()
+                block = r.json().get("OutBlock_1", []) or []
+                if block:
+                    frames.append(pd.DataFrame(block))
+            except Exception:
+                continue
+        if not frames:
+            return pd.DataFrame()
+
+        raw = pd.concat(frames, ignore_index=True)
+        out = pd.DataFrame({
+            "code":   raw["ISU_CD"].map(_krx_short_code),
+            "name":   raw.get("ISU_NM", ""),
+            "market": raw.get("MKT_NM", ""),
+            "Open":   raw["TDD_OPNPRC"].map(_krx_num),
+            "High":   raw["TDD_HGPRC"].map(_krx_num),
+            "Low":    raw["TDD_LWPRC"].map(_krx_num),
+            "Close":  raw["TDD_CLSPRC"].map(_krx_num),
+            "Volume": raw["ACC_TRDVOL"].map(_krx_num),
+            "Marcap": raw.get("MKTCAP", np.nan).map(_krx_num),
+        })
+        out = out[out["Close"].notna() & (out["Close"] > 0)]
+        return out
+
+
+try:
+    _krx = KRXClient(KRX_API_KEY) if KRX_API_KEY else None
+    if _krx:
+        print("[KRX] OpenAPI 클라이언트 초기화 완료")
+    else:
+        print("[KRX] KRX_API_KEY 미설정 — KRX 연동 비활성화")
+except Exception as e:
+    print(f"[KRX] 초기화 실패: {e}")
+    _krx = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DART 오픈API 클라이언트 (조건54 그래엄돌파 — TTM순이익 · 자본총계)
+#   · corpCode.xml(ZIP) 1회 다운로드 → stock_code→corp_code 매핑 캐시
+#   · fnlttSinglAcnt.json 분기별 조회 (thstrm_amount = 단독 분기값 확인됨)
+#   · 분기 손익 4개 합산 = TTM 순이익, 공시지연(45/90일) 반영해 룩어헤드 방지
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DART_REPORT_CODES = {"Q1": "11013", "Q2": "11012", "Q3": "11014", "FY": "11011"}
+_DART_REPORT_LAG   = {"Q1": 45, "Q2": 45, "Q3": 45, "FY": 90}   # 공시 지연(일)
+
+_dart_corp_map: dict = {}                 # stock_code(6) → corp_code(8)
+_dart_corp_lock       = threading.Lock()
+_dart_fund_cache: dict = {}               # (corp_code, year, q) → dict | None
+_dart_fund_lock        = threading.Lock()
+_dart_sem              = threading.Semaphore(10)   # 동시 DART 요청 상한
+
+
+def _dart_add_days(yyyymmdd: str, days: int) -> str:
+    return (datetime.strptime(yyyymmdd, "%Y%m%d") + timedelta(days=days)).strftime("%Y%m%d")
+
+
+def _dart_quarter_end(year: int, q: str) -> str:
+    return {"Q1": f"{year}0331", "Q2": f"{year}0630",
+            "Q3": f"{year}0930", "FY": f"{year}1231"}[q]
+
+
+def _dart_load_corp_map() -> dict:
+    """corpCode.xml(ZIP) 1회 다운로드 → {stock_code: corp_code}. 결과 캐시."""
+    global _dart_corp_map
+    with _dart_corp_lock:
+        if _dart_corp_map:
+            return _dart_corp_map
+        if not DART_API_KEY:
+            return {}
+        try:
+            r = _req.get(f"{DART_API_BASE}/corpCode.xml",
+                         params={"crtfc_key": DART_API_KEY}, timeout=30)
+            r.raise_for_status()
+            z    = _zipfile.ZipFile(io.BytesIO(r.content))
+            xml  = z.read(z.namelist()[0]).decode("utf-8")
+            root = _ET.fromstring(xml)
+            m = {}
+            for e in root.iter("list"):
+                sc = (e.findtext("stock_code") or "").strip()
+                cc = (e.findtext("corp_code") or "").strip()
+                if len(sc) == 6 and sc.isdigit() and cc:
+                    m[sc] = cc
+            _dart_corp_map = m
+            print(f"[DART] corp_code 매핑 로드: {len(m):,}개 상장사")
+        except Exception as ex:
+            print(f"[DART] corp_code 로드 실패: {ex}")
+        return _dart_corp_map
+
+
+def _dart_quarter(corp_code: str, year: int, q: str):
+    """분기 재무 (당기순이익·자본총계). 반환 dict | None. (corp,year,q) 캐시."""
+    key = (corp_code, year, q)
+    with _dart_fund_lock:
+        if key in _dart_fund_cache:
+            return _dart_fund_cache[key]
+    result = None
+    try:
+        with _dart_sem:
+            r = _req.get(f"{DART_API_BASE}/fnlttSinglAcnt.json",
+                         params={"crtfc_key": DART_API_KEY, "corp_code": corp_code,
+                                 "bsns_year": str(year),
+                                 "reprt_code": _DART_REPORT_CODES[q]}, timeout=15)
+        j = r.json()
+        if j.get("status") == "000" and isinstance(j.get("list"), list):
+            rows = j["list"]
+
+            def pick(names):
+                # 연결재무제표(CFS) 우선, 없으면 개별(OFS)
+                for div in ("CFS", "OFS"):
+                    for row in rows:
+                        if row.get("account_nm", "").strip() in names and row.get("fs_div") == div:
+                            raw = (row.get("thstrm_amount") or "").replace(",", "").strip()
+                            try:
+                                n = float(raw)
+                                if n != 0:
+                                    return n
+                            except ValueError:
+                                pass
+                return None
+
+            ni = pick(["당기순이익", "당기순이익(손실)"])
+            eq = pick(["자본총계"])
+            if ni is not None and eq is not None:
+                result = {"netIncome": ni, "equity": eq,
+                          "availableFrom": _dart_add_days(_dart_quarter_end(year, q),
+                                                          _DART_REPORT_LAG[q])}
+    except Exception:
+        result = None
+    with _dart_fund_lock:
+        _dart_fund_cache[key] = result
+    return result
+
+
+def _dart_timeline(corp_code: str, span_years: int):
+    """
+    최근 분기들을 모아 TTM 순이익 시계열 생성.
+    반환: [{availableFrom, ttmNetIncome, equity}, ...] (availableFrom 오름차순)
+    """
+    this_year = datetime.now().year
+    wanted = []
+    for y in range(this_year, this_year - span_years - 2, -1):
+        for q in ("FY", "Q3", "Q2", "Q1"):
+            wanted.append((y, q))
+
+    rows = []
+    for (y, q) in wanted:
+        f = _dart_quarter(corp_code, y, q)
+        if f:
+            rows.append({**f, "end": _dart_quarter_end(y, q)})
+    rows.sort(key=lambda x: x["end"])
+    if len(rows) < 4:
+        return []
+
+    out = []
+    for i in range(len(rows)):
+        if i < 3:
+            continue
+        ttm = sum(rows[j]["netIncome"] for j in range(i - 3, i + 1))   # 4개 분기 합 = TTM
+        cur = rows[i]
+        if ttm > 0 and cur["equity"] > 0:
+            out.append({"availableFrom": cur["availableFrom"],
+                        "ttmNetIncome": ttm, "equity": cur["equity"]})
+    out.sort(key=lambda x: x["availableFrom"])
+    return out
+
+
+def _dart_fundamental_at(timeline, date: str):
+    """해당 날짜(YYYYMMDD)에 실제 공시돼 있던 최신 재무 반환."""
+    found = None
+    for row in timeline:
+        if row["availableFrom"] <= date:
+            found = row
+        else:
+            break
+    return found
+
+
+# ── 공통 OHLCV 캐시 (당일 재요청 방지 · LRU 크기 제한) ──────────────────────
+#   OrderedDict + 최대 크기 → 오래된 항목 자동 삭제로 32비트 메모리 폭주 방지
+from collections import OrderedDict as _OrderedDict
+_OHLCV_CACHE_MAX  = 6000            # OHLCV DataFrame 최대 보관 수
+_ohlcv_cache       = _OrderedDict()
 _ohlcv_cache_lock  = threading.Lock()
 _ohlcv_cache_day   = ""
 
@@ -603,16 +863,21 @@ def fetch_ohlcv(code: str, start: str, end: str) -> pd.DataFrame:
     key = (code, start, end)
     with _ohlcv_cache_lock:
         if key in _ohlcv_cache:
+            _ohlcv_cache.move_to_end(key)   # 최근 사용 표시 (LRU)
             return _ohlcv_cache[key]
 
-    # ── Primary: FDR (timeout 8 초) ──────────────────────────────────────────
+    # ── Primary: FDR (timeout 보호 + 1회 재시도) ─────────────────────────────
+    #   병렬 부하로 인한 일시적 timeout(빈 결과)이 캐시를 오염시켜 종목을 영구
+    #   누락시키는 문제를 막기 위해, 재시도 후에도 실패하면 캐시하지 않는다.
     df = pd.DataFrame()
-    try:
-        tmp = _fdr_safe(code, start, end)
-        if tmp is not None and not tmp.empty:
-            df = tmp
-    except Exception:
-        pass
+    for _attempt in range(2):
+        try:
+            tmp = _fdr_safe(code, start, end)
+            if tmp is not None and not tmp.empty:
+                df = tmp
+                break
+        except Exception:
+            pass
 
     # ── Fallback: KIS API ────────────────────────────────────────────────────
     if df.empty and _kis:
@@ -631,8 +896,14 @@ def fetch_ohlcv(code: str, start: str, end: str) -> pd.DataFrame:
         except Exception as e:
             _plog(f"[fetch_ohlcv] KIS fallback 실패({code}): {e}")
 
-    with _ohlcv_cache_lock:
-        _ohlcv_cache[key] = df
+    # 성공(비어있지 않음)한 경우에만 캐시 → timeout 빈결과 오염 방지
+    if not df.empty:
+        with _ohlcv_cache_lock:
+            _ohlcv_cache[key] = df
+            _ohlcv_cache.move_to_end(key)
+            # 최대 크기 초과 시 가장 오래된 항목부터 삭제 (LRU)
+            while len(_ohlcv_cache) > _OHLCV_CACHE_MAX:
+                _ohlcv_cache.popitem(last=False)
     return df
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -643,7 +914,7 @@ import re as _re
 
 _listing_cache: pd.DataFrame = pd.DataFrame()
 _listing_cache_date: str     = ""
-_LISTING_CACHE_VERSION = "naver-krx-kis-v2"
+_LISTING_CACHE_VERSION = "naver-krx-kis-v3"   # v3: 행별 코드·이름 정합 파싱 (misalignment 수정)
 _LISTING_DISK_CACHE = Path(__file__).parent / ".listing_cache.json"
 
 # ── 네이버 페이지 1장 가져오기 (병렬 worker 함수) ──────────────────────────
@@ -662,43 +933,30 @@ def _naver_fetch_page(args):
         if tbody is None:
             return None
 
-        # 행별로 종목코드 추출
-        row_codes = []
+        # 같은 <tr>에서 코드·이름·시가총액을 함께 추출 → Code↔Name 정합성 보장
+        #   td[1]=종목명(링크텍스트), td[6]=시가총액(억원)
+        rows = []
         for tr in tbody.find_all("tr"):
             a = tr.find("a", href=_re.compile(r"/item/main\.naver\?code=\d{6}"))
-            if a:
-                m = _re.search(r"code=(\d{6})", a["href"])
-                if m:
-                    row_codes.append(m.group(1))
+            if not a:
+                continue
+            m = _re.search(r"code=(\d{6})", a["href"])
+            if not m:
+                continue
+            code = m.group(1)
+            name = a.get_text(strip=True)
+            tds  = tr.find_all("td")
+            if not name or len(tds) < 7:
+                continue
+            marcap_eok = _safe_int(tds[6].get_text(strip=True).replace(",", ""))
+            if marcap_eok <= 0:
+                continue
+            rows.append({"Code": code, "Name": name, "Market": mkt,
+                         "Marcap": marcap_eok * 100_000_000})
 
-        if not row_codes:
+        if not rows:
             return None   # 빈 페이지 (마지막 페이지 초과)
-
-        # 시가총액 테이블 파싱
-        tables = pd.read_html(io.StringIO(r.text), flavor="lxml")
-        tbl    = None
-        for t in tables:
-            if "종목명" in t.columns and "시가총액" in t.columns:
-                tbl = t.dropna(subset=["종목명"]).copy()
-                tbl = tbl[tbl["종목명"].astype(str) != "종목명"]
-                break
-
-        if tbl is None or len(tbl) == 0:
-            return None
-
-        n      = min(len(row_codes), len(tbl))
-        tbl    = tbl.iloc[:n].copy()
-        tbl["Code"]   = row_codes[:n]
-        tbl["Market"] = mkt
-        tbl["Marcap"] = (
-            tbl["시가총액"]
-            .apply(lambda x: _safe_int(str(x).replace(",", "")))
-            .mul(100_000_000)
-        )
-        return (
-            tbl.rename(columns={"종목명": "Name"})
-               [["Code", "Name", "Market", "Marcap"]]
-        )
+        return pd.DataFrame(rows)
     except Exception:
         return None
 
@@ -1360,6 +1618,126 @@ SCREENERS = {
         "color":  "#8b5cf6",
         "icon":   "🎯",
     },
+    52: {
+        "title":  "조건52 리버스이격도",
+        "desc":   "시총 3,000억↑ · ETF/ETN 제외 · (EnvelopeUp(20,40%)−C)/C×100 ≥ 40 (종가 20일선 아래 눌림) · EMA200 상승중 · 금일제외 5일평균거래량 30만↑ · RSI(21) A=SMA(2)/B=SMA(34)−1.6185σ · (A4>B4 or A5>B5)→B(1)>A(1)→A>B 재골든크로스",
+        "color":  "#14b8a6",
+        "icon":   "🔄",
+    },
+    53: {
+        "title":  "조건53 삼각수렴패턴",
+        "desc":   "KRX 일봉 사전적재 후 탐지 · 시총 3,000억↑ · 20봉 저항선(고가회귀)·지지선(저가회귀)이 수렴(밴드폭 22%↑ 축소 + 변동성 수축) · 대칭/상승/하강 삼각형 분류 · 수렴률 높은 순",
+        "color":  "#eab308",
+        "icon":   "📐",
+    },
+    54: {
+        "title":  "조건54 그래엄돌파",
+        "desc":   "시총 1조↑ · ETF/ETN 제외 · value=종가²/(TTM순이익×자본총계) [PER×PBR 대용] · value 볼린저밴드(10,2) 상단선 상향돌파 · 월봉40봉(최근3봉)/주봉100봉(최근5봉) · DART 재무 + 공시지연 반영(룩어헤드 방지)",
+        "color":  "#8b5cf6",
+        "icon":   "📈",
+    },
+    55: {
+        "title":  "조건55 성장주발견",
+        "desc":   "시총 5천억↑ · ETF/ETN 제외 · 12개월 예상 PER × PBR ≥ 300 · 예상PER 없으면 최근(trailing) PER 대체 · 네이버 금융 컨센서스 · 조건 충족 종목 전부(PER×PBR 높은 순)",
+        "color":  "#10b981",
+        "icon":   "🌱",
+    },
+    56: {
+        "title":  "조건56 볼밴.엔벨롭탈출",
+        "desc":   "시총 3천억↑ · ETF/ETN 제외 · 일봉 · 전일 엔벨롭(SMA5)−5%하단 > BB(20,2)하단 → 금일 엔벨롭하단 < BB하단 하향크로스 · 금일 양봉(종가>시가) · 금일제외 5일평균거래량 15만주↑",
+        "color":  "#0ea5e9",
+        "icon":   "🎯",
+    },
+    57: {
+        "title":  "조건57 성장주탈출",
+        "desc":   "조건55 ∩ 조건56 동시충족 · 시총 5천억↑ · 12개월 예상 PER×PBR ≥ 300 (성장주) AND Envelope(SMA5)−5%하단<볼밴(20,2)하단+양봉+5일평균거래량 15만↑ (볼밴 탈출) · 업종(79)·테마(267) 조회·분류 제공",
+        "color":  "#f59e0b",
+        "icon":   "🚀",
+    },
+    58: {
+        "title":  "조건58 PER×PBR 급등(월봉)",
+        "desc":   "시총 3,000억↑ · ETF/ETN 제외 · PER×PBR 대용값 로그변화율 z-score ≥ 2 · 월봉40봉 · 최근 3봉 이내 · DART 재무 + 공시지연 반영",
+        "color":  "#22d3ee",
+        "icon":   "📈",
+    },
+    59: {
+        "title":  "조건59 PER×PBR 급등(주봉)",
+        "desc":   "시총 3,000억↑ · ETF/ETN 제외 · PER×PBR 대용값 로그변화율 z-score ≥ 2 · 주봉100봉 · 최근 5봉 이내 · DART 재무 + 공시지연 반영",
+        "color":  "#38bdf8",
+        "icon":   "📊",
+    },
+    60: {
+        "title":  "조건60 이제출발",
+        "desc":   "① 검색일 기준 월간 상승률 상위 10개 테마 (조건57 로직) · ② 그 테마 구성종목 중 시총 1천5백억↑ · 볼린저밴드(20, 2) 상단선을 최근 3일 이내 상향돌파한 종목 · 돌파 최근순→테마순위순",
+        "color":  "#ef4444",
+        "icon":   "🚀",
+    },
+    61: {
+        "title":  "조건61 이제출발2",
+        "desc":   "조건60과 동일 (월간 상위10테마 · 시총 1천5백억↑ · 최근 3일 돌파) · 볼린저밴드만 (200, 2) — 장기 200일선 밴드 상단 돌파 (강한 중장기 추세 전환)",
+        "color":  "#dc2626",
+        "icon":   "🚀",
+    },
+    62: {
+        "title":  "조건62 볼밴이제출발",
+        "desc":   "① 검색일 기준 월간 상승률 상위 20개 테마 · ② 시총 1천5백억↑ · ③ 조건56(볼밴탈출): 엔벨롭(SMA5)−5%하단이 BB(20,2)하단 아래로 하향크로스 + 양봉 + 금일제외 5일평균거래량 15만↑",
+        "color":  "#e11d48",
+        "icon":   "🎯",
+    },
+    63: {
+        "title":  "조건63 급등테마",
+        "desc":   "① 오늘·2주전 두 시점 월간수익률로 테마 순위 산정 → 순위가 가장 많이 뛰어오른 상위 10개 테마 · ② 그 테마 구성종목 중 볼린저밴드(20, 2) 상단선을 최근 3일 이내 상향돌파한 종목",
+        "color":  "#f97316",
+        "icon":   "🔥",
+    },
+    64: {
+        "title":  "조건64 한투 신호봇",
+        "desc":   "⚠️실주문 없음·신호알림 전용 · 조건63 급등테마 중 같은 테마 0봉전 돌파 3종목↑ → 시총최대 종목 진입신호 · 매수 300만원 · 손절 −1.5ATR(14) · 익절 +3ATR(14) · 하루 최대 3신호 · 월~금 09:00~15:30 실시간감시(주문은 사용자 직접)",
+        "color":  "#eab308",
+        "icon":   "🔔",
+    },
+    65: {
+        "title":  "조건65 더블MACD",
+        "desc":   "장기 MACD(21,55,9) + 단기 MACD(5,13,6) 조합 · 8가지 검색모드(SearchMode) 선택 · 시가총액 3천억↑ · ETF/ETN 제외",
+        "color":  "#22d3ee",
+        "icon":   "📈",
+    },
+    66: {
+        "title":  "조건66 60분더블MACD",
+        "desc":   "일봉 장기 히스토그램(21,55,9) 양성 + 60분봉 조건65 모드1(LongHist≥0 + 단기Hist 0선 상향돌파) 동시충족 · 최근 0/1/2봉전 신호 표시 · 시가총액 1조↑ · ETF/ETN 제외 · ⚠️무료 분봉 최근 약7거래일(≈47봉) 한도",
+        "color":  "#06b6d4",
+        "icon":   "🕐",
+    },
+    67: {
+        "title":  "조건67 주봉더블MACD",
+        "desc":   "조건65(장기 MACD 21,55,9 + 단기 MACD 5,13,6)를 주봉으로 계산 · 8가지 검색모드(SearchMode) 선택 · 시가총액 3천억↑ · ETF/ETN 제외",
+        "color":  "#a78bfa",
+        "icon":   "📆",
+    },
+    68: {
+        "title":  "조건68 황금이",
+        "desc":   "일봉 · 이격도(EMA5·EMA20) CrossUp + MA(5·20) 상승 + 양봉 조합 3조건 중 2개 이상 충족 · 시가총액 3천억↑ · ETF/ETN 제외",
+        "color":  "#f59e0b",
+        "icon":   "🥇",
+    },
+    69: {
+        "title":  "조건69 변동회귀선다이버전스",
+        "desc":   "시총 1조↑ · 일봉: 양봉 + 종가 MA200 위 & MA200 상승 + 더블MACD 장기히스토그램(21,55,9)≥0 · 60분봉 변동회귀선(VL=2·linreg(C,50)−linreg(linreg,50))이 주가 아래 · 주가가 VL 위 4봉 이상 연속 · 60분봉=야후 시간봉 · ETF/ETN 제외",
+        "color":  "#10b981",
+        "icon":   "🪞",
+    },
+    70: {
+        "title":  "조건70 더블STOCHASTIC",
+        "desc":   "일봉 · SMA20 우상향 + Slow %K(12,5) ≥ 70 + Fast %K(5) ≤ 30 · 시가총액 3천억↑ · ETF/ETN 제외",
+        "color":  "#e879f9",
+        "icon":   "🎲",
+    },
+    71: {
+        "title":  "조건71 세력평균20돌파",
+        "desc":   "일봉 · 세력캔들(V>1.5×MA(V,60)&양봉)의 (C+O)/2를 유지한 세력평단의 지수평균(20) = 세력20평균 · 이 선이 5일 이상 하락 중 종가가 상향돌파 · 시가총액 3천억↑ · ETF/ETN 제외",
+        "color":  "#fb7185",
+        "icon":   "🧲",
+    },
 }
 
 
@@ -1811,10 +2189,13 @@ def run_screen6(date_str, prog):
     prog["status"] = "done"
     if not rows:
         return pd.DataFrame()
-    return (pd.DataFrame(rows)
-            [["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
-              "ASGMA점수", "ATR14", "3일등락/ATR(%)"]]
-            .sort_values("ASGMA점수", ascending=False)
+    df = pd.DataFrame(rows).sort_values("ASGMA점수", ascending=False)
+    # 해당 종목의 소속 테마(최대 4개) 표시
+    df["테마"] = df.apply(
+        lambda r: " · ".join(_themes_of(code=r["종목코드"], name=r["종목명"])[:4]) or "-",
+        axis=1)
+    return (df[["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+                "ATR14", "테마"]]
             .reset_index(drop=True))
 
 
@@ -5900,6 +6281,2489 @@ def run_screen51(date_str, prog):
     return df
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건52: 리버스이격도
+# ① (EnvelopeUp(20,40%) − C)/C × 100 ≥ 40  (EnvelopeUp = SMA20 × 1.40)
+#    ⟺ SMA20 ≥ C  (종가가 20일선 아래 = 리버스이격도 눌림)
+# ② EMA200 상승중 (EMA200[-1] > EMA200[-2])
+# ③ 시총 3,000억↑ (run_screen52 필터)
+# ④ 금일 제외 5일 평균거래량 ≥ 30만주
+# ⑤ RSI(21) 재골든크로스: A=SMA(RSI,2), B=SMA(RSI,34)−1.6185σ
+#    (A4>B4 or A5>B5) → B(1)>A(1) → A>B
+# ══════════════════════════════════════════════════════════════════════════════
+
+_S52_ENV_PCT  = 40.0   # 리버스이격도 임계값(%)
+
+
+def _screen52_ticker(code, start, end):
+    try:
+        df = fetch_ohlcv(code,
+                         pd.Timestamp(start).strftime("%Y%m%d"),
+                         pd.Timestamp(end).strftime("%Y%m%d"))
+        min_len = EMA200 + _HR_BAND_LEN + 15
+        if df is None or len(df) < min_len:
+            return None
+
+        close_s = df["Close"].astype(float)
+        vol_s   = df["Volume"].astype(float)
+
+        # ── ① 리버스이격도: (EnvelopeUp(20,40%) − C)/C × 100 ≥ 40 ──────
+        sma20     = close_s.rolling(20).mean()
+        env_upper = sma20 * 1.40
+        c0        = float(close_s.iloc[-1])
+        eu0       = float(env_upper.iloc[-1])
+        if pd.isna(eu0) or c0 <= 0:
+            return None
+        env_gap = (eu0 - c0) / c0 * 100.0
+        if env_gap < _S52_ENV_PCT:
+            return None
+
+        # ── ② EMA200 상승중 ─────────────────────────────────────────────
+        ema200 = ema(close_s, EMA200)
+        if pd.isna(ema200.iloc[-1]) or pd.isna(ema200.iloc[-2]):
+            return None
+        if ema200.iloc[-1] <= ema200.iloc[-2]:
+            return None
+
+        # ── ④ 금일 제외 5일 평균거래량 ≥ 30만주 ─────────────────────────
+        vol5_avg = float(vol_s.iloc[-6:-1].mean())
+        if pd.isna(vol5_avg) or vol5_avg < 300_000:
+            return None
+
+        # ── ⑤ RSI(21) 재골든크로스 패턴 (조건12와 동일) ─────────────────
+        rsi_s   = _calc_rsi(close_s, _HR_RSI_PERIOD)
+        A       = rsi_s.rolling(window=_HR_TSL).mean()
+        rsi_ma  = rsi_s.rolling(window=_HR_BAND_LEN).mean()
+        rsi_std = rsi_s.rolling(window=_HR_BAND_LEN).std(ddof=1)
+        B       = rsi_ma - _HR_COEF * rsi_std
+
+        a0, a1 = A.iloc[-1], A.iloc[-2]
+        a4, a5 = A.iloc[-5], A.iloc[-6]
+        b0, b1 = B.iloc[-1], B.iloc[-2]
+        b4, b5 = B.iloc[-5], B.iloc[-6]
+        if any(pd.isna(x) for x in [a0, a1, a4, a5, b0, b1, b4, b5]):
+            return None
+        if not ((a4 > b4 or a5 > b5) and b1 > a1 and a0 > b0):
+            return None
+
+        c_prev  = float(close_s.iloc[-2])
+        day_chg = round((c0 - c_prev) / c_prev * 100, 2) if c_prev > 0 else 0.0
+
+        return {
+            "종목코드":      code,
+            "종가":          int(c0),
+            "전일대비(%)":   day_chg,
+            "이격도(%)":     round(env_gap, 1),
+            "SMA20":         round(float(sma20.iloc[-1]), 2),
+            "EMA200":        round(float(ema200.iloc[-1]), 2),
+            "RSI(21)":       round(float(rsi_s.iloc[-1]), 2),
+            "A":             round(float(a0), 2),
+            "B":             round(float(b0), 2),
+            "5일평균거래량":  int(vol5_avg),
+            "신호":          "리버스이격도",
+        }
+    except Exception:
+        return None
+
+
+def run_screen52(date_str, prog):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    end     = pd.Timestamp(date_str)
+    start   = end - pd.Timedelta(days=LOOKBACK)
+    listing = _get_listing()
+    valid   = listing[
+        (listing["Marcap"] >= 300_000_000_000) &
+        ~listing["Market"].isin(["ETF", "ETN"]) &
+        ~listing["Name"].str.match(_ETF_NAME_RE, na=False)
+    ].copy()
+    prog["total"]  = len(valid)
+    prog["status"] = "running"
+    rows    = _run_screen_parallel(valid, _screen52_ticker, start, end, prog)
+    t_end   = datetime.now()
+    elapsed = int((t_end - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+            "이격도(%)", "SMA20", "EMA200", "RSI(21)", "A", "B",
+            "5일평균거래량", "신호"]]
+          .sort_values("이격도(%)", ascending=False)
+          .reset_index(drop=True))
+    df["검색시각"] = t_end.strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건53: 삼각수렴패턴 (사전 적재된 KRX 일봉에서 삼각수렴 형태 탐지)
+# ─ 윈도우(20봉) 고가에 저항선·저가에 지지선 회귀적합
+# ─ 수렴: 말단 밴드폭 < 초기 밴드폭 (≥22% 축소) AND 후반 진폭 < 전반 진폭
+# ─ 유형: 대칭삼각(저항↓·지지↑) / 상승삼각(저항평탄·지지↑) / 하강삼각(저항↓·지지평탄)
+# ─ 시총 3,000억↑ · 결과 수렴률(%) 높은 순 (가장 좁게 수렴한 종목 우선)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_S53_WINDOW           = 20    # 삼각수렴 탐지 윈도우 (봉)
+_S53_VOL_MAX          = 0.80  # 후반평균진폭/전반평균진폭 ≤ 0.80 (≥20% 진폭 수축) — 주 게이트
+_S53_CONV_MAX         = 0.97  # envelope 말단밴드폭/초기밴드폭 ≤ 0.97 (추세선 수렴 확인)
+_S53_FLAT_PCT         = 0.20  # 추세선 평탄 판정 임계 (%/봉)
+_S53_CORR_MIN         = 0.20  # 추세선 방향 상관계수 최소 절댓값
+_S53_PREFETCH_DAYS    = 30    # 사전 적재할 거래일 수 (KRX 일봉)
+
+# ── KRX 사전 적재 캐시 (조건53 전용) ───────────────────────────────────────────
+#   검색 전 [데이터 불러오기] 버튼으로 수동 적재 → code별 일봉 DataFrame 보관
+_S53_CACHE: dict = {}
+_S53_CACHE_LOCK   = threading.Lock()
+_S53_PREFETCH = {"status": "idle", "current": 0, "total": _S53_PREFETCH_DAYS,
+                 "days": 0, "tickers": 0, "date": "", "msg": "", "ts": ""}
+_S53_PREFETCH_LOCK = threading.Lock()
+
+
+def _s53_prefetch_run(date_str: str, n_days: int = _S53_PREFETCH_DAYS):
+    """KRX OpenAPI에서 최근 n_days 거래일 전종목 일봉을 받아 _S53_CACHE 적재."""
+    global _S53_CACHE
+    _S53_PREFETCH.update({"status": "running", "current": 0, "total": n_days,
+                          "days": 0, "tickers": 0, "date": date_str,
+                          "msg": "KRX 조회 중...", "ts": ""})
+    if _krx is None:
+        _S53_PREFETCH.update({"status": "error",
+                              "msg": "KRX_API_KEY 미설정 (.env 확인)"})
+        return
+    try:
+        end = pd.Timestamp(date_str)
+        # 후보 평일 (휴장 대비 여유분 포함)
+        cand, d = [], end
+        while len(cand) < n_days + 15:
+            if d.weekday() < 5:
+                cand.append(d.strftime("%Y%m%d"))
+            d -= pd.Timedelta(days=1)
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = {ex.submit(_krx.daily_market, b): b for b in cand}
+            for fut in as_completed(futs):
+                b = futs[fut]
+                try:
+                    df = fut.result()
+                except Exception:
+                    df = pd.DataFrame()
+                if df is not None and not df.empty:
+                    results[b] = df
+                _S53_PREFETCH.update({"current": min(len(results), n_days)})
+
+        if not results:
+            _S53_PREFETCH.update({"status": "error",
+                                  "msg": "KRX 데이터 수신 실패 (날짜·휴장·키 확인)"})
+            return
+
+        days = sorted(results.keys())[-n_days:]      # 최근 n_days 거래일
+        frames = []
+        for b in days:
+            tmp = results[b].copy()
+            tmp["date"] = b
+            frames.append(tmp)
+        big = pd.concat(frames, ignore_index=True)
+
+        cache = {}
+        for code, g in big.groupby("code"):
+            g = g.sort_values("date")
+            cache[str(code)] = g[["date", "Open", "High", "Low", "Close",
+                                  "Volume"]].reset_index(drop=True)
+
+        with _S53_CACHE_LOCK:
+            _S53_CACHE = cache
+
+        _S53_PREFETCH.update({
+            "status": "done", "current": len(days), "days": len(days),
+            "tickers": len(cache),
+            "msg": f"{len(days)}거래일 · {len(cache):,}종목 적재 완료",
+            "ts": datetime.now().strftime("%H:%M:%S"),
+        })
+    except Exception as e:
+        _S53_PREFETCH.update({"status": "error", "msg": f"적재 오류: {e}"})
+
+
+def _s53_geom(df):
+    """
+    조건53 삼각수렴 기하 계산 (검색·차트 공용).
+    반환 dict: 추세선(상·하단 배열)·기울기·수렴/변동성 비율·유형·match 여부 등.
+    데이터 부족·밴드 비정상 시 None.
+    """
+    W = _S53_WINDOW
+    if df is None or len(df) < W + 1:
+        return None
+    h = df["High"].values.astype(float)[-W:]
+    l = df["Low"].values.astype(float)[-W:]
+    c = df["Close"].values.astype(float)[-W:]
+    if np.any(~np.isfinite(h)) or np.any(~np.isfinite(l)):
+        return None
+    x = np.arange(W, dtype=float)
+
+    # 저항선·지지선 (회귀 기울기 + 고저가 envelope 절편 보정)
+    sh = float(np.polyfit(x, h, 1)[0])
+    sl = float(np.polyfit(x, l, 1)[0])
+    ih = float(np.max(h - sh * x))   # 모든 고가에 접하는 상단 절편
+    il = float(np.min(l - sl * x))   # 모든 저가에 접하는 하단 절편
+
+    upper = [ih + sh * i for i in range(W)]
+    lower = [il + sl * i for i in range(W)]
+    width0 = upper[0] - lower[0]
+    width1 = upper[-1] - lower[-1]
+    if width0 <= 0 or width1 <= 0:
+        return None
+    conv_ratio = width1 / width0
+
+    half = W // 2
+    early_rng = float(np.mean(h[:half] - l[:half]))
+    late_rng  = float(np.mean(h[half:] - l[half:]))
+    if early_rng <= 0:
+        return None
+    vol_ratio = late_rng / early_rng
+
+    avg    = float(np.mean(c))
+    sh_pct = sh / avg * 100.0
+    sl_pct = sl / avg * 100.0
+    flat   = _S53_FLAT_PCT
+    corr_h = np.corrcoef(x, h)[0, 1]
+    corr_l = np.corrcoef(x, l)[0, 1]
+
+    desc_res = (sh_pct < -flat) and (corr_h < -_S53_CORR_MIN)
+    rise_sup = (sl_pct >  flat) and (corr_l >  _S53_CORR_MIN)
+    flat_res = abs(sh_pct) <= flat
+    flat_sup = abs(sl_pct) <= flat
+    if   desc_res and rise_sup:  ttype = "대칭삼각"
+    elif flat_res and rise_sup:  ttype = "상승삼각"
+    elif desc_res and flat_sup:  ttype = "하강삼각"
+    else:                        ttype = None
+
+    match = (ttype is not None and conv_ratio < _S53_CONV_MAX
+             and vol_ratio < _S53_VOL_MAX)
+    denom = sh - sl
+    apex  = ((il - ih) / denom - (W - 1)) if denom != 0 else float("nan")
+
+    return {"W": W, "upper": upper, "lower": lower,
+            "width1": width1, "conv_ratio": conv_ratio, "vol_ratio": vol_ratio,
+            "type": ttype, "match": match, "apex": apex}
+
+
+def _screen53_ticker(code, start, end):
+    try:
+        # 사전 적재된 KRX 캐시에서 일봉 조회 (검색 전 [데이터 불러오기] 필수)
+        with _S53_CACHE_LOCK:
+            df = _S53_CACHE.get(str(code))
+        g = _s53_geom(df)
+        if g is None or not g["match"]:
+            return None
+
+        close  = df["Close"].values.astype(float)
+        c_now  = float(close[-1])
+        c_prev = float(close[-2])
+        upper1 = g["upper"][-1]
+        lower1 = g["lower"][-1]
+        width1 = g["width1"]
+        pos    = max(-20.0, min(120.0, (c_now - lower1) / width1 * 100.0))
+        day_chg = round((c_now / c_prev - 1) * 100, 2) if c_prev > 0 else 0.0
+        apex    = g["apex"]
+
+        return {
+            "종목코드":       code,
+            "종가":           int(c_now),
+            "전일대비(%)":    day_chg,
+            "삼각유형":       g["type"],
+            "수렴률(%)":      round((1.0 - g["conv_ratio"]) * 100, 1),
+            "변동성수축(%)":  round((1.0 - g["vol_ratio"]) * 100, 1),
+            "상단선":         int(round(upper1)),
+            "하단선":         int(round(lower1)),
+            "위치(%)":        int(round(pos)),
+            "수렴점(봉)":     (round(float(apex), 1) if np.isfinite(apex) else 0),
+            "신호":           "삼각수렴",
+        }
+    except Exception:
+        return None
+
+
+def run_screen53(date_str, prog):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    # 사전 적재(KRX 데이터 불러오기) 여부 확인
+    with _S53_CACHE_LOCK:
+        loaded = len(_S53_CACHE)
+    if loaded == 0:
+        prog.update({"current": 0, "total": 0, "status": "done"})
+        return pd.DataFrame()
+    end     = pd.Timestamp(date_str)
+    start   = end - pd.Timedelta(days=LOOKBACK)
+    listing = _get_listing()
+    valid   = listing[
+        (listing["Marcap"] >= 300_000_000_000) &
+        ~listing["Market"].isin(["ETF", "ETN"]) &
+        ~listing["Name"].str.match(_ETF_NAME_RE, na=False)
+    ].copy()
+    prog["total"]  = len(valid)
+    prog["status"] = "running"
+    rows    = _run_screen_parallel(valid, _screen53_ticker, start, end, prog)
+    t_end   = datetime.now()
+    elapsed = int((t_end - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+            "삼각유형", "수렴률(%)", "변동성수축(%)", "상단선", "하단선",
+            "위치(%)", "수렴점(봉)", "신호"]]
+          .sort_values(["변동성수축(%)", "수렴률(%)"], ascending=[False, False])
+          .reset_index(drop=True))
+    df["검색시각"] = t_end.strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건54: 그래엄돌파 (밸류에이션 서지 — PER×PBR 대용값의 2σ 급등)
+#   value = 종가² / (TTM순이익 × 자본총계)   ← PER×PBR 과 로그변화율 동일
+#   각 봉 시점에 '실제 공시돼 있던' 재무로 계산(룩어헤드 방지, 공시지연 45/90일)
+#   period=M: 월봉 40봉 · 최근 3봉 이내 / period=W: 주봉 100봉 · 최근 5봉 이내
+#   로그변화율 z-score ≥ 2(SIGMA) 인 봉이 최근 window 안에 있으면 통과
+#   시총 1조↑ · ETF/ETN 제외
+# ══════════════════════════════════════════════════════════════════════════════
+
+_S54_BB_LEN    = 10                        # 볼린저밴드 기간
+_S54_BB_K      = 2.0                        # 볼린저밴드 표준편차 배수 (10,2)
+_S54_MIN_CAP   = 1_000_000_000_000         # 시총 1조원
+_S54_PRESETS   = {"M": {"bars": 40, "window": 3, "rule": "M"},
+                  "W": {"bars": 100, "window": 5, "rule": "W"}}
+_S54_PERIOD    = "M"                        # run_screen54 에서 설정
+
+
+def _s54_price_bars(code: str, bars_n: int, rule: str):
+    """월/주봉 종가 시계열 → [(YYYYMMDD, close), ...] 최근 bars_n개."""
+    years  = bars_n / 12.0 if rule == "M" else bars_n / 52.0
+    end    = datetime.now()
+    start  = end - timedelta(days=int(years * 372) + 500)
+    df = _fdr_safe(code, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
+    if df is None or df.empty:
+        return []
+    close = df["Close"].astype(float)
+    close = close[close > 0].dropna()
+    if close.empty:
+        return []
+    res = close.resample(rule).last().dropna()
+    out = [(idx.strftime("%Y%m%d"), float(v)) for idx, v in res.items()]
+    return out[-bars_n:]
+
+
+def _s54_evaluate(bars, timeline, window):
+    """
+    value = 종가²/(TTM순이익×자본총계) 시계열의 볼린저밴드(10,2) 상단 돌파 판정.
+    최근 window봉 안에서 value가 상단밴드를 상향 돌파(전봉 ≤ 상단 → 당봉 > 상단)하면 통과.
+    반환 dict | None.
+    """
+    series = []
+    for (d, close) in bars:
+        f = _dart_fundamental_at(timeline, d)
+        if not f:
+            continue
+        series.append((d, close, (close * close) / (f["ttmNetIncome"] * f["equity"])))
+
+    L = _S54_BB_LEN
+    n = len(series)
+    if n < L + 1:               # 밴드 계산 + 직전봉 비교 최소치
+        return None
+
+    vals  = np.array([s[2] for s in series], dtype=float)
+    upper = np.full(n, np.nan)
+    mid   = np.full(n, np.nan)
+    for i in range(L - 1, n):
+        w = vals[i - L + 1: i + 1]
+        m  = float(w.mean())
+        sd = float(w.std(ddof=0))          # 볼린저 표준편차 (모집단)
+        mid[i]   = m
+        upper[i] = m + _S54_BB_K * sd
+
+    # 최근 window봉 안에서 상단밴드 상향 돌파(크로스오버) 탐색 — 가장 최근 것 채택
+    lo = max(L, n - window)                 # 후보 당봉 인덱스 하한
+    hit = None
+    for i in range(n - 1, lo - 1, -1):
+        if np.isnan(upper[i]) or np.isnan(upper[i - 1]):
+            continue
+        if vals[i - 1] <= upper[i - 1] and vals[i] > upper[i]:
+            hit = i
+            break
+    if hit is None:
+        return None
+
+    i        = hit
+    bars_ago = (n - 1) - i
+    d        = series[i][0]
+    band_gap = (vals[i] / upper[i] - 1.0) * 100.0 if upper[i] > 0 else 0.0
+    bar_chg  = ((series[i][1] / series[i - 1][1]) - 1.0) * 100.0 if series[i - 1][1] > 0 else 0.0
+
+    return {
+        "밴드초과(%)": round(band_gap, 1),
+        "신호봉":      f"{d[:4]}-{d[4:6]}-{d[6:]}",
+        "봉전":        bars_ago,
+        "봉변화율(%)": round(bar_chg, 1),
+        "평가봉수":    n,
+    }
+
+
+def _screen54_ticker(code, start, end, period=None):
+    try:
+        cc = _dart_corp_map.get(code)
+        if not cc:
+            return None
+        active_period = period or _S54_PERIOD
+        preset = _S54_PRESETS[active_period]
+        span_years = _math.ceil(preset["bars"] / (12.0 if active_period == "M" else 52.0)) + 1
+
+        bars     = _s54_price_bars(code, preset["bars"], preset["rule"])
+        if len(bars) < 12:
+            return None
+        timeline = _dart_timeline(cc, span_years)
+        if not timeline:
+            return None
+
+        hit = _s54_evaluate(bars, timeline, preset["window"])
+        if not hit:
+            return None
+
+        c_now = int(bars[-1][1])
+        return {
+            "종목코드":     code,
+            "종가":         c_now,
+            "기간":         "월봉" if active_period == "M" else "주봉",
+            "밴드초과(%)":  hit["밴드초과(%)"],
+            "신호봉":       hit["신호봉"],
+            "봉전":         hit["봉전"],
+            "봉변화율(%)":  hit["봉변화율(%)"],
+            "평가봉수":     hit["평가봉수"],
+            "신호":         "볼린저상향돌파",
+        }
+    except Exception:
+        return None
+
+
+def run_screen54(date_str, prog, period=None):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    if not DART_API_KEY:
+        prog.update({"status": "done"})
+        return pd.DataFrame()
+
+    _dart_load_corp_map()                       # corp_code 매핑 1회 로드
+    active_period = period or _S54_PERIOD
+    end     = pd.Timestamp(date_str)            # _screen54_ticker 는 미사용(시세는 자체 조회)
+    start   = end - pd.Timedelta(days=1)
+    listing = _get_listing_with_progress(prog)
+    valid   = listing[
+        (listing["Marcap"] >= _S54_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False))
+    ].copy()
+    prog["total"]  = len(valid)
+    prog["status"] = "running"
+    rows    = _run_screen_parallel(
+        valid,
+        lambda code, s, e: _screen54_ticker(code, s, e, active_period),
+        start,
+        end,
+        prog,
+    )
+    t_end   = datetime.now()
+    elapsed = int((t_end - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "시총(억)", "종가", "기간",
+            "밴드초과(%)", "봉전", "신호봉", "봉변화율(%)", "평가봉수", "신호"]]
+          .sort_values(["봉전", "밴드초과(%)"], ascending=[True, False])
+          .reset_index(drop=True))
+    df["검색시각"] = t_end.strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+_S58_SIGMA   = 2.0
+_S58_MIN_CAP = 300_000_000_000
+_S58_PRESETS = {"M": {"bars": 40, "window": 3, "rule": "M"},
+                "W": {"bars": 100, "window": 5, "rule": "W"}}
+
+
+def _s58_evaluate(bars, timeline, window):
+    series = []
+    for (d, close) in bars:
+        f = _dart_fundamental_at(timeline, d)
+        if not f:
+            continue
+        value = (close * close) / (f["ttmNetIncome"] * f["equity"])
+        if value > 0:
+            series.append((d, close, value))
+
+    if len(series) < max(12, window + 2):
+        return None
+
+    changes = []
+    for i in range(1, len(series)):
+        prev = series[i - 1][2]
+        cur = series[i][2]
+        if prev > 0 and cur > 0:
+            changes.append((series[i][0], series[i][1], _math.log(cur / prev)))
+
+    if len(changes) < max(11, window):
+        return None
+
+    vals = np.array([c[2] for c in changes], dtype=float)
+    mean = float(vals.mean())
+    sd = float(vals.std(ddof=1))
+    if not (sd > 0):
+        return None
+
+    best = None
+    for d, close, r in changes[-window:]:
+        z = (r - mean) / sd
+        row = {
+            "date": d,
+            "close": close,
+            "z": z,
+            "change_pct": (_math.exp(r) - 1.0) * 100.0,
+        }
+        if best is None or row["z"] > best["z"]:
+            best = row
+
+    if best is None or best["z"] < _S58_SIGMA:
+        return None
+
+    return {
+        "z-score":    round(best["z"], 2),
+        "신호봉":      f"{best['date'][:4]}-{best['date'][4:6]}-{best['date'][6:]}",
+        "급등률(%)":   round(best["change_pct"], 1),
+        "평가봉수":    len(series),
+    }
+
+
+def _screen58_ticker(code, start, end, period):
+    try:
+        cc = _dart_corp_map.get(code)
+        if not cc:
+            return None
+        preset = _S58_PRESETS[period]
+        span_years = _math.ceil(preset["bars"] / (12.0 if period == "M" else 52.0)) + 1
+
+        bars = _s54_price_bars(code, preset["bars"], preset["rule"])
+        if len(bars) < 12:
+            return None
+        timeline = _dart_timeline(cc, span_years)
+        if not timeline:
+            return None
+
+        hit = _s58_evaluate(bars, timeline, preset["window"])
+        if not hit:
+            return None
+
+        return {
+            "종목코드":    code,
+            "종가":        int(bars[-1][1]),
+            "기간":        "월봉" if period == "M" else "주봉",
+            "z-score":     hit["z-score"],
+            "급등률(%)":   hit["급등률(%)"],
+            "신호봉":      hit["신호봉"],
+            "평가봉수":    hit["평가봉수"],
+            "신호":        "PER×PBR 급등",
+        }
+    except Exception:
+        return None
+
+
+def _run_valuation_surge(date_str, prog, period):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    if not DART_API_KEY:
+        prog.update({"status": "done"})
+        return pd.DataFrame()
+
+    _dart_load_corp_map()
+    end = pd.Timestamp(date_str)
+    start = end - pd.Timedelta(days=1)
+    listing = _get_listing_with_progress(prog)
+    valid = listing[
+        (listing["Marcap"] >= _S58_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False))
+    ].copy()
+    prog["total"] = len(valid)
+    prog["status"] = "running"
+    rows = _run_screen_parallel(
+        valid,
+        lambda code, s, e: _screen58_ticker(code, s, e, period),
+        start,
+        end,
+        prog,
+    )
+    t_end = datetime.now()
+    elapsed = int((t_end - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "시총(억)", "종가", "기간",
+            "z-score", "급등률(%)", "신호봉", "평가봉수", "신호"]]
+          .sort_values("z-score", ascending=False)
+          .reset_index(drop=True))
+    df["검색시각"] = t_end.strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+def run_screen58(date_str, prog):
+    return _run_valuation_surge(date_str, prog, "M")
+
+
+def run_screen59(date_str, prog):
+    return _run_valuation_surge(date_str, prog, "W")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건55: 성장주발견 (12개월 예상 PER × PBR ≥ 300)
+#   · 데이터: 네이버 금융 통합 API (추정PER = 12개월 예상, PBR)
+#   · 예상PER 없거나 음수면 최근(trailing) PER 로 대체
+#   · 시총 5천억↑ · ETF/ETN 제외 · 조건 충족 종목 전부 반환 (PER×PBR 높은 순)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_S55_MIN_CAP   = 500_000_000_000          # 시총 5천억
+_S55_THRESHOLD = 300.0                     # 예상PER × PBR 하한
+_naver_val_sem = threading.Semaphore(12)   # 네이버 동시 요청 상한
+_NAVER_HDR     = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                  "Referer": "https://m.stock.naver.com/"}
+
+
+def _naver_num(s):
+    """'37.96배' / '1,551,000' / 'N/A' → float | None"""
+    if s is None:
+        return None
+    t = str(s).replace("배", "").replace("%", "").replace(",", "").strip()
+    if t in ("", "N/A", "-", "None"):
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _naver_valuation(code: str):
+    """네이버 통합 API에서 추정PER·PER·PBR·종가 추출."""
+    try:
+        with _naver_val_sem:
+            r = _req.get(f"https://m.stock.naver.com/api/stock/{code}/integration",
+                         headers=_NAVER_HDR, timeout=10)
+        j  = r.json()
+        ti = {x.get("key"): x.get("value") for x in (j.get("totalInfos") or [])}
+        fwd = _naver_num(ti.get("추정PER"))
+        per = _naver_num(ti.get("PER"))
+        pbr = _naver_num(ti.get("PBR"))
+        # 예상PER 우선, 없거나 음수면 최근(trailing) PER 사용
+        if fwd is not None and fwd > 0:
+            use_per, src = fwd, "예상"
+        else:
+            use_per, src = per, "최근"
+        close = None
+        dti = j.get("dealTrendInfos") or []
+        if dti:
+            close = _naver_num(dti[-1].get("closePrice"))
+        return {"fwd": fwd, "per": per, "pbr": pbr,
+                "use_per": use_per, "src": src, "close": close}
+    except Exception:
+        return None
+
+
+def _screen55_ticker(code, start, end):
+    try:
+        v = _naver_valuation(code)
+        if not v or v["use_per"] is None or v["pbr"] is None:
+            return None
+        if v["use_per"] <= 0 or v["pbr"] <= 0:
+            return None
+        val = v["use_per"] * v["pbr"]
+        if val < _S55_THRESHOLD:
+            return None
+        return {
+            "종목코드":   code,
+            "종가":       int(v["close"]) if v["close"] else 0,
+            "예상PER":    round(v["use_per"], 2),
+            "PBR":        round(v["pbr"], 2),
+            "PER×PBR":    round(val, 1),
+            "PER출처":    v["src"],
+            "신호":       "성장주발견",
+        }
+    except Exception:
+        return None
+
+
+def run_screen55(date_str, prog):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    end     = pd.Timestamp(date_str)
+    start   = end - pd.Timedelta(days=1)
+    listing = _get_listing_with_progress(prog)
+    valid   = listing[
+        (listing["Marcap"] >= _S55_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False))
+    ].copy()
+    prog["total"]  = len(valid)
+    prog["status"] = "running"
+    rows    = _run_screen_parallel(valid, _screen55_ticker, start, end, prog)
+    t_end   = datetime.now()
+    elapsed = int((t_end - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "시총(억)", "종가",
+            "예상PER", "PBR", "PER×PBR", "PER출처", "신호"]]
+          .sort_values("PER×PBR", ascending=False)
+          .reset_index(drop=True))
+    df["검색시각"] = t_end.strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건56: 볼밴.엔벨롭탈출
+#   · 볼린저밴드(20,2) 하단선 < Envelope(SMA5) −5% 하단선  (볼밴이 엔벨롭 밖으로 이탈)
+#   · 금일 양봉 (종가 > 시가)
+#   · 시총 3천억↑ · ETF/ETN 제외
+#   · 금일 제외 5일 평균거래량 ≥ 15만주
+# ══════════════════════════════════════════════════════════════════════════════
+
+_S56_MIN_CAP  = 300_000_000_000    # 시총 3천억
+_S56_VOL_MIN  = 150_000            # 5일 평균거래량 하한 (15만주)
+_S56_ENV_PCT  = 0.05               # Envelope ±5%
+_S56_LOOKBACK = 150                # 일봉 조회 범위(일) — BB20+엔벨5+전일에 충분 · 짧게=빠름·안정
+
+
+def _screen56_ticker(code, start, end):
+    try:
+        df = fetch_ohlcv(code, start, end)
+        if df is None or len(df) < 25:
+            return None
+        df = df[df["Close"] > 0].dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        if len(df) < 25:
+            return None
+
+        close = df["Close"].astype(float)
+        open_ = df["Open"].astype(float)
+        vol   = df["Volume"].astype(float)
+
+        # ── 볼린저밴드(20,2) 하단선 ──────────────────────────────────────
+        sma20    = close.rolling(20).mean()
+        std20    = close.rolling(20).std(ddof=0)      # 표준 볼린저 = 모집단 std
+        bb_lower = sma20 - 2.0 * std20
+
+        # ── Envelope 5일선 −5% 하단선 ────────────────────────────────────
+        sma5      = close.rolling(5).mean()
+        env_lower = sma5 * (1.0 - _S56_ENV_PCT)
+
+        bl  = bb_lower.iloc[-1];  bl1 = bb_lower.iloc[-2]     # BB하단 금일·전일
+        el  = env_lower.iloc[-1]; el1 = env_lower.iloc[-2]   # 엔벨롭하단 금일·전일
+        if pd.isna(bl) or pd.isna(el) or pd.isna(bl1) or pd.isna(el1):
+            return None
+
+        # ① 하향 크로스: 전일 엔벨롭하단 > BB하단  →  금일 엔벨롭하단 < BB하단
+        if not (el1 > bl1 and el < bl):
+            return None
+
+        # ② 금일 양봉 (종가 > 시가)
+        c0 = float(close.iloc[-1]); o0 = float(open_.iloc[-1])
+        if not (c0 > o0):
+            return None
+
+        # ③ 금일 제외 5일 평균거래량 ≥ 15만주
+        vol5 = float(vol.iloc[-6:-1].mean())
+        if pd.isna(vol5) or vol5 < _S56_VOL_MIN:
+            return None
+
+        c1      = float(close.iloc[-2])
+        day_chg = round((c0 / c1 - 1) * 100, 2) if c1 > 0 else 0.0
+        gap     = round((el / bl - 1) * 100, 2) if bl > 0 else 0.0   # 엔벨롭이 BB보다 낮은 폭(음수)
+
+        return {
+            "종목코드":      code,
+            "종가":          int(c0),
+            "전일대비(%)":   day_chg,
+            "BB하단":        int(round(bl)),
+            "엔벨롭하단":    int(round(el)),
+            "이탈폭(%)":     gap,
+            "5일평균거래량": int(vol5),
+            "신호":          "볼밴엔벨롭탈출",
+        }
+    except Exception:
+        return None
+
+
+def run_screen56(date_str, prog):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=_S56_LOOKBACK)).strftime("%Y%m%d")
+    listing = _get_listing_with_progress(prog)
+    valid   = listing[
+        (listing["Marcap"] >= _S56_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False))
+    ].copy()
+    prog["total"]  = len(valid)
+    prog["status"] = "running"
+    rows    = _run_screen_parallel(valid, _screen56_ticker, start, date_str, prog)
+    t_end   = datetime.now()
+    elapsed = int((t_end - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+            "BB하단", "엔벨롭하단", "이탈폭(%)", "5일평균거래량", "신호"]]
+          .sort_values("이탈폭(%)", ascending=True)      # 이탈 큰(음수 큰) 순
+          .reset_index(drop=True))
+    df["검색시각"] = t_end.strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건57: 성장주탈출 (조건55 AND 조건56 동시 충족)
+#   · 조건55: 12개월 예상 PER × PBR ≥ 300 (성장주)
+#   · 조건56: BB(20,2)하단 < Envelope(SMA5)−5%하단 + 금일 양봉 + 5일평균거래량 15만↑
+#   · 시총: 두 조건 모두 만족 → 더 엄격한 5천억↑ 적용
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _screen57_ticker(code, start, end):
+    try:
+        # ① 성장주(조건55) 먼저 판정 (네이버 1회 — 선별성 높아 대부분 여기서 탈락)
+        v55 = _screen55_ticker(code, start, end)
+        if not v55:
+            return None
+        # ② 볼밴.엔벨롭탈출(조건56) 판정 (일봉 기술적)
+        v56 = _screen56_ticker(code, start, end)
+        if not v56:
+            return None
+        # 둘 다 통과 → 병합 (+ 업종)
+        return {
+            "종목코드":      code,
+            "업종":          _industry_of(code=code) or "-",
+            "종가":          v56["종가"],
+            "전일대비(%)":   v56["전일대비(%)"],
+            "예상PER":       v55["예상PER"],
+            "PBR":           v55["PBR"],
+            "PER×PBR":       v55["PER×PBR"],
+            "PER출처":       v55["PER출처"],
+            "BB하단":        v56["BB하단"],
+            "엔벨롭하단":    v56["엔벨롭하단"],
+            "이탈폭(%)":     v56["이탈폭(%)"],
+            "5일평균거래량": v56["5일평균거래량"],
+            "신호":          "성장주탈출",
+        }
+    except Exception:
+        return None
+
+
+def run_screen57(date_str, prog):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=_S56_LOOKBACK)).strftime("%Y%m%d")
+    listing = _get_listing_with_progress(prog)
+    valid   = listing[
+        (listing["Marcap"] >= _S55_MIN_CAP) &           # 두 조건 모두 만족 → 5천억↑
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False))
+    ].copy()
+    prog["total"]  = len(valid)
+    prog["status"] = "running"
+    rows    = _run_screen_parallel(valid, _screen57_ticker, start, date_str, prog)
+    t_end   = datetime.now()
+    elapsed = int((t_end - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "업종", "시총(억)", "종가", "전일대비(%)",
+            "예상PER", "PBR", "PER×PBR", "이탈폭(%)", "5일평균거래량", "신호"]]
+          .sort_values("이탈폭(%)", ascending=True)       # 이탈 큰 순
+          .reset_index(drop=True))
+    df["검색시각"] = t_end.strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 업종(섹터) 분류 — 조건57 부가기능
+#   · 데이터: 네이버 금융 업종분류 (읽을 수 있는 한글 업종명 · 79개 내외)
+#   · 종목명/코드 → 업종 조회 · 전체 업종 목록 + 구성종목
+# ══════════════════════════════════════════════════════════════════════════════
+
+_industry_groups  = {}      # 업종명 → [{code, name}, ...]
+_industry_by_code = {}      # 종목코드 → 업종명
+_industry_by_name = {}      # 종목명   → 업종명
+_industry_lock    = threading.Lock()
+_industry_day     = ""
+
+
+def _naver_industry_detail(args):
+    """한 업종의 구성종목 [(code, name), ...] 스크랩."""
+    no, nm = args
+    try:
+        from bs4 import BeautifulSoup as _BS4
+        url = f"https://finance.naver.com/sise/sise_group_detail.naver?type=upjong&no={no}"
+        r = _req.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+        r.encoding = "euc-kr"
+        soup = _BS4(r.text, "lxml")
+        out = []
+        for a in soup.select("div.name_area a"):
+            href = a.get("href", "")
+            m = _re.search(r"code=(\d{6})", href)
+            name = a.get_text(strip=True)
+            if m and name:
+                out.append({"code": m.group(1), "name": name})
+        return nm, out
+    except Exception:
+        return nm, []
+
+
+def _load_industry_map(force=False):
+    """네이버 업종분류 전체 로드 → {업종명:[종목]} + 역인덱스. 당일 캐시."""
+    global _industry_groups, _industry_by_code, _industry_by_name, _industry_day
+    today = datetime.now().strftime("%Y%m%d")
+    with _industry_lock:
+        if _industry_groups and _industry_day == today and not force:
+            return _industry_groups
+    try:
+        from bs4 import BeautifulSoup as _BS4
+        r = _req.get("https://finance.naver.com/sise/sise_group.naver?type=upjong",
+                     headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r.encoding = "euc-kr"
+        soup = _BS4(r.text, "lxml")
+        industries = []
+        for a in soup.select("table.type_1 a"):
+            m = _re.search(r"no=(\d+)", a.get("href", ""))
+            nm = a.get_text(strip=True)
+            if m and nm:
+                industries.append((m.group(1), nm))
+        if not industries:
+            return _industry_groups
+
+        groups, by_code, by_name = {}, {}, {}
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            for nm, stocks in ex.map(_naver_industry_detail, industries):
+                if not stocks:
+                    continue
+                groups[nm] = stocks
+                for s in stocks:
+                    by_code[s["code"]] = nm
+                    by_name[s["name"]] = nm
+
+        if groups:
+            with _industry_lock:
+                _industry_groups  = groups
+                _industry_by_code = by_code
+                _industry_by_name = by_name
+                _industry_day     = today
+    except Exception as e:
+        print(f"[INDUSTRY] 업종분류 로드 실패: {e}")
+    return _industry_groups
+
+
+def _industry_of(code=None, name=None):
+    """종목코드/이름으로 업종명 조회 (없으면 None)."""
+    if not _industry_by_code:
+        _load_industry_map()
+    if code and str(code).zfill(6) in _industry_by_code:
+        return _industry_by_code[str(code).zfill(6)]
+    if name and name in _industry_by_name:
+        return _industry_by_name[name]
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 테마 분류 — 조건57 부가기능 (인포스탁 테마분류 스타일)
+#   · 데이터: 네이버 금융 테마 (267개 내외) · 종목은 다중 테마 소속 가능
+# ══════════════════════════════════════════════════════════════════════════════
+
+_theme_groups  = {}      # 테마명 → [{code, name}, ...]
+_theme_by_code = {}      # 종목코드 → [테마명, ...]  (다중)
+_theme_by_name = {}      # 종목명   → [테마명, ...]
+_theme_lock    = threading.Lock()
+_theme_day     = ""
+
+
+def _naver_theme_detail(args):
+    """한 테마의 구성종목 [(code, name), ...] 스크랩."""
+    no, nm = args
+    try:
+        from bs4 import BeautifulSoup as _BS4
+        url = f"https://finance.naver.com/sise/sise_group_detail.naver?type=theme&no={no}"
+        r = _req.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+        r.encoding = "euc-kr"
+        soup = _BS4(r.text, "lxml")
+        out = []
+        for a in soup.select("div.name_area a"):
+            m = _re.search(r"code=(\d{6})", a.get("href", ""))
+            name = a.get_text(strip=True)
+            if m and name:
+                out.append({"code": m.group(1), "name": name})
+        return nm, out
+    except Exception:
+        return nm, []
+
+
+def _load_theme_map(force=False):
+    """네이버 테마분류 전체 로드 → {테마명:[종목]} + 역인덱스(다중). 당일 캐시."""
+    global _theme_groups, _theme_by_code, _theme_by_name, _theme_day
+    today = datetime.now().strftime("%Y%m%d")
+    with _theme_lock:
+        if _theme_groups and _theme_day == today and not force:
+            return _theme_groups
+    try:
+        r = _req.get("https://finance.naver.com/sise/sise_group.naver?type=theme",
+                     headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r.encoding = "euc-kr"
+        pairs, seen = [], set()
+        for no, nm in _re.findall(
+                r'sise_group_detail\.naver\?type=theme&no=(\d+)"[^>]*>([^<]+)</a>', r.text):
+            if no not in seen:
+                seen.add(no); pairs.append((no, nm.strip()))
+        if not pairs:
+            return _theme_groups
+
+        groups, by_code, by_name = {}, {}, {}
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for nm, stocks in ex.map(_naver_theme_detail, pairs):
+                if not stocks:
+                    continue
+                groups[nm] = stocks
+                for s in stocks:
+                    by_code.setdefault(s["code"], []).append(nm)
+                    by_name.setdefault(s["name"], []).append(nm)
+
+        if groups:
+            with _theme_lock:
+                _theme_groups  = groups
+                _theme_by_code = by_code
+                _theme_by_name = by_name
+                _theme_day     = today
+    except Exception as e:
+        print(f"[THEME] 테마분류 로드 실패: {e}")
+    return _theme_groups
+
+
+def _themes_of(code=None, name=None):
+    """종목코드/이름으로 소속 테마 리스트 반환 (없으면 [])."""
+    if not _theme_by_code:
+        _load_theme_map()
+    if code and str(code).zfill(6) in _theme_by_code:
+        return _theme_by_code[str(code).zfill(6)]
+    if name and name in _theme_by_name:
+        return _theme_by_name[name]
+    return []
+
+
+# ── 상위테마: 월간(지난 1달) 상승률 상위 테마 ────────────────────────────────
+_S57_TOPTHEME_MIN = 3      # 테마 순위 산정 최소 유효 구성종목 수
+_theme_top = {"status": "idle", "current": 0, "total": 0, "date": "",
+              "n": 10, "ranking": [], "ts": "", "msg": ""}
+_theme_top_lock = threading.Lock()
+
+
+def _monthly_return_naver(code, start_s, end_s):
+    """약 21거래일(1개월) 종가 수익률(%). 네이버 siseJson (requests 타임아웃, 스레드 미생성)."""
+    try:
+        url = (f"https://api.finance.naver.com/siseJson.naver?symbol={code}"
+               f"&requestType=1&startTime={start_s}&endTime={end_s}&timeframe=day")
+        r = _req.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        rows = json.loads(r.text.replace("'", '"').replace("\n", "").replace("\t", ""))
+        cl = [float(x[4]) for x in rows[1:] if x and len(x) > 4 and x[4]]
+        cl = [c for c in cl if c > 0]
+        if len(cl) < 12:
+            return None
+        base = cl[-22] if len(cl) >= 22 else cl[0]
+        now  = cl[-1]
+        if base <= 0:
+            return None
+        return (now / base - 1.0) * 100.0
+    except Exception:
+        return None
+
+
+def _compute_theme_top(date_str, n):
+    """전 테마 구성종목의 1개월 수익률 → 테마별 평균 → 상위 n개.
+    네이버 siseJson(requests 타임아웃) + 워커 12 → 스레드 폭주 없이 빠르고 안정적."""
+    groups = _load_theme_map()
+    codes = sorted({s["code"] for st in groups.values() for s in st})
+    end   = pd.Timestamp(date_str)
+    start_s = (end - pd.Timedelta(days=50)).strftime("%Y%m%d")
+    end_s   = end.strftime("%Y%m%d")
+    _theme_top.update({"status": "running", "current": 0, "total": len(codes),
+                       "date": date_str, "n": n, "ranking": [], "msg": ""})
+    ret, cnt, lock = {}, [0], threading.Lock()
+
+    def _job(code):
+        r = _monthly_return_naver(code, start_s, end_s)
+        with lock:
+            cnt[0] += 1
+            _theme_top["current"] = cnt[0]
+            if r is not None:
+                ret[code] = r
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_job, codes))
+    except Exception as _e:
+        _theme_top.update({"status": "error", "msg": f"조회 오류: {_e}"})
+        return
+    try:
+        rows = []
+        for nm, st in groups.items():
+            rs = [ret[s["code"]] for s in st if s["code"] in ret]
+            if len(rs) < _S57_TOPTHEME_MIN:
+                continue
+            avg = sum(rs) / len(rs)
+            up  = sum(1 for x in rs if x > 0)
+            rows.append({"테마": nm, "월수익률": round(avg, 2),
+                         "종목수": len(st), "유효": len(rs),
+                         "상승비율": round(up / len(rs) * 100, 0),
+                         "종목": [s["name"] for s in st]})
+        rows.sort(key=lambda x: -x["월수익률"])
+        _theme_top.update({"status": "done", "ranking": rows[:n],
+                           "ts": datetime.now().strftime("%H:%M:%S"),
+                           "msg": f"{len(rows)}개 테마 산정 완료"})
+    except Exception as e:
+        _theme_top.update({"status": "error", "msg": f"계산 오류: {e}"})
+
+
+# ── 급등테마: 2주 전 대비 월간수익률 순위가 급상승한 테마 (조건63) ────────────
+_S63_2W_BARS   = 10   # 2주 = 10 거래일
+_S63_TOP_N     = 10
+_theme_surge = {"status": "idle", "current": 0, "total": 0, "date": "",
+                "ranking": [], "ts": "", "msg": ""}
+_theme_surge_lock = threading.Lock()
+
+
+def _stock_two_returns(code, start_s, end_s):
+    """네이버 siseJson 한 번 조회로 (오늘기준 1개월, 2주전기준 1개월) 수익률(%) 반환."""
+    try:
+        url = (f"https://api.finance.naver.com/siseJson.naver?symbol={code}"
+               f"&requestType=1&startTime={start_s}&endTime={end_s}&timeframe=day")
+        r = _req.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        rows = json.loads(r.text.replace("'", '"').replace("\n", "").replace("\t", ""))
+        cl = [float(x[4]) for x in rows[1:] if x and len(x) > 4 and x[4]]
+        cl = [c for c in cl if c > 0]
+        if len(cl) < 22 + _S63_2W_BARS:
+            return None
+        now  = (cl[-1] / cl[-22] - 1.0) * 100.0                        # 오늘 기준 1개월
+        prev = (cl[-1 - _S63_2W_BARS] / cl[-22 - _S63_2W_BARS] - 1.0) * 100.0  # 2주전 기준 1개월
+        return (now, prev)
+    except Exception:
+        return None
+
+
+def _compute_theme_surge(date_str, n):
+    """오늘/2주전 두 시점 월수익률로 테마 순위 산정 → 순위 급상승 상위 n개."""
+    groups = _load_theme_map()
+    codes = sorted({s["code"] for st in groups.values() for s in st})
+    end   = pd.Timestamp(date_str)
+    start_s = (end - pd.Timedelta(days=70)).strftime("%Y%m%d")
+    end_s   = end.strftime("%Y%m%d")
+    _theme_surge.update({"status": "running", "current": 0, "total": len(codes),
+                         "date": date_str, "ranking": [], "msg": ""})
+    now_r, prev_r, cnt, lock = {}, {}, [0], threading.Lock()
+
+    def _job(code):
+        r = _stock_two_returns(code, start_s, end_s)
+        with lock:
+            cnt[0] += 1
+            _theme_surge["current"] = cnt[0]
+            if r is not None:
+                now_r[code], prev_r[code] = r
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(_job, codes))
+    except Exception as _e:
+        _theme_surge.update({"status": "error", "msg": f"조회 오류: {_e}"})
+        return
+    try:
+        theme_now, theme_prev, members = {}, {}, {}
+        for nm, st in groups.items():
+            rn = [now_r[s["code"]]  for s in st if s["code"] in now_r]
+            rp = [prev_r[s["code"]] for s in st if s["code"] in prev_r]
+            if len(rn) < _S57_TOPTHEME_MIN or len(rp) < _S57_TOPTHEME_MIN:
+                continue
+            theme_now[nm]  = sum(rn) / len(rn)
+            theme_prev[nm] = sum(rp) / len(rp)
+            members[nm]    = [s["name"] for s in st]
+        # 순위 (월수익률 내림차순)
+        rank_now  = {nm: i + 1 for i, nm in enumerate(
+            sorted(theme_now,  key=lambda k: -theme_now[k]))}
+        rank_prev = {nm: i + 1 for i, nm in enumerate(
+            sorted(theme_prev, key=lambda k: -theme_prev[k]))}
+        rows = []
+        for nm in theme_now:
+            if nm not in rank_prev:
+                continue
+            change = rank_prev[nm] - rank_now[nm]      # 양수 = 순위 상승
+            rows.append({"테마": nm, "순위변동": change,
+                         "현재순위": rank_now[nm], "2주전순위": rank_prev[nm],
+                         "현재월수익률": round(theme_now[nm], 2),
+                         "종목": members[nm]})
+        rows.sort(key=lambda x: (-x["순위변동"], x["현재순위"]))
+        _theme_surge.update({"status": "done", "ranking": rows[:n],
+                             "ts": datetime.now().strftime("%H:%M:%S"),
+                             "msg": f"{len(rows)}개 테마 순위비교 완료"})
+    except Exception as e:
+        _theme_surge.update({"status": "error", "msg": f"계산 오류: {e}"})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건60: 이제출발 (월간 상위테마 종목 중 볼린저밴드(20,2.5) 최근3일 돌파)
+#   ① 검색일 기준 월간 상승률 상위 10개 테마 (조건57 로직)
+#   ② 그 테마 구성종목 중 볼린저밴드(20, 2.5) 상단 최근 3일 내 상향돌파
+# ══════════════════════════════════════════════════════════════════════════════
+
+_S60_BB_LEN     = 20
+_S60_BB_K       = 2.0
+_S60_WINDOW     = 3      # 최근 3봉 이내 돌파
+_S60_LOOKBACK   = 120    # 일봉 조회 범위(일)
+_S60_TOP_N      = 10     # 상위 테마 개수
+_S60_MIN_CAP_EOK = 1500  # 시총 하한 (억) = 1천5백억
+
+# 조건61 이제출발2 = 조건60과 동일하되 볼린저밴드(200, 2)
+_S61_BB_LEN     = 200
+_S61_BB_K       = 2.0
+_S61_WINDOW     = 3
+_S61_LOOKBACK   = 420    # 200봉 확보용 (약 290 거래일)
+_S61_TOP_N      = 10
+_S61_MIN_CAP_EOK = 1500
+
+
+def _screen_theme_bb_ticker(code, date_str, bb_len, bb_k, window, lookback, signal):
+    """볼린저밴드(bb_len, bb_k) 상단 최근 window일 내 상향돌파 판정 (조건60/61 공용)."""
+    try:
+        end   = pd.Timestamp(date_str)
+        start = (end - pd.Timedelta(days=lookback)).strftime("%Y%m%d")
+        df = fetch_ohlcv(code, start, end.strftime("%Y%m%d"))
+        need = bb_len + 3
+        if df is None or len(df) < need:
+            return None
+        df = df[df["Close"] > 0].dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        if len(df) < need:
+            return None
+
+        close = df["Close"].astype(float)
+        sma   = close.rolling(bb_len).mean()
+        std   = close.rolling(bb_len).std(ddof=0)
+        upper = (sma + bb_k * std).values
+        c     = close.values
+        n     = len(c)
+
+        # 최근 window봉 이내 상단선 상향 돌파(크로스오버) — 가장 최근 것
+        hit = None
+        for off in range(window):
+            i = n - 1 - off
+            if i < 1 or np.isnan(upper[i]) or np.isnan(upper[i - 1]):
+                continue
+            if c[i - 1] <= upper[i - 1] and c[i] > upper[i]:
+                hit, hit_i = off, i
+                break
+        if hit is None:
+            return None
+
+        c_now  = float(c[-1]); c_prev = float(c[-2])
+        day_chg = round((c_now / c_prev - 1) * 100, 2) if c_prev > 0 else 0.0
+        brk_pct = round((c[hit_i] / upper[hit_i] - 1) * 100, 2)
+        return {
+            "종목코드":       code,
+            "종가":           int(c_now),
+            "전일대비(%)":    day_chg,
+            "BB상단":         int(round(upper[-1])),
+            "돌파시점(봉전)": hit,
+            "돌파율(%)":      brk_pct,
+            "신호":           signal,
+        }
+    except Exception:
+        return None
+
+
+def _run_theme_bb(date_str, prog, top_n, min_cap_eok, bb_len, bb_k, window, lookback, signal):
+    """상위 테마 종목 중 볼린저밴드 상단 돌파 스캔 (조건60/61 공용)."""
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+
+    # ① 상위 테마 (조건57 로직 · 같은 날짜 캐시 재사용, 필요 개수 이상일 때만)
+    if not (_theme_top["status"] == "done" and _theme_top["date"] == date_str
+            and len(_theme_top.get("ranking") or []) >= top_n):
+        _compute_theme_top(date_str, max(top_n, 20))
+    top = (_theme_top.get("ranking") or [])[:top_n]
+    if not top:
+        prog["status"] = "done"
+        return pd.DataFrame()
+    rank_of = {t["테마"]: i + 1 for i, t in enumerate(top)}
+
+    # ② 상위 테마 구성종목 수집 (다중 테마 소속 병합)
+    stock_themes, stock_name = {}, {}
+    for t in top:
+        for s in _theme_groups.get(t["테마"], []):
+            stock_themes.setdefault(s["code"], []).append(t["테마"])
+            stock_name[s["code"]] = s["name"]
+    listing = _get_listing()
+    lmap = {str(r["Code"]).zfill(6): (r["Market"], int(r["Marcap"]) // 100_000_000)
+            for _, r in listing.iterrows()}
+
+    # 시총 필터 (lmap 시총 단위=억)
+    codes = [c for c in stock_themes.keys()
+             if lmap.get(c, ("", 0))[1] >= min_cap_eok]
+
+    prog["total"]  = len(codes)
+    prog["status"] = "running"
+    rows, cnt, lock = [], [0], threading.Lock()
+
+    def _job(code):
+        r = _screen_theme_bb_ticker(code, date_str, bb_len, bb_k, window, lookback, signal)
+        with lock:
+            cnt[0] += 1
+            prog["current"] = cnt[0]
+            if r is not None:
+                mkt, mc = lmap.get(code, ("", 0))
+                ths = stock_themes[code]
+                r["종목명"]    = stock_name.get(code, code)
+                r["시장"]      = mkt
+                r["시총(억)"]  = mc
+                r["테마"]      = " · ".join(ths)
+                r["테마순위"]  = min(rank_of[x] for x in ths)
+                rows.append(r)
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        list(ex.map(_job, codes))
+
+    elapsed = int((datetime.now() - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "테마", "테마순위", "시총(억)", "종가",
+            "전일대비(%)", "BB상단", "돌파시점(봉전)", "돌파율(%)", "신호"]]
+          .sort_values(["돌파시점(봉전)", "테마순위"], ascending=[True, True])
+          .reset_index(drop=True))
+    df["검색시각"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+def run_screen60(date_str, prog):
+    return _run_theme_bb(date_str, prog, _S60_TOP_N, _S60_MIN_CAP_EOK,
+                         _S60_BB_LEN, _S60_BB_K, _S60_WINDOW, _S60_LOOKBACK, "이제출발")
+
+
+def run_screen61(date_str, prog):
+    return _run_theme_bb(date_str, prog, _S61_TOP_N, _S61_MIN_CAP_EOK,
+                         _S61_BB_LEN, _S61_BB_K, _S61_WINDOW, _S61_LOOKBACK, "이제출발2")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건62: 볼밴이제출발 (월간 상위20테마 종목 중 조건56 볼밴탈출 만족)
+#   ① 검색일 기준 월간 상승률 상위 20개 테마 (조건57/60 로직)
+#   ② 그 테마 구성종목 중 시총 1천5백억↑
+#   ③ 조건56 기술적: 엔벨롭(SMA5)−5%하단 < BB(20,2)하단 하향크로스 + 양봉 + 5일평균거래량 15만↑
+# ══════════════════════════════════════════════════════════════════════════════
+
+_S62_TOP_N       = 20     # 상위 테마 20위권
+_S62_MIN_CAP_EOK = 1500   # 시총 1천5백억
+
+
+def run_screen62(date_str, prog):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+
+    # ① 상위 20 테마 (캐시 재사용, 20개 이상일 때만)
+    if not (_theme_top["status"] == "done" and _theme_top["date"] == date_str
+            and len(_theme_top.get("ranking") or []) >= _S62_TOP_N):
+        _compute_theme_top(date_str, max(_S62_TOP_N, 20))
+    top = (_theme_top.get("ranking") or [])[:_S62_TOP_N]
+    if not top:
+        prog["status"] = "done"
+        return pd.DataFrame()
+    rank_of = {t["테마"]: i + 1 for i, t in enumerate(top)}
+
+    # ② 구성종목 수집 + 시총 1500억 필터
+    stock_themes, stock_name = {}, {}
+    for t in top:
+        for s in _theme_groups.get(t["테마"], []):
+            stock_themes.setdefault(s["code"], []).append(t["테마"])
+            stock_name[s["code"]] = s["name"]
+    listing = _get_listing()
+    lmap = {str(r["Code"]).zfill(6): (r["Market"], int(r["Marcap"]) // 100_000_000)
+            for _, r in listing.iterrows()}
+    codes = [c for c in stock_themes.keys()
+             if lmap.get(c, ("", 0))[1] >= _S62_MIN_CAP_EOK]
+
+    # ③ 조건56 기술조건 검사
+    start = (pd.Timestamp(date_str) - pd.Timedelta(days=_S56_LOOKBACK)).strftime("%Y%m%d")
+    prog["total"]  = len(codes)
+    prog["status"] = "running"
+    rows, cnt, lock = [], [0], threading.Lock()
+
+    def _job(code):
+        r = _screen56_ticker(code, start, date_str)
+        with lock:
+            cnt[0] += 1
+            prog["current"] = cnt[0]
+            if r is not None:
+                mkt, mc = lmap.get(code, ("", 0))
+                ths = stock_themes[code]
+                r["종목명"]    = stock_name.get(code, code)
+                r["시장"]      = mkt
+                r["시총(억)"]  = mc
+                r["테마"]      = " · ".join(ths)
+                r["테마순위"]  = min(rank_of[x] for x in ths)
+                r["신호"]      = "볼밴이제출발"
+                rows.append(r)
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        list(ex.map(_job, codes))
+
+    elapsed = int((datetime.now() - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "테마", "테마순위", "시총(억)", "종가",
+            "전일대비(%)", "BB하단", "엔벨롭하단", "이탈폭(%)", "5일평균거래량", "신호"]]
+          .sort_values(["테마순위", "이탈폭(%)"], ascending=[True, True])
+          .reset_index(drop=True))
+    df["검색시각"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건63: 급등테마 (2주전 대비 월간수익률 순위 급상승 테마 종목의 BB(20,2) 돌파)
+#   ① 오늘/2주전 두 시점 월수익률로 테마 순위 산정 → 순위 급상승 상위 10개 테마
+#   ② 그 테마 구성종목 중 볼린저밴드(20, 2) 상단 최근 3일 내 상향돌파
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_screen63(date_str, prog):
+    t_start = datetime.now()
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+
+    # ① 순위 급상승 상위 10 테마 (같은 날짜 캐시 재사용)
+    if not (_theme_surge["status"] == "done" and _theme_surge["date"] == date_str
+            and _theme_surge["ranking"]):
+        _compute_theme_surge(date_str, _S63_TOP_N)
+    top = (_theme_surge.get("ranking") or [])[:_S63_TOP_N]
+    if not top:
+        prog["status"] = "done"
+        return pd.DataFrame()
+    surge_of = {t["테마"]: t for t in top}
+    order_of = {t["테마"]: i + 1 for i, t in enumerate(top)}
+
+    # ② 구성종목 수집 (다중 테마 병합)
+    stock_themes, stock_name = {}, {}
+    for t in top:
+        for s in _theme_groups.get(t["테마"], []):
+            stock_themes.setdefault(s["code"], []).append(t["테마"])
+            stock_name[s["code"]] = s["name"]
+    codes = list(stock_themes.keys())   # 시총 필터 없음 (요청대로)
+
+    listing = _get_listing()
+    lmap = {str(r["Code"]).zfill(6): (r["Market"], int(r["Marcap"]) // 100_000_000)
+            for _, r in listing.iterrows()}
+
+    prog["total"]  = len(codes)
+    prog["status"] = "running"
+    rows, cnt, lock = [], [0], threading.Lock()
+
+    def _job(code):
+        r = _screen_theme_bb_ticker(code, date_str, 20, 2.0, 3, 120, "급등테마")
+        with lock:
+            cnt[0] += 1
+            prog["current"] = cnt[0]
+            if r is not None:
+                mkt, mc = lmap.get(code, ("", 0))
+                ths = stock_themes[code]
+                best = max(ths, key=lambda x: surge_of[x]["순위변동"])
+                r["종목명"]    = stock_name.get(code, code)
+                r["시장"]      = mkt
+                r["시총(억)"]  = mc
+                r["테마"]      = " · ".join(ths)
+                r["순위변동"]  = surge_of[best]["순위변동"]
+                r["급등순위"]  = min(order_of[x] for x in ths)
+                rows.append(r)
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        list(ex.map(_job, codes))
+
+    elapsed = int((datetime.now() - t_start).total_seconds())
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          [["시장", "종목코드", "종목명", "테마", "순위변동", "급등순위", "시총(억)", "종가",
+            "전일대비(%)", "BB상단", "돌파시점(봉전)", "돌파율(%)", "신호"]]
+          .sort_values(["돌파시점(봉전)", "급등순위"], ascending=[True, True])
+          .reset_index(drop=True))
+    df["검색시각"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df["소요(초)"] = elapsed
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건64: 한투 신호봇 (실주문 없음 — 진입/청산 신호 계산 + 이메일 알림)
+#   진입: 조건63 급등테마 종목 중, 같은 테마에서 0봉전 BB(20,2) 돌파가 3개↑ →
+#         해당 클러스터 중 시가총액 최대 종목
+#   매매금액: 매수 300만원 (수량 = 300만÷진입가) · 청산 100%
+#   손절: 진입가 − 1.5×ATR(14) · 익절: 진입가 + 3×ATR(14)  (당일 ATR 기준)
+#   하루 최대 3신호 · 월~금 09:00~15:30 실시간 감시 · 알림만(주문은 사용자)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_S64_BUY_KRW      = 3_000_000   # 매수 금액
+_S64_ATR_STOP     = 1.5         # 손절 배수
+_S64_ATR_TARGET   = 3.0         # 익절 배수
+_S64_CLUSTER_MIN  = 3           # 같은 테마 0봉전 최소 종목수
+_S64_MAX_TRADES   = 3           # 하루 최대 신호
+_S64_INTERVAL_SEC = 600         # 실시간 감시 주기(10분)
+_S64_MKT_OPEN     = (9, 0)
+_S64_MKT_CLOSE    = (15, 30)
+
+
+def _calc_atr14(df, period=14):
+    """ATR(14) — Wilder 평활. 반환 float | None."""
+    hi = df["High"].astype(float).values
+    lo = df["Low"].astype(float).values
+    cl = df["Close"].astype(float).values
+    n = len(cl)
+    if n < period + 1:
+        return None
+    tr = np.zeros(n)
+    for i in range(1, n):
+        tr[i] = max(hi[i] - lo[i], abs(hi[i] - cl[i - 1]), abs(lo[i] - cl[i - 1]))
+    atr = tr[1:period + 1].mean()
+    for i in range(period + 1, n):
+        atr = (atr * (period - 1) + tr[i]) / period
+    return float(atr) if atr > 0 else None
+
+
+def _hantoo_candidates(date_str):
+    """급등테마 내 0봉전 BB(20,2) 돌파 종목 전체(후보) + 진입대상 표시.
+    반환: (rows list, entry_pick dict|None)
+      - rows: 모든 0봉전 돌파 종목 (클러스터 3미만도 포함)
+      - entry_pick: 3종목↑ 클러스터 중 시총최대 (없으면 None)"""
+    # ① 급등테마 (조건63) — 캐시 재사용
+    if not (_theme_surge["status"] == "done" and _theme_surge["date"] == date_str
+            and _theme_surge["ranking"]):
+        _compute_theme_surge(date_str, _S63_TOP_N)
+    top = (_theme_surge.get("ranking") or [])[:_S63_TOP_N]
+    if not top:
+        return [], None
+
+    theme_of, name_of = {}, {}
+    for t in top:
+        for s in _theme_groups.get(t["테마"], []):
+            theme_of.setdefault(s["code"], []).append(t["테마"])
+            name_of[s["code"]] = s["name"]
+    codes = list(theme_of.keys())
+
+    listing = _get_listing()
+    cap_of = {str(r["Code"]).zfill(6): int(r["Marcap"]) for _, r in listing.iterrows()}
+    mkt_of = {str(r["Code"]).zfill(6): r["Market"] for _, r in listing.iterrows()}
+
+    # ② 0봉전 BB(20,2) 돌파 종목 탐지
+    brk, lock = {}, threading.Lock()
+
+    def _job(code):
+        r = _screen_theme_bb_ticker(code, date_str, 20, 2.0, 3, 120, "한투")
+        if r is not None and r.get("돌파시점(봉전)") == 0:
+            with lock:
+                brk[code] = r
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        list(ex.map(_job, codes))
+    if not brk:
+        return [], None
+
+    # ③ 테마별 0봉전 돌파 종목수
+    theme_hits = {}
+    for code in brk:
+        for th in theme_of[code]:
+            theme_hits.setdefault(th, []).append(code)
+    cluster_codes = {c for th, cs in theme_hits.items() if len(cs) >= _S64_CLUSTER_MIN for c in cs}
+    entry_code = max(cluster_codes, key=lambda c: cap_of.get(c, 0)) if cluster_codes else None
+
+    # ④ 모든 후보 종목 행 생성 (ATR·진입·손절·익절·수량)
+    end = pd.Timestamp(date_str)
+    start = (end - pd.Timedelta(days=120)).strftime("%Y%m%d")
+    rows = []
+    for code in brk:
+        df = fetch_ohlcv(code, start, end.strftime("%Y%m%d"))   # 캐시됨 (티커에서 이미 조회)
+        if df is None or df.empty:
+            continue
+        atr = _calc_atr14(df)
+        if atr is None:
+            continue
+        entry = float(df["Close"].astype(float).iloc[-1])
+        shares = int(_S64_BUY_KRW // entry)
+        if shares < 1:
+            continue
+        ths = theme_of[code]
+        cl_max = max(len(theme_hits.get(th, [])) for th in ths)
+        rows.append({
+            "종목코드":  code,
+            "종목명":    name_of.get(code, code),
+            "시장":      mkt_of.get(code, ""),
+            "시총(억)":  cap_of.get(code, 0) // 100_000_000,
+            "테마":      " · ".join(ths),
+            "클러스터":  cl_max,
+            "진입가":    int(round(entry)),
+            "ATR14":     int(round(atr)),
+            "손절가":    int(round(entry - _S64_ATR_STOP * atr)),
+            "익절가":    int(round(entry + _S64_ATR_TARGET * atr)),
+            "수량":      shares,
+            "매수금액":  shares * int(round(entry)),
+            "진입대상":  "Y" if code == entry_code else "N",
+            "신호":      "★진입대상" if code == entry_code else "후보(0봉전)",
+        })
+    rows.sort(key=lambda r: (r["진입대상"] != "Y", -r["클러스터"], -r["시총(억)"]))
+    pick = next((r for r in rows if r["진입대상"] == "Y"), None)
+    return rows, pick
+
+
+def _hantoo_detect(date_str):
+    """한투 실시간 자동알림용 진입신호 (3종목↑ 클러스터 · 시총최대). 반환 dict | None."""
+    _, pick = _hantoo_candidates(date_str)
+    return pick
+
+
+def run_screen64(date_str, prog):
+    """한투 신호봇 검색 = 조건63(급등테마 BB(20,2) 최근3일 돌파) 결과 + ATR(14) 컬럼."""
+    df = run_screen63(date_str, prog)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    # ATR(14) 컬럼 추가 (종목별 1회 계산)
+    end   = pd.Timestamp(date_str)
+    start = (end - pd.Timedelta(days=120)).strftime("%Y%m%d")
+    atr_map = {}
+    for code in df["종목코드"].astype(str).str.zfill(6).unique():
+        d2 = fetch_ohlcv(code, start, end.strftime("%Y%m%d"))
+        a  = _calc_atr14(d2) if (d2 is not None and not d2.empty) else None
+        atr_map[code] = int(round(a)) if a else 0
+    df["ATR14"] = df["종목코드"].astype(str).str.zfill(6).map(atr_map)
+    # ATR14를 돌파율(%) 뒤로 배치
+    cols = [c for c in df.columns if c != "ATR14"]
+    if "돌파율(%)" in cols:
+        i = cols.index("돌파율(%)") + 1
+        cols = cols[:i] + ["ATR14"] + cols[i:]
+    else:
+        cols = cols + ["ATR14"]
+    return df[cols]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건65: 더블MACD (장기 MACD 21/55/9 + 단기 MACD 5/13/6 · 8가지 SearchMode)
+# ══════════════════════════════════════════════════════════════════════════════
+_S65_MIN_CAP = 300_000_000_000            # 시가총액 3천억 이상
+
+_S65_MODE_LABEL = {
+    1: "LongHist≥0 + 단기Hist 0선 상향돌파",
+    2: "LongHist 상승중 + 단기Hist 0선 상향돌파",
+    3: "장기MACD 상향교차 + 단기Hist 양수",
+    4: "단기MACD 상향교차 + LongHist 양수",
+    5: "장기·단기 MACD 동시 상향교차",
+    6: "장기·단기 히스토그램 모두 첫 음수전환",
+    7: "장기·단기 MACD 동시 하향교차",
+    8: "장기·단기 히스토그램 모두 첫 양수전환",
+}
+
+
+def _screen65_ticker(code, start, end):
+    try:
+        mode = int(_state[65].get("find_mode", 1))
+        df = fetch_ohlcv(code, start, end)
+        if df is None or len(df) < 70:
+            return None
+        c = df["Close"].astype(float)
+
+        # 장기 MACD (21,55,9)
+        lmacd = ema(c, 21) - ema(c, 55)
+        lsig  = ema(lmacd, 9)
+        lhist = lmacd - lsig
+        # 단기 MACD (5,13,6)
+        smacd = ema(c, 5) - ema(c, 13)
+        ssig  = ema(smacd, 6)
+        shist = smacd - ssig
+
+        # 최근 2봉 값
+        lh0, lh1   = float(lhist.iloc[-1]), float(lhist.iloc[-2])
+        sh0, sh1   = float(shist.iloc[-1]), float(shist.iloc[-2])
+        lm0, lm1   = float(lmacd.iloc[-1]), float(lmacd.iloc[-2])
+        lsg0, lsg1 = float(lsig.iloc[-1]),  float(lsig.iloc[-2])
+        sm0, sm1   = float(smacd.iloc[-1]), float(smacd.iloc[-2])
+        ssg0, ssg1 = float(ssig.iloc[-1]),  float(ssig.iloc[-2])
+
+        # 교차/상태
+        long_cross_up    = lm1 <= lsg1 and lm0 >  lsg0
+        short_cross_up   = sm1 <= ssg1 and sm0 >  ssg0
+        long_cross_down  = lm1 >= lsg1 and lm0 <  lsg0
+        short_cross_down = sm1 >= ssg1 and sm0 <  ssg0
+        short_zero_up    = sh1 <= 0    and sh0 >  0
+        long_hist_rising = lh0 > lh1
+        both_bull_0 = lh0 > 0 and sh0 > 0
+        both_bull_1 = lh1 > 0 and sh1 > 0
+        both_bear_0 = lh0 < 0 and sh0 < 0
+        both_bear_1 = lh1 < 0 and sh1 < 0
+
+        if   mode == 1: cond = lh0 >= 0 and short_zero_up
+        elif mode == 2: cond = long_hist_rising and short_zero_up
+        elif mode == 3: cond = long_cross_up and sh0 > 0
+        elif mode == 4: cond = short_cross_up and lh0 > 0
+        elif mode == 5: cond = long_cross_up and short_cross_up
+        elif mode == 6: cond = both_bear_0 and (not both_bear_1)
+        elif mode == 7: cond = long_cross_down and short_cross_down
+        elif mode == 8: cond = both_bull_0 and (not both_bull_1)
+        else:           cond = False
+        if not cond:
+            return None
+
+        close_px = c.iloc[-1]
+        prev     = c.iloc[-2]
+        chg = round((close_px / prev - 1) * 100, 2) if prev > 0 else 0.0
+        return {
+            "종목코드":     code,
+            "종가":        int(round(close_px)),
+            "전일대비(%)": chg,
+            "장기Hist":    round(lh0, 2),
+            "단기Hist":    round(sh0, 2),
+            "장기MACD":    round(lm0, 2),
+            "단기MACD":    round(sm0, 2),
+        }
+    except Exception:
+        return None
+
+
+def run_screen65(date_str, prog):
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    mode    = int(_state[65].get("find_mode", 1))
+    start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
+    listing = _get_listing_with_progress(prog)
+    valid   = listing[
+        (listing["Marcap"] >= _S65_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False)) &
+        (~listing["Name"].str.contains(r"ETN|ETF", case=False, na=False, regex=True))
+    ].copy()
+    prog["total"] = len(valid); prog["status"] = "running"
+    rows = _run_screen_parallel(valid, _screen65_ticker, start, date_str, prog)
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["검색모드"] = f"{mode}. {_S65_MODE_LABEL.get(mode, '')}"
+    return (df[["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+                "장기Hist", "단기Hist", "장기MACD", "단기MACD", "검색모드"]]
+            .sort_values("전일대비(%)", ascending=False)
+            .reset_index(drop=True))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건66: 60분더블MACD (조건65 모드1을 60분봉에서 · 시총 1조↑ · 0/1/2봉전 표시)
+# ══════════════════════════════════════════════════════════════════════════════
+_S66_MIN_CAP  = 1_000_000_000_000        # 시가총액 1조 이상
+_S66_MIN_BARS = 15                        # 최소 60분봉 개수
+
+
+def _fetch_60m_close(code, date_str):
+    """네이버 분봉 API로 1분봉을 받아 60분봉 종가 시리즈로 리샘플. (무료 데이터 = 최근 ~7거래일 한도)"""
+    try:
+        end   = datetime.strptime(date_str, "%Y%m%d")
+        start = end - timedelta(days=20)
+        url = (f"https://api.stock.naver.com/chart/domestic/item/{code}/minute"
+               f"?startDateTime={start:%Y%m%d}0900&endDateTime={date_str}1530")
+        r = _req.get(url, headers={"User-Agent": "Mozilla/5.0",
+                                   "Referer": "https://m.stock.naver.com/"}, timeout=8)
+        d = json.loads(r.text)
+        if not d:
+            return None
+        df = pd.DataFrame(d)
+        df["dt"] = pd.to_datetime(df["localDateTime"], format="%Y%m%d%H%M%S")
+        df = df.set_index("dt").sort_index()
+        c = (pd.to_numeric(df["currentPrice"], errors="coerce")
+             .resample("60min").last().dropna())
+        return c if len(c) >= _S66_MIN_BARS else None
+    except Exception:
+        return None
+
+
+def _screen66_ticker(code, start, end):
+    """[게이트] 일봉 장기 히스토그램(21,55,9) > 0 AND
+    [신호] 조건65 모드1(LongHist≥0 + 단기Hist 0선 상향돌파)을 60분봉에서 판정.
+    최근 3봉(0/1/2봉전) 각각 신호 여부 반환."""
+    try:
+        # ── 게이트: 일봉 장기 MACD 히스토그램 > 0 (양성일 때만 통과) ──
+        dd = fetch_ohlcv(code, start, end)
+        if dd is None or len(dd) < 60:
+            return None
+        dc = dd["Close"].astype(float)
+        d_lmacd = ema(dc, 21) - ema(dc, 55)
+        d_lhist = d_lmacd - ema(d_lmacd, 9)
+        daily_long_hist = float(d_lhist.iloc[-1])
+        if daily_long_hist <= 0:
+            return None
+
+        # ── 신호: 60분봉 모드1 ──
+        c = _fetch_60m_close(code, end)        # end == date_str
+        if c is None:
+            return None
+        # 장기 MACD(21,55,9) · 단기 MACD(5,13,6) — 종가만 사용
+        lmacd = ema(c, 21) - ema(c, 55); lsig = ema(lmacd, 9); lhist = lmacd - lsig
+        smacd = ema(c, 5)  - ema(c, 13); ssig = ema(smacd, 6); shist = smacd - ssig
+        n = len(c)
+
+        def mode1_at(i):                        # i: 현재봉의 음수 인덱스 (-1=0봉전)
+            if n + i - 1 < 0:
+                return False
+            lh  = float(lhist.iloc[i])
+            sh  = float(shist.iloc[i])
+            shp = float(shist.iloc[i - 1])
+            return (lh >= 0) and (shp <= 0 and sh > 0)   # LongHist≥0 + 단기Hist 0선 상향돌파
+
+        b0, b1, b2 = mode1_at(-1), mode1_at(-2), mode1_at(-3)
+        if not (b0 or b1 or b2):
+            return None
+        recent = 0 if b0 else (1 if b1 else 2)  # 가장 최근 신호봉 (정렬용)
+        return {
+            "종목코드":    code,
+            "60분종가":    int(round(float(c.iloc[-1]))),
+            "일봉롱Hist":  round(daily_long_hist, 2),
+            "0봉전":       "✓" if b0 else "",
+            "1봉전":       "✓" if b1 else "",
+            "2봉전":       "✓" if b2 else "",
+            "장기Hist":    round(float(lhist.iloc[-1]), 2),
+            "단기Hist":    round(float(shist.iloc[-1]), 2),
+            "_최근신호":    recent,
+        }
+    except Exception:
+        return None
+
+
+def run_screen66(date_str, prog):
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    listing = _get_listing_with_progress(prog)
+    valid   = listing[
+        (listing["Marcap"] >= _S66_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False)) &
+        (~listing["Name"].str.contains(r"ETN|ETF", case=False, na=False, regex=True))
+    ].copy()
+    start = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
+    prog["total"] = len(valid); prog["status"] = "running"
+    rows = _run_screen_parallel(valid, _screen66_ticker, start, date_str, prog)
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = (pd.DataFrame(rows)
+          .sort_values(["_최근신호", "시총(억)"], ascending=[True, False])
+          .reset_index(drop=True))
+    return df[["시장", "종목코드", "종목명", "시총(억)", "60분종가", "일봉롱Hist",
+               "0봉전", "1봉전", "2봉전", "장기Hist", "단기Hist"]]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건67: 주봉더블MACD (조건65를 주봉으로 계산 · 8모드 · 시총 3천억↑)
+# ══════════════════════════════════════════════════════════════════════════════
+_S67_MIN_CAP       = 300_000_000_000       # 시가총액 3천억 이상
+_S67_LOOKBACK_DAYS = 1400                  # 주봉 EMA(55) 확보용 (~200주)
+
+
+def _double_macd_eval(c, mode):
+    """종가 시리즈 c에 장기(21,55,9)·단기(5,13,6) MACD를 적용, mode(1~8) 충족 여부와 지표 반환.
+    반환: (cond: bool, dict) — dict는 장기/단기 Hist·MACD 최신값."""
+    lmacd = ema(c, 21) - ema(c, 55); lsig = ema(lmacd, 9); lhist = lmacd - lsig
+    smacd = ema(c, 5)  - ema(c, 13); ssig = ema(smacd, 6); shist = smacd - ssig
+    lh0, lh1   = float(lhist.iloc[-1]), float(lhist.iloc[-2])
+    sh0, sh1   = float(shist.iloc[-1]), float(shist.iloc[-2])
+    lm0, lm1   = float(lmacd.iloc[-1]), float(lmacd.iloc[-2])
+    lsg0, lsg1 = float(lsig.iloc[-1]),  float(lsig.iloc[-2])
+    sm0, sm1   = float(smacd.iloc[-1]), float(smacd.iloc[-2])
+    ssg0, ssg1 = float(ssig.iloc[-1]),  float(ssig.iloc[-2])
+
+    long_cross_up    = lm1 <= lsg1 and lm0 >  lsg0
+    short_cross_up   = sm1 <= ssg1 and sm0 >  ssg0
+    long_cross_down  = lm1 >= lsg1 and lm0 <  lsg0
+    short_cross_down = sm1 >= ssg1 and sm0 <  ssg0
+    short_zero_up    = sh1 <= 0    and sh0 >  0
+    long_hist_rising = lh0 > lh1
+    both_bull_0 = lh0 > 0 and sh0 > 0
+    both_bull_1 = lh1 > 0 and sh1 > 0
+    both_bear_0 = lh0 < 0 and sh0 < 0
+    both_bear_1 = lh1 < 0 and sh1 < 0
+
+    if   mode == 1: cond = lh0 >= 0 and short_zero_up
+    elif mode == 2: cond = long_hist_rising and short_zero_up
+    elif mode == 3: cond = long_cross_up and sh0 > 0
+    elif mode == 4: cond = short_cross_up and lh0 > 0
+    elif mode == 5: cond = long_cross_up and short_cross_up
+    elif mode == 6: cond = both_bear_0 and (not both_bear_1)
+    elif mode == 7: cond = long_cross_down and short_cross_down
+    elif mode == 8: cond = both_bull_0 and (not both_bull_1)
+    else:           cond = False
+    return cond, {"장기Hist": round(lh0, 2), "단기Hist": round(sh0, 2),
+                  "장기MACD": round(lm0, 2), "단기MACD": round(sm0, 2)}
+
+
+def _screen67_ticker(code, start, end):
+    """조건65의 8모드를 주봉으로 판정 (최신 주봉 기준)."""
+    try:
+        mode = int(_state[67].get("find_mode", 1))
+        df = fetch_ohlcv(code, start, end)
+        if df is None or len(df) < 300:
+            return None
+        dfw = _resample_weekly(df)
+        c = dfw["Close"].astype(float)
+        if len(c) < 60:
+            return None
+        cond, ind = _double_macd_eval(c, mode)
+        if not cond:
+            return None
+        close_px = c.iloc[-1]; prev = c.iloc[-2]
+        chg = round((close_px / prev - 1) * 100, 2) if prev > 0 else 0.0
+        return {
+            "종목코드":   code,
+            "주봉종가":   int(round(float(close_px))),
+            "주봉대비(%)": chg,
+            "장기Hist":   ind["장기Hist"],
+            "단기Hist":   ind["단기Hist"],
+            "장기MACD":   ind["장기MACD"],
+            "단기MACD":   ind["단기MACD"],
+            "봉주기":     "주봉",
+        }
+    except Exception:
+        return None
+
+
+def run_screen67(date_str, prog):
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    mode    = int(_state[67].get("find_mode", 1))
+    start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=_S67_LOOKBACK_DAYS)).strftime("%Y%m%d")
+    listing = _get_listing_with_progress(prog)
+    valid   = listing[
+        (listing["Marcap"] >= _S67_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False)) &
+        (~listing["Name"].str.contains(r"ETN|ETF", case=False, na=False, regex=True))
+    ].copy()
+    prog["total"] = len(valid); prog["status"] = "running"
+    rows = _run_screen_parallel(valid, _screen67_ticker, start, date_str, prog)
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["검색모드"] = f"{mode}. {_S65_MODE_LABEL.get(mode, '')}"
+    return (df[["시장", "종목코드", "종목명", "시총(억)", "주봉종가", "주봉대비(%)",
+                "장기Hist", "단기Hist", "장기MACD", "단기MACD", "봉주기", "검색모드"]]
+            .sort_values("주봉대비(%)", ascending=False)
+            .reset_index(drop=True))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건68: 황금이 (일봉 · 이격도(EMA5/20) 크로스업 + MA상승 + 양봉 3조건 중 2개↑ · 시총 3천억↑)
+# ══════════════════════════════════════════════════════════════════════════════
+_S68_MIN_CAP = 300_000_000_000            # 시가총액 3천억 이상
+
+
+def _screen68_ticker(code, start, end):
+    """가격=종가 · 기간1=5, 기간2=20 · 종류=지수이동평균(EMA)
+       이격도 D5=C/EMA5×100, D20=C/EMA20×100 · DC=CrossUp(D20,D5)
+       ① DC & 양봉  ② M5·M20 강상승 + DC & 양봉 (첫봉)  ③ M5·M20 상승 + DC & 양봉 (첫봉)
+       3조건 중 2개 이상 충족 시 선정."""
+    try:
+        df = fetch_ohlcv(code, start, end)
+        if df is None or len(df) < 40:
+            return None
+        c = df["Close"].astype(float)
+        o = df["Open"].astype(float)
+        ema5, ema20 = ema(c, 5), ema(c, 20)
+        D5  = c / ema5  * 100.0
+        D20 = c / ema20 * 100.0
+        M5  = c.rolling(5).mean()
+        M20 = c.rolling(20).mean()
+
+        def v(s, i): return float(s.iloc[i])
+        def DC(i):                              # CrossUp(D20, D5): D20이 D5를 상향 돌파
+            return (v(D20, i-1) <= v(D5, i-1)) and (v(D20, i) > v(D5, i))
+        def bull(i): return v(c, i) > v(o, i)   # 양봉 C>O
+
+        def cond1(i):
+            return DC(i) and bull(i)
+        def cond2_raw(i):
+            return (v(M5, i) > v(M5, i-1) and v(M5, i) >= v(M5, i-2) and
+                    v(M20, i) > v(M20, i-1) and v(M20, i) >= v(M20, i-2) and
+                    DC(i) and bull(i))
+        def cond3_raw(i):
+            return (v(M5, i) > v(M5, i-1) and v(M20, i) > v(M20, i-1) and
+                    DC(i) and bull(i))
+
+        c1 = cond1(-1)
+        c2 = cond2_raw(-1) and (not cond2_raw(-2))    # 조건 && !조건(1)
+        c3 = cond3_raw(-1) and (not cond3_raw(-2))    # 조건 && !조건(1)
+        cnt = int(c1) + int(c2) + int(c3)
+        if cnt < 2:
+            return None
+
+        close_px = v(c, -1); prev = v(c, -2)
+        chg = round((close_px / prev - 1) * 100, 2) if prev > 0 else 0.0
+        sat = []
+        if c1: sat.append("①")
+        if c2: sat.append("②")
+        if c3: sat.append("③")
+        return {
+            "종목코드":   code,
+            "종가":      int(round(close_px)),
+            "전일대비(%)": chg,
+            "이격도5":    round(v(D5, -1), 2),
+            "이격도20":   round(v(D20, -1), 2),
+            "충족조건":   " ".join(sat),
+            "충족수":     cnt,
+        }
+    except Exception:
+        return None
+
+
+def run_screen68(date_str, prog):
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
+    listing = _get_listing_with_progress(prog)
+    valid   = listing[
+        (listing["Marcap"] >= _S68_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False)) &
+        (~listing["Name"].str.contains(r"ETN|ETF", case=False, na=False, regex=True))
+    ].copy()
+    prog["total"] = len(valid); prog["status"] = "running"
+    rows = _run_screen_parallel(valid, _screen68_ticker, start, date_str, prog)
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    return (pd.DataFrame(rows)
+            [["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+              "이격도5", "이격도20", "충족조건", "충족수"]]
+            .sort_values(["충족수", "전일대비(%)"], ascending=[False, False])
+            .reset_index(drop=True))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건69: 변동회귀선다이버전스
+#   시총 3천억↑ · 일봉 양봉 · 60분봉 VL(변동회귀선)이 주가 아래 · 주가가 VL 위 4봉 이상 연속
+#   60분봉 데이터: 야후(yfinance) — 한국종목 시간봉 최대 ~730일 제공
+# ══════════════════════════════════════════════════════════════════════════════
+_S69_MIN_CAP  = 1_000_000_000_000    # 시가총액 1조 이상
+_S69_MIN_RUN  = 4              # 주가가 VL 위에 연속으로 있어야 하는 최소 봉수
+_S69_MKT      = {}             # code -> Market (야후 접미사 판별용)
+
+
+def _fetch_60m_yahoo(code, market, end_date):
+    """야후 시간봉(60분) 종가 시리즈. KOSPI→.KS, KOSDAQ→.KQ."""
+    try:
+        import yfinance as yf
+        suffix = ".KQ" if market == "KOSDAQ" else ".KS"
+        end   = datetime.strptime(end_date, "%Y%m%d") + timedelta(days=1)
+        start = end - timedelta(days=120)
+        h = yf.Ticker(f"{code}{suffix}").history(
+            start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"),
+            interval="60m", auto_adjust=False)
+        if h is None or h.empty or "Close" not in h.columns:
+            return None
+        return h["Close"].astype(float).dropna()
+    except Exception:
+        return None
+
+
+def _screen69_ticker(code, start, end):
+    try:
+        # ⓪ [선행] 일봉: 양봉 + MA200 위 & MA200 상승 + 더블MACD 장기 히스토그램(21,55,9) ≥ 0
+        dd = fetch_ohlcv(code, start, end)
+        if dd is None or len(dd) < 201:
+            return None
+        d_close = float(dd["Close"].iloc[-1]); d_open = float(dd["Open"].iloc[-1])
+        if not (d_close > d_open):                 # 일봉 양봉
+            return None
+        dc_s = dd["Close"].astype(float)
+        ma200 = dc_s.rolling(200).mean()           # 일봉 MA200 (단순이동평균)
+        m200_0, m200_1 = ma200.iloc[-1], ma200.iloc[-2]
+        if pd.isna(m200_0) or pd.isna(m200_1):
+            return None
+        if not (d_close > float(m200_0)):          # 종가가 MA200 위
+            return None
+        if not (float(m200_0) > float(m200_1)):    # MA200 상승중
+            return None
+        d_lmacd = ema(dc_s, 21) - ema(dc_s, 55)
+        d_lhist = d_lmacd - ema(d_lmacd, 9)        # 일봉 LongHist
+        daily_long_hist = float(d_lhist.iloc[-1])
+        if daily_long_hist < 0:                    # LongHist ≥ 0 만족 종목만
+            return None
+
+        # ② 60분봉 변동회귀선(VL) — 주가가 VL 위 4봉 이상 연속
+        c60 = _fetch_60m_yahoo(code, _S69_MKT.get(code, "KOSPI"), end)
+        if c60 is None or len(c60) < LR_PERIOD * 2 + 10:
+            return None
+        A  = linreg(c60, LR_PERIOD)
+        A1 = linreg(A,   LR_PERIOD)
+        vl = A + (A - A1)                         # VL = 2·linreg(C,50) − linreg(linreg(C,50),50)
+
+        # VL이 최근 2봉 연속 하락 (전전봉 > 전봉 > 현재봉)
+        v0, v1, v2 = vl.iloc[-1], vl.iloc[-2], vl.iloc[-3]
+        if pd.isna(v0) or pd.isna(v1) or pd.isna(v2):
+            return None
+        if not (float(v0) < float(v1) < float(v2)):
+            return None
+
+        run = 0                                    # 최근부터 연속으로 Close > VL 인 봉수
+        for i in range(len(c60) - 1, -1, -1):
+            vi = vl.iloc[i]
+            if pd.notna(vi) and float(c60.iloc[i]) > float(vi):
+                run += 1
+            else:
+                break
+        if run < _S69_MIN_RUN:
+            return None
+
+        px = float(c60.iloc[-1]); vlast = float(vl.iloc[-1])
+        return {
+            "종목코드":    code,
+            "일봉종가":    int(round(d_close)),
+            "일봉대비(%)": round((d_close / d_open - 1) * 100, 2),
+            "일봉롱Hist":  round(daily_long_hist, 2),
+            "MA200":       int(round(float(m200_0))),
+            "60분종가":    int(round(px)),
+            "60분VL":      int(round(vlast)),
+            "VL이격(%)":   round((px / vlast - 1) * 100, 2),
+            "유지봉수":    run,
+        }
+    except Exception:
+        return None
+
+
+def run_screen69(date_str, prog):
+    global _S69_MKT
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
+    listing = _get_listing_with_progress(prog)
+    valid   = listing[
+        (listing["Marcap"] >= _S69_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False)) &
+        (~listing["Name"].str.contains(r"ETN|ETF", case=False, na=False, regex=True))
+    ].copy()
+    _S69_MKT = {str(r["Code"]).zfill(6): r["Market"] for _, r in valid.iterrows()}
+    prog["total"] = len(valid); prog["status"] = "running"
+
+    # 야후 시간봉은 과다 동시요청 시 제한될 수 있어 워커 8로 완만하게
+    rows = []; lock = threading.Lock(); cnt = [0]
+    def _job(row):
+        code = str(row["Code"]).zfill(6)
+        res  = _screen69_ticker(code, start, date_str)
+        with lock:
+            cnt[0] += 1; prog["current"] = cnt[0]
+            if res is not None:
+                res["종목명"]   = row["Name"]
+                res["시총(억)"] = int(row["Marcap"]) // 100_000_000
+                res["시장"]     = row["Market"]
+                rows.append(res)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(_job, (row for _, row in valid.iterrows())))
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    return (pd.DataFrame(rows)
+            [["시장", "종목코드", "종목명", "시총(억)", "일봉종가", "일봉대비(%)", "일봉롱Hist", "MA200",
+              "60분종가", "60분VL", "VL이격(%)", "유지봉수"]]
+            .sort_values(["유지봉수", "VL이격(%)"], ascending=[False, False])
+            .reset_index(drop=True))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건70: 더블STOCHASTIC (일봉 · SMA20 우상향 + slow%K≥70 + fast%K≤30 · 시총 3천억↑)
+#   fast:  StochasticsFast(5)                         → fast %K = raw stochastic(5)
+#   slow:  Stochasticsslow(12,5)                      → slow %K = SMA(raw stochastic(12), 5)
+# ══════════════════════════════════════════════════════════════════════════════
+_S70_MIN_CAP = 300_000_000_000            # 시가총액 3천억 이상
+
+
+def _stoch_rawk(df, n):
+    """raw stochastic %K = (C − LL(n)) / (HH(n) − LL(n)) × 100"""
+    ll = df["Low"].rolling(n).min()
+    hh = df["High"].rolling(n).max()
+    rng = (hh - ll).replace(0, np.nan)
+    return (df["Close"] - ll) / rng * 100.0
+
+
+def _screen70_ticker(code, start, end):
+    try:
+        df = fetch_ohlcv(code, start, end)
+        if df is None or len(df) < 40:
+            return None
+        c = df["Close"].astype(float)
+        sma20 = c.rolling(20).mean()
+        fast_k = _stoch_rawk(df, 5)               # StochasticsFast(5)
+        slow_k = _stoch_rawk(df, 12).rolling(5).mean()   # Stochasticsslow(12,5): SMA(rawK12, 5)
+
+        s0, s1 = sma20.iloc[-1], sma20.iloc[-2]
+        fk = fast_k.iloc[-1]; sk = slow_k.iloc[-1]
+        if pd.isna(s0) or pd.isna(s1) or pd.isna(fk) or pd.isna(sk):
+            return None
+        if not (float(s0) > float(s1)):           # ① SMA20 우상향
+            return None
+        if not (float(sk) >= 70.0):               # ② slow %K ≥ 70
+            return None
+        if not (float(fk) <= 30.0):               # ③ fast %K ≤ 30
+            return None
+
+        close_px = float(c.iloc[-1]); prev = float(c.iloc[-2])
+        chg = round((close_px / prev - 1) * 100, 2) if prev > 0 else 0.0
+        return {
+            "종목코드":    code,
+            "종가":       int(round(close_px)),
+            "전일대비(%)": chg,
+            "SMA20":      int(round(float(s0))),
+            "fast%K":     round(float(fk), 1),
+            "slow%K":     round(float(sk), 1),
+        }
+    except Exception:
+        return None
+
+
+def run_screen70(date_str, prog):
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
+    listing = _get_listing_with_progress(prog)
+    valid   = listing[
+        (listing["Marcap"] >= _S70_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False)) &
+        (~listing["Name"].str.contains(r"ETN|ETF", case=False, na=False, regex=True))
+    ].copy()
+    prog["total"] = len(valid); prog["status"] = "running"
+    rows = _run_screen_parallel(valid, _screen70_ticker, start, date_str, prog)
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    return (pd.DataFrame(rows)
+            [["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+              "SMA20", "fast%K", "slow%K"]]
+            .sort_values("fast%K", ascending=True)
+            .reset_index(drop=True))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 조건71: 세력평균20돌파 (일봉 · 세력20평균선이 5일↑ 하락 중 종가가 상향돌파 · 시총 3천억↑)
+#   세력캔들 : V > 1.5×MA(V,60) AND C>O 인 봉의 (C+O)/2
+#   세력평단  : 세력캔들 값 (없는 날은 직전 세력캔들 값 유지 = valuewhen)
+#   세력20평균: 지수평균(세력평단, 20)
+# ══════════════════════════════════════════════════════════════════════════════
+_S71_MIN_CAP   = 300_000_000_000          # 시가총액 3천억 이상
+_S71_DROP_DAYS = 5                        # 세력20평균 최소 연속 하락일수
+
+
+def _screen71_ticker(code, start, end):
+    try:
+        df = fetch_ohlcv(code, start, end)
+        if df is None or len(df) < 90:
+            return None
+        df = df[df["Close"] > 0].dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        if len(df) < 90:
+            return None
+        c = df["Close"].astype(float)
+        o = df["Open"].astype(float)
+        v = df["Volume"].astype(float)
+        volma60 = v.rolling(60).mean()
+
+        # 세력캔들 = (거래량 > 1.5×MA(V,60)) AND 양봉 → (시가+종가)/2, 아니면 직전값 유지
+        mask   = (v > 1.5 * volma60) & (c > o)
+        half   = (c + o) / 2.0
+        kandle = half.where(mask).ffill()          # valuewhen(1, mask, (C+O)/2)
+        avg    = kandle.ewm(span=20, adjust=False).mean()   # 세력20평균 = 지수평균(세력평단, 20)
+
+        if pd.isna(avg.iloc[-1]) or pd.isna(avg.iloc[-2]):
+            return None
+
+        # ① 세력20평균이 오늘까지 5일 이상 연속 하락
+        drop = 0
+        for i in range(len(avg) - 1, 0, -1):
+            a0, a1 = avg.iloc[i], avg.iloc[i - 1]
+            if pd.notna(a0) and pd.notna(a1) and float(a0) < float(a1):
+                drop += 1
+            else:
+                break
+        if drop < _S71_DROP_DAYS:
+            return None
+
+        # ② 종가가 세력20평균을 오늘 상향돌파 (전일 종가 ≤ 전일 평균 → 금일 종가 > 금일 평균)
+        c0, c1   = float(c.iloc[-1]), float(c.iloc[-2])
+        a0v, a1v = float(avg.iloc[-1]), float(avg.iloc[-2])
+        if not (c1 <= a1v and c0 > a0v):
+            return None
+
+        prev = float(c.iloc[-2])
+        chg  = round((c0 / prev - 1) * 100, 2) if prev > 0 else 0.0
+        return {
+            "종목코드":   code,
+            "종가":      int(round(c0)),
+            "전일대비(%)": chg,
+            "세력평단":   int(round(float(kandle.iloc[-1]))),
+            "세력20선":   int(round(a0v)),
+            "평균대비(%)": round((c0 / a0v - 1) * 100, 2),
+            "하락일수":   drop,
+        }
+    except Exception:
+        return None
+
+
+def run_screen71(date_str, prog):
+    prog.update({"current": 0, "total": 0, "status": "loading"})
+    start   = (datetime.strptime(date_str, "%Y%m%d") - timedelta(days=LOOKBACK)).strftime("%Y%m%d")
+    listing = _get_listing_with_progress(prog)
+    valid   = listing[
+        (listing["Marcap"] >= _S71_MIN_CAP) &
+        (~listing["Market"].isin(["ETF", "ETN"])) &
+        (~listing["Name"].str.match(_ETF_NAME_RE, na=False)) &
+        (~listing["Name"].str.contains(r"ETN|ETF", case=False, na=False, regex=True))
+    ].copy()
+    prog["total"] = len(valid); prog["status"] = "running"
+    rows = _run_screen_parallel(valid, _screen71_ticker, start, date_str, prog)
+    prog["status"] = "done"
+    if not rows:
+        return pd.DataFrame()
+    return (pd.DataFrame(rows)
+            [["시장", "종목코드", "종목명", "시총(억)", "종가", "전일대비(%)",
+              "세력평단", "세력20선", "평균대비(%)", "하락일수"]]
+            .sort_values(["하락일수", "평균대비(%)"], ascending=[False, False])
+            .reset_index(drop=True))
+
+
+# ── 한투 신호봇 실시간 감시 루프 (실주문 없음, 이메일 알림) ──────────────────
+_hantoo_state = {"running": False, "date": "", "trades_today": 0,
+                 "active": None, "history": [], "scan_no": 0,
+                 "last_scan": "", "next_scan": "", "msg": "대기",
+                 "final_done": False}
+
+
+def _hantoo_market_open(now):
+    if now.weekday() >= 5:
+        return False
+    return _S64_MKT_OPEN <= (now.hour, now.minute) <= _S64_MKT_CLOSE
+
+
+def _hantoo_current_price(code, date_str):
+    end = pd.Timestamp(date_str)
+    start = (end - pd.Timedelta(days=10)).strftime("%Y%m%d")
+    df = fetch_ohlcv(code, start, end.strftime("%Y%m%d"))
+    if df is None or df.empty:
+        return None
+    return float(df["Close"].astype(float).iloc[-1])
+
+
+def _hantoo_alert_entry(sig, n):
+    body = "\n".join([
+        f"[한투 신호봇] 진입 신호 #{n}/{_S64_MAX_TRADES} — {datetime.now():%Y-%m-%d %H:%M:%S}",
+        "⚠️ 실주문 없음 — 아래 신호를 참고해 직접 주문하세요.", "",
+        f"종목    : {sig['종목명']} ({sig['종목코드']}) · {sig['시장']}",
+        f"테마    : {sig['테마']} (0봉전 클러스터 {sig['클러스터']}종목)",
+        f"시가총액: {sig['시총(억)']:,}억", "",
+        f"진입가  : {sig['진입가']:,}원",
+        f"수량    : {sig['수량']:,}주  (매수 {sig['매수금액']:,}원)",
+        f"ATR(14) : {sig['ATR14']:,}",
+        f"손절가  : {sig['손절가']:,}원  (진입 −1.5 ATR)",
+        f"익절가  : {sig['익절가']:,}원  (진입 +3 ATR)",
+    ])
+    _send_email_alert(f"[한투] 진입신호 {sig['종목명']} {sig['진입가']:,}원", body)
+    print(f"[HANTOO] 진입신호 이메일 → {sig['종목명']}")
+
+
+def _hantoo_alert_sell(sig, px, kind):
+    body = "\n".join([
+        f"[한투 신호봇] {kind} 청산 신호 — {datetime.now():%Y-%m-%d %H:%M:%S}",
+        "⚠️ 실주문 없음 — 직접 100% 시장가 청산 검토하세요.", "",
+        f"종목    : {sig['종목명']} ({sig['종목코드']})",
+        f"진입가  : {sig['진입가']:,}원",
+        f"현재가  : {int(round(px)):,}원",
+        f"{kind}선 : {sig['손절가'] if kind=='손절' else sig['익절가']:,}원",
+        f"수량    : {sig['수량']:,}주 (100% 청산)",
+    ])
+    _send_email_alert(f"[한투] {kind} 청산 {sig['종목명']} {int(round(px)):,}원", body)
+    print(f"[HANTOO] {kind} 청산 이메일 → {sig['종목명']}")
+
+
+def _run_hantoo():
+    st = _hantoo_state
+    print("[HANTOO] 신호봇 시작")
+    while st["running"]:
+        now = datetime.now()
+        today = now.strftime("%Y%m%d")
+        if st["date"] != today:                       # 날짜 롤오버 초기화
+            st.update({"date": today, "trades_today": 0, "active": None,
+                       "history": [], "final_done": False})
+
+        is_wd      = now.weekday() < 5
+        past_close = (now.hour, now.minute) >= _S64_MKT_CLOSE     # 15:30 이후
+        do_scan    = _hantoo_market_open(now) or (is_wd and past_close and not st["final_done"])
+
+        if do_scan:
+            st["scan_no"] += 1
+            st["last_scan"] = now.strftime("%H:%M:%S")
+            st["msg"] = "장 마감(15:30) 최종 검색 중" if past_close else "감시 중"
+            try:
+                # ① 활성 신호 손절/익절 모니터
+                act = st["active"]
+                if act:
+                    px = _hantoo_current_price(act["종목코드"], today)
+                    if px is not None:
+                        if px <= act["손절가"]:
+                            _hantoo_alert_sell(act, px, "손절"); st["active"] = None
+                        elif px >= act["익절가"]:
+                            _hantoo_alert_sell(act, px, "익절"); st["active"] = None
+                # ② 진입 신호 (하루 3회 · 활성 없을 때)
+                if st["trades_today"] < _S64_MAX_TRADES and st["active"] is None:
+                    sig = _hantoo_detect(today)
+                    if sig and sig["종목코드"] not in {h["종목코드"] for h in st["history"]}:
+                        st["active"] = sig
+                        st["trades_today"] += 1
+                        st["history"].append(sig)
+                        _hantoo_alert_entry(sig, st["trades_today"])
+            except Exception as e:
+                print(f"[HANTOO] 오류: {e}")
+
+            # ③ 15:30 이후의 이번 스캔이 오늘 마지막 → 최종검색 후 자동 종료
+            if is_wd and past_close:
+                st["final_done"] = True
+                st["next_scan"]  = ""
+                st["msg"] = "장 마감(15:30) · 최종 검색 완료 — 오늘 감시 종료"
+                st["running"] = False
+                print("[HANTOO] 15:30 최종 검색 완료 → 오늘 자동 종료")
+                break
+        else:
+            st["msg"] = ("오늘 감시 종료 (내일 재시작)" if (is_wd and st["final_done"])
+                         else "장 시간 외 대기 (월~금 09:00~15:30)")
+
+        st["next_scan"] = (datetime.now() + timedelta(seconds=_S64_INTERVAL_SEC)).strftime("%H:%M:%S")
+        for _ in range(_S64_INTERVAL_SEC):
+            if not st["running"]:
+                break
+            n2 = datetime.now()
+            # 15:30 도달 시 즉시 최종검색을 위해 대기 중단
+            if n2.weekday() < 5 and (n2.hour, n2.minute) >= _S64_MKT_CLOSE and not st["final_done"]:
+                break
+            time.sleep(1)
+    if not st["final_done"]:            # 수동 중지: '중지됨' / 15:30 자동종료: 완료 메시지 유지
+        st["msg"] = "중지됨"
+    st["next_scan"] = ""
+    print("[HANTOO] 신호봇 종료")
+
+
 _rt46_scan_no      = 0
 _rt46_scan_start   = ""
 _rt46_last_scan    = ""
@@ -7098,7 +9962,8 @@ MAX_CAP_35 = 20_000_000_000_000     # 조건35 시총 상한: 20조 미만
 # FDR listing 에서 ETF가 Market='KOSPI'로 들어오는 경우 이름 패턴으로 추가 제외
 _ETF_NAME_RE = _re.compile(
     r'^(TIGER|KODEX|KBSTAR|HANARO|KOSEF|ARIRANG|ACE|SOL|TIMEFOLIO|SMART|MASTER|'
-    r'PLUS|TREX|GIANT|PIONEER|KTOP|KINDEX|파워|KoAct|WON|FOCUS|BOOKOO|LAVIE)',
+    r'PLUS|TREX|GIANT|PIONEER|KTOP|KINDEX|파워|KoAct|WON|FOCUS|BOOKOO|LAVIE|'
+    r'RISE|히어로즈|마이티|UNICORN|1Q|VITA|KIWOOM|키움)',
     _re.IGNORECASE
 )
 
@@ -8486,7 +11351,14 @@ RUNNER = {1: run_screen1,  2: run_screen2,  3: run_screen3,
           40: run_screen40, 41: run_screen41, 42: run_screen42,
           43: run_screen43, 44: run_screen44, 45: run_screen45,
           46: run_screen46, 47: run_screen47, 48: run_screen48,
-          49: run_screen49, 50: run_screen50, 51: run_screen51}
+          49: run_screen49, 50: run_screen50, 51: run_screen51,
+          52: run_screen52, 53: run_screen53, 54: run_screen54,
+          55: run_screen55, 56: run_screen56, 57: run_screen57,
+          58: run_screen58, 59: run_screen59, 60: run_screen60,
+          61: run_screen61, 62: run_screen62, 63: run_screen63,
+          64: run_screen64, 65: run_screen65, 66: run_screen66,
+          67: run_screen67, 68: run_screen68, 69: run_screen69,
+          70: run_screen70, 71: run_screen71}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -8789,6 +11661,203 @@ function renderResult(date,rows){
     `<span class="badge b1">기준일: ${date}</span>`+
     `<span class="badge b2">총 ${rows.length}개</span>`;
 
+  // 조건71 세력평균20돌파 (하락일수 컬럼 존재 여부로 판별)
+  if(rows.length && '하락일수' in rows[0]){
+    document.getElementById('summary').innerHTML+=
+      `<span class="badge b3" style="color:#fb7185">🧲 세력20평균 5일↑ 하락 중 종가 상향돌파</span>`;
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th><th>세력평단</th><th>세력20선</th><th>평균대비(%)</th><th>하락일수</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:#8b8fa8">${Number(r['세력평단']).toLocaleString()}</td>
+        <td style="color:#fb7185;font-weight:700">${Number(r['세력20선']).toLocaleString()}</td>
+        <td class="pos" style="font-weight:700">+${r['평균대비(%)']}%</td>
+        <td style="color:#fbbf24;font-weight:800;text-align:center">${r['하락일수']}일</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건70 더블STOCHASTIC (slow%K 컬럼 존재 여부로 판별)
+  if(rows.length && 'slow%K' in rows[0]){
+    document.getElementById('summary').innerHTML+=
+      `<span class="badge b3" style="color:#e879f9">🎲 SMA20↑ · Slow%K≥70 · Fast%K≤30</span>`;
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th><th>SMA20</th><th>Fast %K</th><th>Slow %K</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:#8b8fa8">${Number(r['SMA20']).toLocaleString()}</td>
+        <td style="color:#60a5fa;font-weight:800">${r['fast%K']}</td>
+        <td style="color:#f472b6;font-weight:800">${r['slow%K']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건69 변동회귀선다이버전스 (유지봉수 컬럼 존재 여부로 판별)
+  if(rows.length && '유지봉수' in rows[0]){
+    document.getElementById('summary').innerHTML+=
+      `<span class="badge b3" style="color:#10b981">🪞 일봉 양봉·MA200↑위·롱Hist≥0 + 60분 VL 2봉연속↓·주가 VL위 4봉↑</span>`;
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>일봉종가</th><th>일봉대비(%)</th><th>일봉롱Hist</th><th>MA200</th><th>60분종가</th><th>60분VL</th><th>VL이격(%)</th><th>유지봉수</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dh=Number(r['일봉롱Hist']);
+      const run=Number(r['유지봉수']);
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['일봉종가']).toLocaleString()}</td>
+        <td class="pos">+${r['일봉대비(%)']}%</td>
+        <td style="color:${dh>=0?'#4ade80':'#f87171'};font-weight:700">${r['일봉롱Hist']}</td>
+        <td style="color:#8b8fa8">${Number(r['MA200']).toLocaleString()}</td>
+        <td>${Number(r['60분종가']).toLocaleString()}</td>
+        <td style="color:#10b981">${Number(r['60분VL']).toLocaleString()}</td>
+        <td class="pos" style="font-weight:700">+${r['VL이격(%)']}%</td>
+        <td style="color:#fbbf24;font-weight:800;text-align:center">${run}봉</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건68 황금이 (충족조건 컬럼 존재 여부로 판별)
+  if(rows.length && '충족조건' in rows[0]){
+    document.getElementById('summary').innerHTML+=
+      `<span class="badge b3" style="color:#f59e0b">🥇 3조건 중 2개↑ 충족</span>`;
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th><th>이격도5</th><th>이격도20</th><th>충족조건</th><th>충족수</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const cnt=Number(r['충족수']);
+      const cc=cnt>=3?'#fbbf24':'#f59e0b';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td>${r['이격도5']}</td>
+        <td>${r['이격도20']}</td>
+        <td style="color:#fdba74;font-weight:700">${r['충족조건']}</td>
+        <td style="color:${cc};font-weight:800;text-align:center">${cnt}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건66 60분더블MACD (0봉전 컬럼 존재 여부로 판별 — 조건65보다 먼저)
+  if(rows.length && '0봉전' in rows[0] && '장기Hist' in rows[0]){
+    document.getElementById('summary').innerHTML+=
+      `<span class="badge b3" style="color:#06b6d4">🕐 일봉 롱Hist 양성 + 60분봉 모드1 · 0/1/2봉전</span>`;
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>60분종가</th><th>일봉롱Hist</th><th>0봉전</th><th>1봉전</th><th>2봉전</th><th>60분장기Hist</th><th>60분단기Hist</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const chk=v=>v==='✓'?'<span style="color:#4ade80;font-weight:800">✓</span>':'<span style="color:#3a3d4a">·</span>';
+      const lh=Number(r['장기Hist']), sh=Number(r['단기Hist']), dh=Number(r['일봉롱Hist']);
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['60분종가']).toLocaleString()}</td>
+        <td style="color:${dh>0?'#4ade80':'#f87171'};font-weight:800">${r['일봉롱Hist']}</td>
+        <td style="text-align:center">${chk(r['0봉전'])}</td>
+        <td style="text-align:center">${chk(r['1봉전'])}</td>
+        <td style="text-align:center">${chk(r['2봉전'])}</td>
+        <td style="color:${lh>=0?'#4ade80':'#f87171'};font-weight:700">${r['장기Hist']}</td>
+        <td style="color:${sh>=0?'#4ade80':'#f87171'};font-weight:700">${r['단기Hist']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건67 주봉더블MACD (봉주기 컬럼 존재 여부로 판별 — 조건65보다 먼저)
+  if(rows.length && '봉주기' in rows[0]){
+    document.getElementById('summary').innerHTML+=
+      `<span class="badge b3" style="color:#a78bfa">📆 주봉 · ${rows[0]['검색모드']||''}</span>`;
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>주봉종가</th><th>주봉대비(%)</th><th>장기Hist</th><th>단기Hist</th><th>장기MACD</th><th>단기MACD</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['주봉대비(%)']<0?'neg10':'pos';
+      const lh=Number(r['장기Hist']), sh=Number(r['단기Hist']);
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['주봉종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['주봉대비(%)']}%</td>
+        <td style="color:${lh>=0?'#4ade80':'#f87171'};font-weight:700">${r['장기Hist']}</td>
+        <td style="color:${sh>=0?'#4ade80':'#f87171'};font-weight:700">${r['단기Hist']}</td>
+        <td style="color:#22d3ee">${r['장기MACD']}</td>
+        <td style="color:#38bdf8">${r['단기MACD']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건65 더블MACD (장기Hist 컬럼 존재 여부로 판별)
+  if(rows.length && '장기Hist' in rows[0]){
+    document.getElementById('summary').innerHTML+=
+      `<span class="badge b3" style="color:#22d3ee">📈 ${rows[0]['검색모드']||''}</span>`;
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th><th>장기Hist</th><th>단기Hist</th><th>장기MACD</th><th>단기MACD</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const lh=Number(r['장기Hist']), sh=Number(r['단기Hist']);
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:${lh>=0?'#4ade80':'#f87171'};font-weight:700">${r['장기Hist']}</td>
+        <td style="color:${sh>=0?'#4ade80':'#f87171'};font-weight:700">${r['단기Hist']}</td>
+        <td style="color:#22d3ee">${r['장기MACD']}</td>
+        <td style="color:#38bdf8">${r['단기MACD']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
   // 조건38 패턴검색 (유사율(%) 컬럼 존재 여부로 판별 — 가장 먼저)
   if(rows.length && '유사율(%)' in rows[0]){
     let html=`<div class="tbl-wrap"><table>
@@ -9021,24 +12090,22 @@ function renderResult(date,rows){
     return;
   }
 
-  // 조건6 폭발직전 (ATR14 컬럼 존재 여부로 판별 — 조건5보다 먼저)
-  if(rows.length && 'ATR14' in rows[0]){
+  // 조건6 폭발직전 (ATR14 + 테마, 순위변동 없음으로 판별 — 조건64/5 제외)
+  if(rows.length && 'ATR14' in rows[0] && '테마' in rows[0] && !('순위변동' in rows[0])){
     let html=`<div class="tbl-wrap"><table>
     <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
-        <th>종가</th><th>전일대비(%)</th><th>ASGMA점수</th><th>ATR14</th><th>3일등락/ATR(%)</th></tr>`;
+        <th>종가</th><th>전일대비(%)</th><th>ATR14</th><th>테마</th></tr>`;
     rows.forEach(r=>{
       const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
       const dc=r['전일대비(%)']<0?'neg10':'pos';
-      const sc=r['ASGMA점수']>=10?'neg15':r['ASGMA점수']>=6?'neg10':'neg5';
       html+=`<tr>
         <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
         <td><b>${r['종목명']}</b></td>
         <td>${Number(r['시총(억)']).toLocaleString()}</td>
         <td>${Number(r['종가']).toLocaleString()}</td>
         <td class="${dc}">${r['전일대비(%)']}%</td>
-        <td class="${sc}" style="font-weight:700">${r['ASGMA점수']}</td>
         <td>${r['ATR14']}</td>
-        <td style="color:#f59e0b">${r['3일등락/ATR(%)']}</td>
+        <td style="color:#fdba74;font-size:.82em">${r['테마']}</td>
       </tr>`;
     });
     html+='</table></div>';
@@ -9992,6 +13059,369 @@ function renderResult(date,rows){
     return;
   }
 
+  // 조건57 성장주탈출 (PER×PBR + 이탈폭(%) 둘 다 존재 → 55∩56)
+  if(rows.length && 'PER×PBR' in rows[0] && '이탈폭(%)' in rows[0]){
+    document.getElementById('summary').innerHTML+=
+      `<span class="badge b3" style="color:#f59e0b">성장주 ∩ 볼밴탈출 · ${rows.length}종목</span>`;
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>업종</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th>
+        <th>예상PER</th><th>PBR</th><th>PER×PBR</th><th>이탈폭(%)</th><th>5일평균거래량</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const v=Number(r['PER×PBR']);
+      const vc=v>=1000?'neg15':v>=500?'neg10':'neg5';
+      const g=Number(r['이탈폭(%)']);
+      const gc=g<=-3?'neg15':g<=-1?'neg10':'neg5';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td style="color:#c4b5fd">${r['업종']||'-'}</td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:#60a5fa;font-weight:700">${r['예상PER']}</td>
+        <td style="color:#a78bfa">${r['PBR']}</td>
+        <td class="${vc}" style="font-weight:800">${v.toLocaleString()}</td>
+        <td class="${gc}" style="font-weight:800">${g}%</td>
+        <td style="color:#8b8fa8">${Number(r['5일평균거래량']).toLocaleString()}주</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건62 볼밴이제출발 (이탈폭(%) + 테마순위 → 상위테마 볼밴탈출)
+  if(rows.length && '이탈폭(%)' in rows[0] && '테마순위' in rows[0]){
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>테마(상위)</th><th>순위</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th><th>BB하단</th><th>엔벨롭하단</th><th>이탈폭(%)</th><th>5일평균거래량</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const g=Number(r['이탈폭(%)']);
+      const gc=g<=-3?'neg15':g<=-1?'neg10':'neg5';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td style="color:#fca5a5;font-size:.82em">${r['테마']}</td>
+        <td style="color:#fbbf24;font-weight:700">${r['테마순위']}위</td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:#38bdf8">${Number(r['BB하단']).toLocaleString()}</td>
+        <td style="color:#a78bfa">${Number(r['엔벨롭하단']).toLocaleString()}</td>
+        <td class="${gc}" style="font-weight:800">${g}%</td>
+        <td style="color:#8b8fa8">${Number(r['5일평균거래량']).toLocaleString()}주</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건56 볼밴.엔벨롭탈출 (이탈폭(%) 컬럼 존재 여부로 판별)
+  if(rows.length && '이탈폭(%)' in rows[0]){
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th>
+        <th>BB하단</th><th>엔벨롭하단</th><th>이탈폭(%)</th><th>5일평균거래량</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const g=Number(r['이탈폭(%)']);
+      const gc=g<=-3?'neg15':g<=-1?'neg10':'neg5';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:#38bdf8">${Number(r['BB하단']).toLocaleString()}</td>
+        <td style="color:#a78bfa">${Number(r['엔벨롭하단']).toLocaleString()}</td>
+        <td class="${gc}" style="font-weight:800">${g}%</td>
+        <td style="color:#8b8fa8">${Number(r['5일평균거래량']).toLocaleString()}주</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건55 성장주발견 (PER×PBR 컬럼 존재 여부로 판별)
+  if(rows.length && 'PER×PBR' in rows[0]){
+    document.getElementById('summary').innerHTML+=
+      `<span class="badge b3" style="color:#34d399">예상PER×PBR ≥ 300 · ${rows.length}종목</span>`;
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>예상PER</th><th>PBR</th><th>PER×PBR</th><th>PER출처</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const v=Number(r['PER×PBR']);
+      const vc=v>=1000?'neg15':v>=500?'neg10':'neg5';
+      const sc=r['PER출처']==='예상'?'#34d399':'#8b8fa8';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td style="color:#60a5fa;font-weight:700">${r['예상PER']}</td>
+        <td style="color:#a78bfa">${r['PBR']}</td>
+        <td class="${vc}" style="font-weight:800">${v.toLocaleString()}</td>
+        <td style="color:${sc};font-weight:700">${r['PER출처']}</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건58/59 PER×PBR 급등 (z-score 컬럼 존재 여부로 판별)
+  if(rows.length && 'z-score' in rows[0]){
+    const periodName = rows[0]['기간'] || '월/주봉';
+    document.getElementById('summary').innerHTML+=
+      `<span class="badge b3" style="color:#22d3ee">${periodName} z-score ≥ 2 · ${rows.length}종목</span>`;
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>기간</th><th>z-score</th><th>급등률(%)</th><th>신호봉</th><th>평가봉수</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const z=Number(r['z-score']);
+      const zc=z>=4?'neg15':z>=3?'neg10':'neg5';
+      const chg=Number(r['급등률(%)']);
+      const cc=chg>=0?'pos':'neg10';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td style="color:#38bdf8;font-weight:700">${r['기간']}</td>
+        <td class="${zc}" style="font-weight:800">${z.toFixed(2)}</td>
+        <td class="${cc}" style="font-weight:700">${chg>=0?'+':''}${chg}%</td>
+        <td style="color:#8b8fa8">${r['신호봉']}</td>
+        <td style="color:#8b8fa8">${r['평가봉수']}봉</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건64 한투 신호봇 검색 = 조건63 + ATR14 (ATR14 컬럼 존재 여부로 판별)
+  if(rows.length && 'ATR14' in rows[0] && '순위변동' in rows[0]){
+    document.getElementById('summary').innerHTML+=
+      `<span class="badge b3" style="color:#fbbf24">🔔 급등테마 BB(20,2) 돌파 ${rows.length}종목 (+ATR14) · 실주문 없음</span>`;
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>테마(급등)</th><th>순위변동</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th><th>BB상단</th><th>ATR14</th><th>돌파시점</th><th>돌파율(%)</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const bars=Number(r['돌파시점(봉전)']);
+      const bbc=bars===0?'neg15':bars===1?'neg10':'neg5';
+      const ch=Number(r['순위변동']);
+      const cht=ch>0?('▲'+ch):(ch<0?('▼'+(-ch)):'—');
+      const chc=ch>0?'#f97316':(ch<0?'#60a5fa':'#8b8fa8');
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td style="color:#fdba74;font-size:.82em">${r['테마']}</td>
+        <td style="color:${chc};font-weight:800">${cht}</td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:#0ea5e9">${Number(r['BB상단']).toLocaleString()}</td>
+        <td style="color:#fbbf24;font-weight:700">${Number(r['ATR14']).toLocaleString()}</td>
+        <td class="${bbc}" style="font-weight:700">${bars}봉전</td>
+        <td class="neg10" style="font-weight:700">+${r['돌파율(%)']}%</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건63 급등테마 (순위변동 + 돌파시점 → 순위급상승 테마 돌파)
+  if(rows.length && '돌파시점(봉전)' in rows[0] && '순위변동' in rows[0]){
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>테마(급등)</th><th>순위변동</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th><th>BB상단</th><th>돌파시점</th><th>돌파율(%)</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const bars=Number(r['돌파시점(봉전)']);
+      const bbc=bars===0?'neg15':bars===1?'neg10':'neg5';
+      const ch=Number(r['순위변동']);
+      const cht=ch>0?('▲'+ch):(ch<0?('▼'+(-ch)):'—');
+      const chc=ch>0?'#f97316':(ch<0?'#60a5fa':'#8b8fa8');
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td style="color:#fdba74;font-size:.82em">${r['테마']}</td>
+        <td style="color:${chc};font-weight:800">${cht}</td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:#0ea5e9">${Number(r['BB상단']).toLocaleString()}</td>
+        <td class="${bbc}" style="font-weight:700">${bars}봉전</td>
+        <td class="neg10" style="font-weight:700">+${r['돌파율(%)']}%</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건60 이제출발 (돌파시점(봉전) 컬럼 존재 여부로 판별)
+  if(rows.length && '돌파시점(봉전)' in rows[0]){
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>테마(상위)</th><th>순위</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th><th>BB상단</th><th>돌파시점</th><th>돌파율(%)</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const bars=Number(r['돌파시점(봉전)']);
+      const bbc=bars===0?'neg15':bars===1?'neg10':'neg5';
+      const bp=Number(r['돌파율(%)']);
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td style="color:#fca5a5;font-size:.82em">${r['테마']}</td>
+        <td style="color:#fbbf24;font-weight:700">${r['테마순위']}위</td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:#0ea5e9">${Number(r['BB상단']).toLocaleString()}</td>
+        <td class="${bbc}" style="font-weight:700">${bars}봉전</td>
+        <td class="neg10" style="font-weight:700">+${bp}%</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건54 그래엄돌파 (밴드초과(%) 컬럼 존재 여부로 판별)
+  if(rows.length && '밴드초과(%)' in rows[0]){
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>기간</th>
+        <th>밴드초과(%)</th><th>돌파시점</th><th>신호봉</th><th>봉변화율(%)</th><th>평가봉수</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const g=Number(r['밴드초과(%)']);
+      const gc=g>=15?'neg15':g>=5?'neg10':'neg5';
+      const ba=Number(r['봉전']);
+      const bc=ba===0?'neg15':ba===1?'neg10':'neg5';
+      const chg=Number(r['봉변화율(%)']);
+      const cc=chg>=0?'pos':'neg10';
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td style="color:#a78bfa;font-weight:700">${r['기간']}</td>
+        <td class="${gc}" style="font-weight:800">+${g}%</td>
+        <td class="${bc}" style="font-weight:700">${ba}봉전</td>
+        <td style="color:#8b8fa8">${r['신호봉']}</td>
+        <td class="${cc}" style="font-weight:700">${chg>=0?'+':''}${chg}%</td>
+        <td style="color:#8b8fa8">${r['평가봉수']}봉</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건53 삼각수렴패턴 (삼각유형 컬럼 존재 여부로 판별)
+  if(rows.length && '삼각유형' in rows[0]){
+    const tc={'대칭삼각':'#facc15','상승삼각':'#4ade80','하강삼각':'#f87171'};
+    const cnt={};
+    rows.forEach(r=>{cnt[r['삼각유형']]=(cnt[r['삼각유형']]||0)+1;});
+    document.getElementById('summary').innerHTML+=
+      Object.keys(cnt).map(k=>`<span class="badge b3" style="color:${tc[k]||'#8b8fa8'}">${k} ${cnt[k]}개</span>`).join('');
+    let html=`<div style="font-size:.78rem;color:#8b8fa8;margin-bottom:6px">💡 종목을 클릭하면 아래에 캔들차트 + 저항/지지 추세선이 표시됩니다.</div>
+    <div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th>
+        <th>삼각유형</th><th>수렴률(%)</th><th>변동성수축(%)</th>
+        <th>상단선</th><th>하단선</th><th>위치(%)</th><th>수렴점(봉)</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const col=tc[r['삼각유형']]||'#facc15';
+      const cv=Number(r['수렴률(%)']);
+      const cc=cv>=45?'neg15':cv>=30?'neg10':'neg5';
+      const pos=Number(r['위치(%)']);
+      const pcol=pos>=70?'#4ade80':pos<=30?'#f87171':'#8b8fa8';
+      const nm=(r['종목명']||'').replace(/'/g,'');
+      html+=`<tr style="cursor:pointer" onclick="s53ShowChart('${r['종목코드']}','${nm}')">
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td style="color:${col};font-weight:800">${r['삼각유형']}</td>
+        <td class="${cc}" style="font-weight:800">${cv}%</td>
+        <td style="color:#a78bfa;font-weight:700">${r['변동성수축(%)']}%</td>
+        <td style="color:#4ade80">${Number(r['상단선']).toLocaleString()}</td>
+        <td style="color:#f87171">${Number(r['하단선']).toLocaleString()}</td>
+        <td style="color:${pcol};font-weight:700">${pos}%</td>
+        <td style="color:#8b8fa8">${r['수렴점(봉)']}봉</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div><div id="s53ChartWrap" style="margin-top:16px"></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
+  // 조건52 리버스이격도 (이격도(%) 컬럼 존재 여부로 판별)
+  if(rows.length && '이격도(%)' in rows[0]){
+    let html=`<div class="tbl-wrap"><table>
+    <tr><th>시장</th><th>종목코드</th><th>종목명</th><th>시총(억)</th>
+        <th>종가</th><th>전일대비(%)</th>
+        <th>이격도(%)</th><th>SMA20</th><th>EMA200</th>
+        <th>RSI(21)</th><th>A</th><th>B</th>
+        <th>5일평균거래량</th><th>신호</th></tr>`;
+    rows.forEach(r=>{
+      const mc=r['시장'].includes('KOSDAQ')?'mkt-kosdaq':r['시장'].includes('KONEX')?'mkt-konex':'mkt-kospi';
+      const dc=r['전일대비(%)']<0?'neg10':'pos';
+      const gap=Number(r['이격도(%)']);
+      const gc=gap>=70?'neg15':gap>=55?'neg10':'neg5';
+      const ab=Number(r['A'])-Number(r['B']);
+      html+=`<tr>
+        <td class="${mc}">${r['시장']}</td><td>${r['종목코드']}</td>
+        <td><b>${r['종목명']}</b></td>
+        <td>${Number(r['시총(억)']).toLocaleString()}</td>
+        <td>${Number(r['종가']).toLocaleString()}</td>
+        <td class="${dc}">${r['전일대비(%)']}%</td>
+        <td class="${gc}" style="font-weight:800">${gap}%</td>
+        <td style="color:#a78bfa">${Number(r['SMA20']).toLocaleString()}</td>
+        <td style="color:#34d399">${Number(r['EMA200']).toLocaleString()}</td>
+        <td style="color:#e879f9;font-weight:700">${r['RSI(21)']}</td>
+        <td style="color:#60a5fa">${r['A']}</td>
+        <td style="color:#fbbf24">${r['B']}</td>
+        <td style="color:#8b8fa8">${Number(r['5일평균거래량']).toLocaleString()}주</td>
+        <td class="neg15" style="font-weight:700">${r['신호']}</td>
+      </tr>`;
+    });
+    html+='</table></div>';
+    document.getElementById('tables').innerHTML=html;
+    return;
+  }
+
   // 조건51 김승태타점4 (SMA60 컬럼 존재 여부로 판별)
   if(rows.length && 'SMA60' in rows[0]){
     let html=`<div class="tbl-wrap"><table>
@@ -10459,6 +13889,192 @@ COND_TAGS = {
         <span class="cond-tag" style="color:#60a5fa;border-color:#0a2a5a">G: SMA20 2봉 연속 상승</span>
         <span class="cond-tag" style="color:#34d399;border-color:#0a4a20">H: SMA60 2봉 연속 상승</span>
         <span class="cond-tag" style="color:#fb923c;border-color:#5a2a00">J: 전일 기준 5봉 평균 거래량 ≥ 10만주</span>
+    """,
+    52: """
+        <span class="cond-tag">필터1: 시총 3,000억↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#2dd4bf;border-color:#0a4a44">①: (EnvelopeUp(20,40%) − C) / C × 100 ≥ 40 · EnvelopeUp = SMA20 × 1.40</span>
+        <span class="cond-tag" style="color:#2dd4bf;border-color:#0a4a44">⟺ 종가가 20일선 아래로 깊게 눌린 상태 (리버스이격도)</span>
+        <span class="cond-tag" style="color:#34d399;border-color:#0a4a20">②: EMA200 상승중 (EMA200[-1] &gt; EMA200[-2]) — 장기 상승추세</span>
+        <span class="cond-tag" style="color:#fb923c;border-color:#5a2a00">③: 금일 제외 5일 평균 거래량 ≥ 30만주</span>
+        <span class="cond-tag" style="color:#e879f9;border-color:#4a1a5a">④: RSI(21) 기반 A = SMA(RSI,2) · B = SMA(RSI,34) − 1.6185×σ(34)</span>
+        <span class="cond-tag" style="color:#e879f9;border-color:#4a1a5a">패턴: (A4&gt;B4 or A5&gt;B5) → B(1)&gt;A(1) → A&gt;B (눌림 후 재골든크로스)</span>
+        <span class="cond-tag">결과 정렬: 이격도(%) 높은 순 (가장 깊게 눌린 종목 우선)</span>
+    """,
+    53: """
+        <span class="cond-tag">사전적재: [📥 KRX 데이터 불러오기]로 최근 30거래일 전종목 일봉 적재 후 검색</span>
+        <span class="cond-tag">필터1: 시총 3,000억↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#facc15;border-color:#5a4a00">추세선: 최근 20봉 고가에 저항선 · 저가에 지지선 선형회귀 적합</span>
+        <span class="cond-tag" style="color:#facc15;border-color:#5a4a00">수렴①: 말단 밴드폭 ≤ 초기 밴드폭 × 0.78 (≥22% 축소)</span>
+        <span class="cond-tag" style="color:#a78bfa;border-color:#3a2a6a">수렴②: 후반 평균진폭 ≤ 전반 평균진폭 × 0.92 (변동성 수축)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">유형 분류: 대칭삼각(저항↓·지지↑) / 상승삼각(저항평탄·지지↑) / 하강삼각(저항↓·지지평탄)</span>
+        <span class="cond-tag">부가정보: 수렴점(apex)까지 봉수 · 현재가 밴드 내 위치(%) · 상·하단선</span>
+        <span class="cond-tag">결과 정렬: 수렴률(%) 높은 순 (가장 좁게 수렴한 종목 우선)</span>
+    """,
+    54: """
+        <span class="cond-tag">필터1: 시총 1조↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#a78bfa;border-color:#3a2a6a">value = 종가² / (TTM순이익 × 자본총계) — PER×PBR 대용 (발행주식수 상쇄)</span>
+        <span class="cond-tag" style="color:#8b5cf6;border-color:#3a2a6a">데이터: DART 분기재무(연결우선) 4분기 합산=TTM · 시세=월/주봉 종가</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">룩어헤드 방지: 분기보고서 공시지연(분기 45일·사업보고서 90일) 반영 — 각 봉 시점 실제 공시 재무만 사용</span>
+        <span class="cond-tag" style="color:#22d3ee;border-color:#0a3a4a">볼린저밴드(10,2): 상단선 = SMA(value,10) + 2×σ(value,10)</span>
+        <span class="cond-tag" style="color:#22d3ee;border-color:#0a3a4a">신호: value가 상단선을 상향 돌파 (전봉 ≤ 상단 → 당봉 > 상단)</span>
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">돌파 시점: 월봉(M) 최근 3봉 이내 / 주봉(W) 최근 5봉 이내</span>
+        <span class="cond-tag">결과 정렬: 돌파시점 빠른 순(최근) → 밴드초과율 높은 순</span>
+    """,
+    55: """
+        <span class="cond-tag">필터1: 시총 5천억↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#34d399;border-color:#0a4a30">지표: 12개월 예상 PER × PBR ≥ 300 (성장 기대가 큰 고밸류 종목)</span>
+        <span class="cond-tag" style="color:#10b981;border-color:#0a4a30">예상PER = 네이버 금융 컨센서스 추정PER (12개월 forward)</span>
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">예상PER 없거나 음수(적자예상)면 → 최근(trailing) PER 로 대체 · PBR은 현재값</span>
+        <span class="cond-tag">결과: 조건 충족 종목 전부 · PER×PBR 높은 순 정렬 (PER출처 예상/최근 표시)</span>
+    """,
+    56: """
+        <span class="cond-tag">필터1: 시총 3천억↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#38bdf8;border-color:#0a3a5a">볼린저밴드(20,2) 하단선 = SMA(20) − 2×σ(20)</span>
+        <span class="cond-tag" style="color:#38bdf8;border-color:#0a3a5a">Envelope 하단선 = SMA(5) × 0.95 (5일선 −5%)</span>
+        <span class="cond-tag" style="color:#0ea5e9;border-color:#0a3a5a">신호①: 하향 크로스 — 전일 엔벨롭하단 &gt; BB하단 → 금일 엔벨롭하단 &lt; BB하단 (오늘 처음 아래로 내려감)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">신호②: 금일 양봉 (종가 &gt; 시가) — 반등 캔들</span>
+        <span class="cond-tag" style="color:#fb923c;border-color:#5a2a00">필터: 금일 제외 5일 평균거래량 ≥ 15만주 · 일봉 기준</span>
+        <span class="cond-tag">결과 정렬: 이탈폭(%) 큰 순 (엔벨롭하단이 BB하단보다 더 아래일수록 상위)</span>
+    """,
+    57: """
+        <span class="cond-tag">필터1: 시총 5천억↑ · ETF/ETN 제외 (조건55·56 동시충족)</span>
+        <span class="cond-tag" style="color:#34d399;border-color:#0a4a30">조건55(성장주): 12개월 예상 PER × PBR ≥ 300 · 예상PER 없으면 최근 PER 대체 (네이버 컨센서스)</span>
+        <span class="cond-tag" style="color:#38bdf8;border-color:#0a3a5a">조건56(볼밴탈출): 엔벨롭하단이 BB하단 아래로 하향크로스 (전일&gt; → 금일&lt;)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">+ 금일 양봉(종가&gt;시가) · 금일제외 5일평균거래량 ≥ 15만주</span>
+        <span class="cond-tag" style="color:#f59e0b;border-color:#5a3a00">두 조건 AND — 성장 기대가 큰 종목의 낙폭과대 반등 초입</span>
+        <span class="cond-tag">결과 정렬: 이탈폭(%) 큰 순</span>
+    """,
+    58: """
+        <span class="cond-tag">필터1: 시총 3,000억↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#22d3ee;border-color:#0a3a4a">기간: 월봉 40봉 · 최근 3봉 이내 신호</span>
+        <span class="cond-tag" style="color:#a78bfa;border-color:#3a2a6a">value = 종가² / (TTM순이익 × 자본총계) — PER×PBR 대용</span>
+        <span class="cond-tag" style="color:#8b5cf6;border-color:#3a2a6a">DART 분기재무 4분기 합산=TTM · 공시지연 반영</span>
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">신호: PER×PBR 로그변화율 z-score ≥ 2</span>
+        <span class="cond-tag">결과 정렬: z-score 높은 순</span>
+    """,
+    59: """
+        <span class="cond-tag">필터1: 시총 3,000억↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#38bdf8;border-color:#0a3a4a">기간: 주봉 100봉 · 최근 5봉 이내 신호</span>
+        <span class="cond-tag" style="color:#a78bfa;border-color:#3a2a6a">value = 종가² / (TTM순이익 × 자본총계) — PER×PBR 대용</span>
+        <span class="cond-tag" style="color:#8b5cf6;border-color:#3a2a6a">DART 분기재무 4분기 합산=TTM · 공시지연 반영</span>
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">신호: PER×PBR 로그변화율 z-score ≥ 2</span>
+        <span class="cond-tag">결과 정렬: z-score 높은 순</span>
+    """,
+    60: """
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">① 검색일 기준 월간(지난 1달) 상승률 상위 10개 테마 선정 (조건57 로직 · 구성종목 평균수익률)</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">② 그 10개 테마 구성종목 중 시총 1천5백억↑</span>
+        <span class="cond-tag" style="color:#0ea5e9;border-color:#0a3a5a">볼린저밴드 상단 = SMA(20) + 2 × σ(20)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">신호: 종가가 상단선을 최근 3일(봉) 이내 상향 돌파 (전봉 ≤ 상단 → 당봉 &gt; 상단)</span>
+        <span class="cond-tag">부가: 소속 상위테마·테마순위·돌파시점(봉전)·돌파율 표시</span>
+        <span class="cond-tag">결과 정렬: 돌파 최근순 → 테마순위 높은순</span>
+        <span class="cond-tag" style="color:#8b8fa8;border-color:#333">⏳ 최초 1회 상위테마 계산 ~30초 (이후 당일 캐시)</span>
+    """,
+    61: """
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">① 검색일 기준 월간 상승률 상위 10개 테마 (조건57 로직)</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">② 그 10개 테마 구성종목 중 시총 1천5백억↑</span>
+        <span class="cond-tag" style="color:#0ea5e9;border-color:#0a3a5a">볼린저밴드 상단 = SMA(200) + 2 × σ(200) — 장기 200일선 밴드</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">신호: 종가가 상단선을 최근 3일(봉) 이내 상향 돌파 (전봉 ≤ 상단 → 당봉 &gt; 상단)</span>
+        <span class="cond-tag">조건60과 동일하되 볼린저밴드 기간만 20 → 200 (강한 중장기 추세 전환 포착)</span>
+        <span class="cond-tag">결과 정렬: 돌파 최근순 → 테마순위 높은순</span>
+        <span class="cond-tag" style="color:#8b8fa8;border-color:#333">⏳ 최초 1회 상위테마 계산 ~30초 · 200봉 데이터라 종목당 조회 다소 느림</span>
+    """,
+    62: """
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">① 검색일 기준 월간 상승률 상위 20개 테마 (조건57/60 로직)</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">② 그 20개 테마 구성종목 중 시총 1천5백억↑</span>
+        <span class="cond-tag" style="color:#38bdf8;border-color:#0a3a5a">③ 조건56 기술조건: 전일 엔벨롭(SMA5)−5%하단 &gt; BB(20,2)하단 → 금일 엔벨롭하단 &lt; BB하단 (하향크로스)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">+ 금일 양봉(종가&gt;시가) · 금일제외 5일평균거래량 ≥ 15만주</span>
+        <span class="cond-tag" style="color:#e11d48;border-color:#5a1a2a">상위테마 종목의 낙폭과대 반등(볼밴탈출) 포착 — "볼밴 + 이제출발"</span>
+        <span class="cond-tag">결과 정렬: 테마순위 높은순 → 이탈폭 큰순</span>
+        <span class="cond-tag" style="color:#8b8fa8;border-color:#333">⏳ 최초 1회 상위테마 계산 ~30초 (이후 당일 캐시)</span>
+    """,
+    63: """
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">① 오늘 기준 1개월 수익률로 테마 순위 산정 (조건57 방식)</span>
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">② 2주전(10거래일) 기준 1개월 수익률로 테마 순위 산정</span>
+        <span class="cond-tag" style="color:#f97316;border-color:#5a2a00">③ 순위변동 = 2주전순위 − 현재순위 (양수=상승) → 순위 급상승 상위 10개 테마 선정</span>
+        <span class="cond-tag" style="color:#0ea5e9;border-color:#0a3a5a">볼린저밴드 상단 = SMA(20) + 2 × σ(20)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">신호: 그 10개 테마 구성종목이 상단선을 최근 3일 이내 상향 돌파</span>
+        <span class="cond-tag">결과 정렬: 돌파 최근순 → 급등순위 높은순 · 시총 필터 없음</span>
+        <span class="cond-tag" style="color:#8b8fa8;border-color:#333">⏳ 최초 1회 순위비교 계산 ~30초 (종목당 시세 1회로 두 시점 계산)</span>
+    """,
+    64: """
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">⚠️ 실주문 없음 — 신호 계산·알림 전용 (주문은 사용자가 직접)</span>
+        <span class="cond-tag" style="color:#f97316;border-color:#5a2a00">진입: 조건63 급등테마 중 <b>같은 테마에서 0봉전 BB(20,2) 돌파가 3종목 이상</b> 동시 검출</span>
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">→ 그 클러스터 중 <b>시가총액 최대 종목</b> 1개를 진입 신호로</span>
+        <span class="cond-tag">매수금액: 300만원 (수량 = 300만 ÷ 진입가) · 청산 100%</span>
+        <span class="cond-tag" style="color:#60a5fa;border-color:#0a2a5a">손절가 = 진입가 − 1.5 × ATR(14) · 익절가 = 진입가 + 3 × ATR(14) (당일 ATR)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">실시간 감시: 월~금 09:00~15:30 · 10분 주기 · 하루 최대 3신호 · 손절/익절 도달 시 청산 알림</span>
+        <span class="cond-tag" style="color:#8b8fa8;border-color:#333">알림: 이메일 (설정 필요) + 화면 표시</span>
+    """,
+    65: """
+        <span class="cond-tag">필터: 시가총액 3,000억↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#22d3ee;border-color:#0a4a5a">장기 MACD = EMA(21) − EMA(55) · Signal EMA(9) · Hist = MACD − Signal</span>
+        <span class="cond-tag" style="color:#38bdf8;border-color:#0a3a5a">단기 MACD = EMA(5) − EMA(13) · Signal EMA(6) · Hist = MACD − Signal</span>
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">SearchMode 선택(1~8) — 상단 드롭다운에서 지정 후 스크리닝</span>
+        <span class="cond-tag">1: LongHist≥0 + 단기Hist 0선 상향돌파</span>
+        <span class="cond-tag">2: LongHist 상승중 + 단기Hist 0선 상향돌파</span>
+        <span class="cond-tag">3: 장기MACD 상향교차 + 단기Hist 양수</span>
+        <span class="cond-tag">4: 단기MACD 상향교차 + LongHist 양수</span>
+        <span class="cond-tag">5: 장기·단기 MACD 동시 상향교차</span>
+        <span class="cond-tag">6: 장기·단기 히스토그램 모두 첫 음수전환</span>
+        <span class="cond-tag">7: 장기·단기 MACD 동시 하향교차</span>
+        <span class="cond-tag">8: 장기·단기 히스토그램 모두 첫 양수전환</span>
+        <span class="cond-tag">결과 정렬: 전일대비(%) 높은 순</span>
+    """,
+    66: """
+        <span class="cond-tag">필터: 시가총액 1조↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#f59e0b;border-color:#5a4a00">① [일봉 게이트] 일봉 장기 히스토그램(21,55,9) &gt; 0 (양성)일 때만 통과 — 더 엄격</span>
+        <span class="cond-tag" style="color:#06b6d4;border-color:#0a4a5a">② [60분봉] 1분봉 → 60분 리샘플(종가 기준)</span>
+        <span class="cond-tag" style="color:#22d3ee;border-color:#0a4a5a">장기 MACD(21,55,9) · 단기 MACD(5,13,6)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">모드1: 60분 LongHist ≥ 0 AND 60분 단기Hist 0선 상향돌파(전봉≤0 → 당봉&gt;0)</span>
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">최근 0봉전·1봉전·2봉전 각각 신호 여부 표시 (하나라도 충족 시 검색)</span>
+        <span class="cond-tag">결과 정렬: 최근 신호봉(0봉전 우선) → 시총 큰 순</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">⚠️ 무료 분봉은 최근 약 7거래일(≈47개 60분봉)까지만 제공 → 오늘/최근일 조회 권장 · EMA(55)는 근사</span>
+    """,
+    67: """
+        <span class="cond-tag">필터: 시가총액 3,000억↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#a78bfa;border-color:#3a2a6a">데이터: 주봉 (일봉 → 주봉 리샘플, 월요일 기준 · 약 200주 이력)</span>
+        <span class="cond-tag" style="color:#22d3ee;border-color:#0a4a5a">주봉 장기 MACD(21,55,9) · 단기 MACD(5,13,6)</span>
+        <span class="cond-tag" style="color:#fbbf24;border-color:#5a4a00">SearchMode 선택(1~8) — 상단 드롭다운에서 지정 후 스크리닝 (조건65와 동일 로직, 주봉 계산)</span>
+        <span class="cond-tag">결과 정렬: 주봉대비(%) 높은 순</span>
+    """,
+    68: """
+        <span class="cond-tag">필터: 시가총액 3,000억↑ · ETF/ETN 제외 · 일봉</span>
+        <span class="cond-tag" style="color:#f59e0b;border-color:#5a4a00">이격도 D5 = 종가/EMA(5)×100 · D20 = 종가/EMA(20)×100 (종류=지수이동평균)</span>
+        <span class="cond-tag" style="color:#22d3ee;border-color:#0a4a5a">DC = CrossUp(D20, D5) — D20이 D5를 상향 돌파</span>
+        <span class="cond-tag">① DC 발생 AND 양봉(C&gt;O)</span>
+        <span class="cond-tag">② M5·M20 강상승(M5&gt;M5₁ & M5≥M5₂ & M20&gt;M20₁ & M20≥M20₂) + DC + 양봉 · 첫 발생봉</span>
+        <span class="cond-tag">③ M5&gt;M5₁ & M20&gt;M20₁ + DC + 양봉 · 첫 발생봉 (M5·M20=단순MA)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">위 3조건 중 <b>2개 이상</b> 동시 충족 시 선정</span>
+        <span class="cond-tag">결과 정렬: 충족수 많은 순 → 전일대비(%) 높은 순</span>
+    """,
+    69: """
+        <span class="cond-tag">필터: 시가총액 1조↑ · ETF/ETN 제외</span>
+        <span class="cond-tag" style="color:#22d3ee;border-color:#0a4a5a">⓪ [선행] 일봉 조건65 더블MACD 장기 히스토그램(21,55,9) ≥ 0</span>
+        <span class="cond-tag" style="color:#f59e0b;border-color:#5a4a00">⓪ [선행] 일봉 종가 &gt; MA200(단순) AND MA200 상승중(당일 &gt; 전일)</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">① 일봉 양봉 (당일 종가 &gt; 시가)</span>
+        <span class="cond-tag" style="color:#10b981;border-color:#0a3a2a">② 60분봉 변동회귀선 VL = 2·linreg(C,50) − linreg(linreg(C,50),50)</span>
+        <span class="cond-tag" style="color:#38bdf8;border-color:#0a3a5a">③ 60분봉에서 VL이 주가 아래 & 주가가 VL 위에 <b>4봉 이상 연속</b> 유지</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">④ 60분봉 VL이 <b>최근 2봉 연속 하락</b> (전전봉 &gt; 전봉 &gt; 현재봉) — 주가↑ vs VL↓ 다이버전스</span>
+        <span class="cond-tag" style="color:#a78bfa;border-color:#3a2a6a">60분봉 데이터: 야후(yfinance) 시간봉 · 워커 8 (완만 요청)</span>
+        <span class="cond-tag">결과 정렬: 유지봉수 많은 순 → VL이격(%) 큰 순</span>
+        <span class="cond-tag" style="color:#8b8fa8;border-color:#333">⏳ 종목별 시간봉 조회로 스캔 다소 느림</span>
+    """,
+    70: """
+        <span class="cond-tag">필터: 시가총액 3,000억↑ · ETF/ETN 제외 · 일봉</span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">① 단순 SMA(20)이 우상향 (당일 &gt; 전일)</span>
+        <span class="cond-tag" style="color:#60a5fa;border-color:#0a2a5a">Fast = StochasticsFast(5): Fast %K = (C−최저5)/(최고5−최저5)×100 · %D = EMA(%K,3)</span>
+        <span class="cond-tag" style="color:#f472b6;border-color:#4a1a3a">Slow = Stochasticsslow(12,5): Slow %K = SMA(raw%K(12), 5) · %D = EMA(Slow%K,5)</span>
+        <span class="cond-tag" style="color:#e879f9;border-color:#4a1a4a">② Slow %K ≥ 70 (중기 과매수) AND ③ Fast %K ≤ 30 (단기 과매도)</span>
+        <span class="cond-tag">결과 정렬: Fast %K 낮은 순 (단기 과매도 깊은 순)</span>
+    """,
+    71: """
+        <span class="cond-tag">필터: 시가총액 3,000억↑ · ETF/ETN 제외 · 일봉</span>
+        <span class="cond-tag" style="color:#f59e0b;border-color:#5a4a00">세력캔들 = 거래량 &gt; 1.5×MA(V,60) AND 양봉(C&gt;O) → 그날 (시가+종가)/2</span>
+        <span class="cond-tag" style="color:#38bdf8;border-color:#0a3a5a">세력평단 = 세력캔들 값 유지 (세력캔들 없는 날은 직전 세력캔들 값 = valuewhen)</span>
+        <span class="cond-tag" style="color:#fb7185;border-color:#4a1a2a">세력20평균 = 지수평균(세력평단, 20)</span>
+        <span class="cond-tag" style="color:#f87171;border-color:#5a1a1a">① 세력20평균이 오늘까지 <b>5일 이상 연속 하락</b></span>
+        <span class="cond-tag" style="color:#4ade80;border-color:#0a3a20">② 종가가 세력20평균을 오늘 <b>상향 돌파</b> (전일 종가 ≤ 전일 평균 → 금일 종가 &gt; 금일 평균)</span>
+        <span class="cond-tag">결과 정렬: 하락일수 많은 순 → 평균대비(%) 큰 순</span>
     """,
     45: """
         <span class="cond-tag">필터1: 시총 1,500억↑ · ETF/ETN 제외</span>
@@ -12298,6 +15914,90 @@ function startScan(){
 """
 
 
+# ── 조건65 더블MACD: SearchMode(1~8) 선택 ────────────────────────────────────
+_S65_EXTRA_SECTION = """
+<div style="margin-top:14px">
+  <label style="font-size:.82rem;color:#8b8fa8;display:block;margin-bottom:6px">🔍 검색 모드 (SearchMode)</label>
+  <select id="findModeSelect"
+    style="background:#13161f;border:1px solid #2a2d3a;border-radius:6px;color:#e0e0e0;
+           padding:9px 14px;font-size:.86rem;outline:none;max-width:560px;width:100%">
+    <option value="1">Mode 1 — LongHist≥0 + 단기Hist 0선 상향돌파</option>
+    <option value="2">Mode 2 — LongHist 상승중 + 단기Hist 0선 상향돌파</option>
+    <option value="3">Mode 3 — 장기MACD 상향교차 + 단기Hist 양수</option>
+    <option value="4">Mode 4 — 단기MACD 상향교차 + LongHist 양수</option>
+    <option value="5">Mode 5 — 장기·단기 MACD 동시 상향교차</option>
+    <option value="6">Mode 6 — 장기·단기 히스토그램 모두 첫 음수전환</option>
+    <option value="7">Mode 7 — 장기·단기 MACD 동시 하향교차</option>
+    <option value="8">Mode 8 — 장기·단기 히스토그램 모두 첫 양수전환</option>
+  </select>
+  <div style="margin-top:8px;font-size:.76rem;color:#4a4d5e">
+    장기 MACD(21,55,9) · 단기 MACD(5,13,6) · 시가총액 3,000억↑
+  </div>
+</div>
+"""
+
+_S65_EXTRA_JS = r"""
+/* ── 조건65 더블MACD: SearchMode 파라미터 포함하여 스크리닝 시작 ── */
+function startScan(){
+  const d = document.getElementById('dateInput').value.replace(/-/g,'');
+  if(!d) return;
+  const fm = document.getElementById('findModeSelect').value;
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('dlBtn').classList.add('hidden');
+  document.getElementById('resultCard').classList.add('hidden');
+  document.getElementById('progWrap').style.display = 'block';
+  document.getElementById('msg').textContent = '';
+  setP(0,'종목 리스트 조회 중...');
+  fetch(`/api/${SID}/start?date=${d}&find_mode=${fm}`).then(r=>r.json()).then(r=>{
+    if(r.error){showMsg(r.error);resetBtn();return;}
+    listenProg();
+  });
+}
+"""
+
+
+# ── 조건67 주봉더블MACD: SearchMode(1~8) 선택 (조건65와 동일 UI, 주봉 계산) ──
+_S67_EXTRA_SECTION = """
+<div style="margin-top:14px">
+  <label style="font-size:.82rem;color:#8b8fa8;display:block;margin-bottom:6px">🔍 검색 모드 (SearchMode) · 주봉 기준</label>
+  <select id="findModeSelect"
+    style="background:#13161f;border:1px solid #2a2d3a;border-radius:6px;color:#e0e0e0;
+           padding:9px 14px;font-size:.86rem;outline:none;max-width:560px;width:100%">
+    <option value="1">Mode 1 — LongHist≥0 + 단기Hist 0선 상향돌파</option>
+    <option value="2">Mode 2 — LongHist 상승중 + 단기Hist 0선 상향돌파</option>
+    <option value="3">Mode 3 — 장기MACD 상향교차 + 단기Hist 양수</option>
+    <option value="4">Mode 4 — 단기MACD 상향교차 + LongHist 양수</option>
+    <option value="5">Mode 5 — 장기·단기 MACD 동시 상향교차</option>
+    <option value="6">Mode 6 — 장기·단기 히스토그램 모두 첫 음수전환</option>
+    <option value="7">Mode 7 — 장기·단기 MACD 동시 하향교차</option>
+    <option value="8">Mode 8 — 장기·단기 히스토그램 모두 첫 양수전환</option>
+  </select>
+  <div style="margin-top:8px;font-size:.76rem;color:#4a4d5e">
+    주봉 장기 MACD(21,55,9) · 단기 MACD(5,13,6) · 시가총액 3,000억↑ · 주봉 리샘플(월요일 기준)
+  </div>
+</div>
+"""
+
+_S67_EXTRA_JS = r"""
+/* ── 조건67 주봉더블MACD: SearchMode 파라미터 포함하여 스크리닝 시작 ── */
+function startScan(){
+  const d = document.getElementById('dateInput').value.replace(/-/g,'');
+  if(!d) return;
+  const fm = document.getElementById('findModeSelect').value;
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('dlBtn').classList.add('hidden');
+  document.getElementById('resultCard').classList.add('hidden');
+  document.getElementById('progWrap').style.display = 'block';
+  document.getElementById('msg').textContent = '';
+  setP(0,'종목 리스트 조회 중...');
+  fetch(`/api/${SID}/start?date=${d}&find_mode=${fm}`).then(r=>r.json()).then(r=>{
+    if(r.error){showMsg(r.error);resetBtn();return;}
+    listenProg();
+  });
+}
+"""
+
+
 # ── 조건43 proRSI2: 조건31과 동일하나 LenRSI=30 (expoLen=59) ───────────────
 _S43_EXTRA_SECTION = """
 <div style="margin-top:14px">
@@ -12339,6 +16039,422 @@ function startScan(){
     listenProg();
   });
 }
+"""
+
+
+# ── 조건53 삼각수렴: KRX 데이터 사전 적재 버튼 ───────────────────────────────
+_S53_EXTRA_SECTION = """
+<div style="margin-top:14px;padding:14px;background:#0e1219;border:1px solid #3a3320;border-radius:8px">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <button class="btn" id="s53LoadBtn" onclick="s53Prefetch()"
+      style="background:#1c1a0e;border:1px solid #eab308;color:#facc15;font-weight:700">
+      📥 KRX 데이터 불러오기 (최근 30거래일 일봉)
+    </button>
+    <span id="s53Status" style="font-size:.82rem;color:#8b8fa8">데이터 미로드 — 검색 전 먼저 불러오세요.</span>
+  </div>
+  <div style="margin-top:8px;font-size:.74rem;color:#4a4d5e">
+    KRX 정보데이터시스템 OpenAPI로 전종목 일봉을 받아 캐시합니다. 적재 완료 후 <b>[스크리닝 시작]</b>을 누르세요.
+    (기준일을 바꾸면 다시 불러와야 합니다.)
+  </div>
+</div>
+"""
+
+_S53_EXTRA_JS = r"""
+/* ── 조건53 삼각수렴: KRX 사전 적재 + 검색 가드 ── */
+let s53Loaded = false;
+
+function s53RenderStatus(d){
+  const el = document.getElementById('s53Status');
+  const btn = document.getElementById('s53LoadBtn');
+  if(!el) return;
+  if(d.status === 'running'){
+    s53Loaded = false;
+    el.style.color = '#fbbf24';
+    el.textContent = `불러오는 중... ${d.current||0}/${d.total||30}거래일`;
+    if(btn) btn.disabled = true;
+  } else if(d.status === 'done' && (d.tickers||0) > 0){
+    s53Loaded = true;
+    el.style.color = '#4ade80';
+    el.textContent = `✅ ${d.msg||''} (기준일 ${d.date||''}${d.ts ? ', '+d.ts : ''})`;
+    if(btn) btn.disabled = false;
+  } else if(d.status === 'error'){
+    s53Loaded = false;
+    el.style.color = '#f87171';
+    el.textContent = `⚠ ${d.msg||'불러오기 실패'}`;
+    if(btn) btn.disabled = false;
+  } else {
+    s53Loaded = false;
+    el.style.color = '#8b8fa8';
+    el.textContent = '데이터 미로드 — 검색 전 먼저 불러오세요.';
+    if(btn) btn.disabled = false;
+  }
+}
+
+function s53PollStatus(){
+  fetch('/api/53/prefetch/status').then(r=>r.json()).then(d=>{
+    s53RenderStatus(d);
+    if(d.status === 'running') setTimeout(s53PollStatus, 700);
+  }).catch(()=>{});
+}
+
+function s53Prefetch(){
+  const d = document.getElementById('dateInput').value.replace(/-/g,'');
+  if(!d){ alert('기준일을 먼저 선택하세요.'); return; }
+  document.getElementById('s53LoadBtn').disabled = true;
+  const el = document.getElementById('s53Status');
+  el.style.color = '#fbbf24'; el.textContent = '불러오는 중...';
+  fetch(`/api/53/prefetch?date=${d}&days=30`).then(r=>r.json()).then(r=>{
+    if(r.error){
+      el.style.color = '#f87171'; el.textContent = '⚠ ' + r.error;
+      document.getElementById('s53LoadBtn').disabled = false;
+      return;
+    }
+    s53PollStatus();
+  });
+}
+
+/* 검색 전 데이터 로드 여부 확인 (가드) */
+function startScan(){
+  const d = document.getElementById('dateInput').value.replace(/-/g,'');
+  if(!d) return;
+  if(!s53Loaded){
+    showMsg('먼저 [📥 KRX 데이터 불러오기]를 실행한 뒤 검색하세요.');
+    return;
+  }
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('dlBtn').classList.add('hidden');
+  document.getElementById('resultCard').classList.add('hidden');
+  document.getElementById('progWrap').style.display = 'block';
+  document.getElementById('msg').textContent = '';
+  setP(0,'캐시 일봉 분석 중...');
+  fetch(`/api/${SID}/start?date=${d}`).then(r=>r.json()).then(r=>{
+    if(r.error){showMsg(r.error);resetBtn();return;}
+    listenProg();
+  });
+}
+
+/* ── 종목 클릭 → 캔들차트 + 추세선 (SVG, 20봉 패턴 구간) ── */
+function s53ShowChart(code, name){
+  const wrap = document.getElementById('s53ChartWrap');
+  if(!wrap) return;
+  wrap.innerHTML = '<div style="color:#8b8fa8;padding:14px">차트 로딩 중...</div>';
+  wrap.scrollIntoView({behavior:'smooth', block:'nearest'});
+  fetch(`/api/53/chart?code=${code}`).then(r=>r.json()).then(d=>{
+    if(d.error){ wrap.innerHTML = '<div style="color:#f87171;padding:14px">'+d.error+'</div>'; return; }
+    wrap.innerHTML = s53RenderChart(d, name);
+  }).catch(()=>{ wrap.innerHTML = '<div style="color:#f87171;padding:14px">차트 로드 실패</div>'; });
+}
+
+function s53RenderChart(d, name){
+  const o=d.open, h=d.high, l=d.low, c=d.close, up=d.upper, lo=d.lower, dts=d.dates||[];
+  const N=c.length;
+  const W=820, H=400, padL=58, padR=18, padT=42, padB=30;
+  const plotW=W-padL-padR, plotH=H-padT-padB;
+  let pmin=Infinity, pmax=-Infinity;
+  for(let i=0;i<N;i++){ pmin=Math.min(pmin,l[i],lo[i]); pmax=Math.max(pmax,h[i],up[i]); }
+  const mg=(pmax-pmin)*0.06||1; pmin-=mg; pmax+=mg;
+  const X=i=> padL + (N<=1 ? plotW/2 : i*plotW/(N-1));
+  const Y=p=> padT + (pmax-p)/(pmax-pmin)*plotH;
+  const bw=Math.max(2, plotW/N*0.62);
+  const tcol={'대칭삼각':'#facc15','상승삼각':'#4ade80','하강삼각':'#f87171'}[d.type]||'#facc15';
+  let s=`<svg viewBox="0 0 ${W} ${H}" style="width:100%;background:#0b0e16;border:1px solid #2a2d3a;border-radius:8px">`;
+  s+=`<text x="${padL}" y="26" fill="#e0e0e0" font-size="15" font-weight="700">${name} (${d.code}) · <tspan fill="${tcol}">${d.type}</tspan></text>`;
+  s+=`<text x="${W-padR}" y="26" fill="#8b8fa8" font-size="12" text-anchor="end">수렴 ${d.conv_pct}% · 변동수축 ${d.vol_pct}% · ${N}봉</text>`;
+  // 가격 그리드
+  for(let k=0;k<=4;k++){
+    const p=pmin+(pmax-pmin)*k/4, y=Y(p);
+    s+=`<line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}" stroke="#161a26" stroke-width="1"/>`;
+    s+=`<text x="${padL-6}" y="${y+4}" fill="#5a5d6e" font-size="10" text-anchor="end">${Math.round(p).toLocaleString()}</text>`;
+  }
+  // 캔들
+  for(let i=0;i<N;i++){
+    const x=X(i), rise=c[i]>=o[i], col=rise?'#26a69a':'#ef5350';
+    s+=`<line x1="${x}" y1="${Y(h[i])}" x2="${x}" y2="${Y(l[i])}" stroke="${col}" stroke-width="1"/>`;
+    const yo=Y(o[i]), yc=Y(c[i]), top=Math.min(yo,yc), bh=Math.max(1,Math.abs(yc-yo));
+    s+=`<rect x="${x-bw/2}" y="${top}" width="${bw}" height="${bh}" fill="${col}"/>`;
+  }
+  // 추세선 (저항=빨강 점선, 지지=초록 점선)
+  const resPts=up.map((p,i)=>`${X(i).toFixed(1)},${Y(p).toFixed(1)}`).join(' ');
+  const supPts=lo.map((p,i)=>`${X(i).toFixed(1)},${Y(p).toFixed(1)}`).join(' ');
+  s+=`<polyline points="${resPts}" fill="none" stroke="#f87171" stroke-width="2" stroke-dasharray="6 3"/>`;
+  s+=`<polyline points="${supPts}" fill="none" stroke="#4ade80" stroke-width="2" stroke-dasharray="6 3"/>`;
+  // 날짜 (시작·끝)
+  if(dts.length){
+    s+=`<text x="${padL}" y="${H-10}" fill="#5a5d6e" font-size="10">${dts[0]}</text>`;
+    s+=`<text x="${W-padR}" y="${H-10}" fill="#5a5d6e" font-size="10" text-anchor="end">${dts[N-1]}</text>`;
+  }
+  // 범례
+  s+=`<text x="${padL+120}" y="${H-10}" fill="#f87171" font-size="11">▬ 저항선</text>`;
+  s+=`<text x="${padL+196}" y="${H-10}" fill="#4ade80" font-size="11">▬ 지지선</text>`;
+  s+=`</svg>`;
+  return s;
+}
+
+/* 페이지 진입 시 기존 적재 상태 반영 */
+s53PollStatus();
+"""
+
+
+# ── 조건54 그래엄돌파: 월봉/주봉 기간 선택 ────────────────────────────────────
+_S54_EXTRA_SECTION = """
+<div style="margin-top:14px">
+  <label style="font-size:.82rem;color:#8b8fa8;display:block;margin-bottom:6px">📊 분석 기간 (period)</label>
+  <select id="s54Period"
+    style="background:#13161f;border:1px solid #2a2d3a;border-radius:6px;color:#e0e0e0;
+           padding:9px 14px;font-size:.86rem;outline:none;max-width:520px;width:100%">
+    <option value="M">월봉 (M) — 40봉 · 최근 3봉 이내 2σ 급등</option>
+    <option value="W">주봉 (W) — 100봉 · 최근 5봉 이내 2σ 급등</option>
+  </select>
+  <div style="margin-top:8px;font-size:.76rem;color:#4a4d5e">
+    value = 종가²/(TTM순이익×자본총계) · DART 분기재무(연결) + 공시지연 반영 · 시총 1조↑<br>
+    ⏳ DART 재무를 종목마다 조회하므로 <b>첫 검색은 수 분 소요</b>됩니다(이후 캐시로 빨라짐).
+  </div>
+</div>
+"""
+
+_S54_EXTRA_JS = r"""
+/* ── 조건54 그래엄돌파: period 파라미터 포함하여 스크리닝 시작 ── */
+function startScan(){
+  const d = document.getElementById('dateInput').value.replace(/-/g,'');
+  if(!d) return;
+  const p = document.getElementById('s54Period').value;
+  document.getElementById('runBtn').disabled = true;
+  document.getElementById('dlBtn').classList.add('hidden');
+  document.getElementById('resultCard').classList.add('hidden');
+  document.getElementById('progWrap').style.display = 'block';
+  document.getElementById('msg').textContent = '';
+  setP(0,'DART 재무·시세 조회 중... (첫 검색은 수 분 소요)');
+  fetch(`/api/${SID}/start?date=${d}&period=${p}`).then(r=>r.json()).then(r=>{
+    if(r.error){showMsg(r.error);resetBtn();return;}
+    listenProg();
+  });
+}
+"""
+
+
+# ── 조건57 성장주탈출: 업종·테마 조회·분류 ───────────────────────────────────
+_S57_EXTRA_SECTION = """
+<div style="margin-top:14px;padding:14px;background:#0e1219;border:1px solid #2b2340;border-radius:8px">
+  <label style="font-size:.82rem;color:#8b8fa8;display:block;margin-bottom:6px">🏷 업종 · 테마 조회 / 분류</label>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <input id="s57IndQ" placeholder="종목명 또는 6자리 코드 (예: 삼성전자, 005930)"
+      onkeydown="if(event.key==='Enter')s57Lookup()"
+      style="flex:1;min-width:200px;background:#13161f;border:1px solid #2a2d3a;border-radius:6px;color:#e0e0e0;padding:9px 12px;font-size:.86rem;outline:none">
+    <button class="btn" onclick="s57Lookup()" style="background:#1a1330;border:1px solid #8b5cf6;color:#c4b5fd;font-weight:700">업종·테마 조회</button>
+    <button class="btn" onclick="s57List('industry')" style="background:#13161f;border:1px solid #2a2d3a;color:#e0e0e0">전체 업종</button>
+    <button class="btn" onclick="s57List('theme')" style="background:#13161f;border:1px solid #2a2d3a;color:#e0e0e0">전체 테마</button>
+    <button class="btn" onclick="s57TopThemes()" style="background:#1c1206;border:1px solid #f59e0b;color:#fbbf24;font-weight:700">🔥 상위테마 (월간)</button>
+  </div>
+  <div style="margin-top:8px;font-size:.74rem;color:#4a4d5e">종목 입력 → 업종 1개 + 소속 테마(다중) · [전체 업종] 79개 · [전체 테마] 267개 · [상위테마] 지난 1달 상승률 상위 10개 (구성종목 평균수익률). 인포스탁 스타일·네이버 분류.</div>
+  <div id="s57IndOut" style="margin-top:12px"></div>
+</div>
+"""
+
+_S57_EXTRA_JS = r"""
+/* ── 조건57 업종·테마 조회/분류 ── */
+function s57chip(nm,on){ return `<span style="font-size:.78rem;padding:3px 9px;border-radius:999px;border:1px solid ${on?'#8b5cf6':'#2a2d3a'};color:${on?'#c4b5fd':'#b8bcc8'};background:${on?'#1a1330':'#13161f'}">${nm}</span>`; }
+
+function s57Lookup(){
+  const q=document.getElementById('s57IndQ').value.trim();
+  const out=document.getElementById('s57IndOut');
+  if(!q){ out.innerHTML='<span style="color:#f87171">종목명 또는 코드를 입력하세요.</span>'; return; }
+  out.innerHTML='<span style="color:#8b8fa8">조회 중... (테마 최초 로딩 시 ~40초)</span>';
+  Promise.all([
+    fetch('/api/industry/lookup?q='+encodeURIComponent(q)).then(r=>r.json()),
+    fetch('/api/theme/lookup?q='+encodeURIComponent(q)).then(r=>r.json())
+  ]).then(([ind,thm])=>{
+    let h='';
+    // 업종
+    if(ind.found){
+      h+=`<div style="font-size:.98rem"><b>${ind.matched}</b> → 업종 <span style="color:#c4b5fd;font-weight:800">${ind['업종']}</span> <span style="color:#8b8fa8">· 동종 ${ind['종목수']}종목</span></div>`;
+      h+='<div style="margin-top:7px;display:flex;flex-wrap:wrap;gap:5px">'+ind['동종종목'].map(nm=>s57chip(nm,nm===ind.matched)).join('')+'</div>';
+    } else { h+=`<div style="color:#fbbf24">${ind.msg||'업종 없음'}</div>`; }
+    // 테마
+    h+='<div style="margin-top:14px;font-size:.98rem;color:#e0e0e0">📌 소속 테마 <span style="color:#8b8fa8">'+(thm.found?thm['테마수']+'개':'없음')+'</span></div>';
+    if(thm.found){
+      h+='<div style="margin-top:7px;display:flex;flex-wrap:wrap;gap:5px">'+
+        thm['테마'].map(t=>`<span style="font-size:.78rem;padding:3px 10px;border-radius:8px;border:1px solid #3a2a5a;color:#d8b4fe;background:#160f26"><b>${t['테마']}</b> <span style="color:#8b8fa8">${t['종목수']}</span></span>`).join('')+'</div>';
+    }
+    out.innerHTML=h;
+  }).catch(()=>{ out.innerHTML='<span style="color:#f87171">조회 실패</span>'; });
+}
+
+function s57List(kind){
+  const out=document.getElementById('s57IndOut');
+  const isTheme=(kind==='theme');
+  out.innerHTML='<span style="color:#8b8fa8">'+(isTheme?'테마':'업종')+' 분류 불러오는 중...'+(isTheme?' (최초 ~40초)':' (최초 10~15초)')+'</span>';
+  fetch(isTheme?'/api/theme/list':'/api/industry/list').then(r=>r.json()).then(d=>{
+    const arr=isTheme?d.themes:d.industries; const key=isTheme?'테마':'업종';
+    window._s57list=arr; window._s57key=key;
+    let h=`<div style="font-size:.85rem;color:#8b8fa8;margin-bottom:8px">전체 ${d.count}개 ${key} (종목수 순) — 클릭하면 구성종목</div>`;
+    h+='<div style="display:flex;flex-wrap:wrap;gap:6px">';
+    arr.forEach((it,i)=>{ h+=`<span onclick="s57Show(${i})" style="cursor:pointer;font-size:.8rem;padding:5px 11px;border-radius:8px;border:1px solid ${isTheme?'#3a2a5a':'#2a2d3a'};background:#13161f;color:#e0e0e0"><b style="color:${isTheme?'#d8b4fe':'#c4b5fd'}">${it[key]}</b> <span style="color:#8b8fa8">${it['종목수']}</span></span>`; });
+    h+='</div><div id="s57ListDetail" style="margin-top:12px"></div>';
+    out.innerHTML=h;
+  }).catch(()=>{ out.innerHTML='<span style="color:#f87171">불러오기 실패</span>'; });
+}
+function s57Show(i){
+  const it=window._s57list[i]; const key=window._s57key; const dt=document.getElementById('s57ListDetail');
+  let h=`<div style="font-size:.9rem"><b style="color:#c4b5fd">${it[key]}</b> <span style="color:#8b8fa8">${it['종목수']}종목</span></div>`;
+  h+='<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:5px">'+it['종목'].map(nm=>s57chip(nm,false)).join('')+'</div>';
+  dt.innerHTML=h;
+}
+
+/* ── 상위테마 (월간 상승률 상위 10) ── */
+function s57TopThemes(){
+  const d=(document.getElementById('dateInput')||{}).value; const date=d?d.replace(/-/g,''):'';
+  const out=document.getElementById('s57IndOut');
+  out.innerHTML='<span style="color:#fbbf24">🔥 상위테마 계산 중... 구성종목 1개월 수익률 집계 (1~2분, 최초 1회)</span>';
+  fetch('/api/theme/top/start?date='+date+'&n=10').then(r=>r.json()).then(r=>{
+    if(r.error){ out.innerHTML='<span style="color:#f87171">'+r.error+'</span>'; return; }
+    s57TopPoll();
+  });
+}
+function s57TopPoll(){
+  fetch('/api/theme/top/status').then(r=>r.json()).then(d=>{
+    const out=document.getElementById('s57IndOut');
+    if(d.status==='running'){
+      const pct=d.total?Math.round(d.current/d.total*100):0;
+      out.innerHTML=`<span style="color:#fbbf24">🔥 상위테마 계산 중... ${d.current}/${d.total} 종목 (${pct}%)</span>`;
+      setTimeout(s57TopPoll, 1200); return;
+    }
+    if(d.status==='error'){ out.innerHTML='<span style="color:#f87171">⚠ '+(d.msg||'계산 실패')+'</span>'; return; }
+    if(d.status!=='done'){ out.innerHTML='<span style="color:#8b8fa8">준비 중...</span>'; setTimeout(s57TopPoll,1200); return; }
+    window._s57top=d.ranking;
+    let h=`<div style="font-size:.9rem;color:#fbbf24;font-weight:700">🔥 월간 상승률 상위 ${d.ranking.length}개 테마 <span style="color:#8b8fa8;font-weight:400;font-size:.8rem">· 기준 ${d.date} · ${d.ts}</span></div>`;
+    h+='<div style="margin-top:10px;display:flex;flex-direction:column;gap:6px">';
+    d.ranking.forEach((it,i)=>{
+      const r=Number(it['월수익률']); const rc=r>=0?'#f87171':'#60a5fa';
+      h+=`<div onclick="s57TopShow(${i})" style="cursor:pointer;display:flex;align-items:center;gap:10px;padding:8px 11px;border:1px solid #3a2e14;border-radius:8px;background:#13161f">
+        <span style="font-family:monospace;color:#fbbf24;font-weight:700;width:1.4em;text-align:right">${i+1}</span>
+        <b style="flex:1;color:#e0e0e0">${it['테마']}</b>
+        <span style="color:#8b8fa8;font-size:.76rem">상승 ${it['상승비율']}% · ${it['유효']}종목</span>
+        <span style="font-family:monospace;font-weight:800;color:${rc};min-width:5em;text-align:right">${r>=0?'+':''}${r}%</span>
+      </div>`;
+    });
+    h+='</div><div id="s57TopDetail" style="margin-top:10px"></div>';
+    out.innerHTML=h;
+  }).catch(()=>{});
+}
+function s57TopShow(i){
+  const it=window._s57top[i]; const dt=document.getElementById('s57TopDetail');
+  let h=`<div style="font-size:.88rem"><b style="color:#fbbf24">${it['테마']}</b> <span style="color:#8b8fa8">월 ${it['월수익률']>=0?'+':''}${it['월수익률']}% · ${it['종목수']}종목</span></div>`;
+  h+='<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:5px">'+it['종목'].map(nm=>s57chip(nm,false)).join('')+'</div>';
+  dt.innerHTML=h;
+}
+"""
+
+
+# ── 조건64 한투 신호봇: 실시간 감시 제어 패널 ────────────────────────────────
+_S64_EXTRA_SECTION = """
+<div style="margin-top:14px;padding:14px;background:#1a1607;border:1px solid #5a4a00;border-radius:8px">
+  <div style="color:#fbbf24;font-weight:700;margin-bottom:4px">🔔 한투 실시간 신호봇</div>
+  <div style="font-size:.76rem;color:#f87171;margin-bottom:8px">⚠️ 실제 주문은 하지 않습니다 — 진입/손절/익절 신호를 이메일·화면으로 알리기만 합니다. 주문은 본인이 직접 하세요.</div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <button class="btn" id="hantooStartBtn" onclick="hantooStart()" style="font-weight:700;min-width:150px;transition:all .15s">▶ 실시간 감시 시작</button>
+    <button class="btn" id="hantooStopBtn" onclick="hantooStop()" style="font-weight:700;min-width:90px;transition:all .15s">■ 중지</button>
+    <span id="hantooStatus" style="font-size:.84rem;color:#8b8fa8">상태 확인 중...</span>
+  </div>
+  <div id="hantooPanel" style="margin-top:12px"></div>
+  <div style="margin-top:8px;font-size:.74rem;color:#8b8fa8">
+    월~금 09:00~15:30 · 10분 주기 · 하루 최대 3신호 · 손절 −1.5ATR / 익절 +3ATR 도달 시 청산 알림. 이메일 수신자는 서버 이메일 설정을 따릅니다. [스크리닝 시작]으로 지금 시점 신호를 1회 조회할 수도 있습니다.
+  </div>
+</div>
+"""
+
+_S64_EXTRA_JS = r"""
+let _hantooAudio=null, _hantooSeen=null, _hantooAck=new Set();
+(function(){                              // 깜빡임 애니메이션 스타일 1회 주입
+  if(document.getElementById('hantooBlinkStyle')) return;
+  const s=document.createElement('style'); s.id='hantooBlinkStyle';
+  s.textContent='@keyframes hantooBlink{0%,100%{box-shadow:0 0 0 2px #fbbf24,0 0 12px #f59e0b;background:#3a2a06}50%{box-shadow:0 0 0 2px #4ade80;background:#0e1a0e}} .hantoo-blink{animation:hantooBlink .7s infinite;cursor:pointer} .hantoo-item{cursor:pointer}';
+  document.head.appendChild(s);
+})();
+function hantooAck(code){                  // 종목 클릭 → 깜빡임 정지(확인 처리)
+  _hantooAck.add(code);
+  document.querySelectorAll('.hantoo-blink[data-code="'+code+'"]').forEach(el=>el.classList.remove('hantoo-blink'));
+}
+function hantooAudioUnlock(){
+  try{
+    if(!_hantooAudio) _hantooAudio=new (window.AudioContext||window.webkitAudioContext)();
+    if(_hantooAudio.state==='suspended') _hantooAudio.resume();
+  }catch(e){}
+}
+function hantooBeep(){
+  hantooAudioUnlock();
+  try{
+    const ac=_hantooAudio; if(!ac) return;
+    [0,0.18].forEach((t,i)=>{           // 삐-빅 2음
+      const o=ac.createOscillator(), g=ac.createGain();
+      o.type='sine'; o.frequency.value = i? 1175 : 880;
+      o.connect(g); g.connect(ac.destination);
+      const s=ac.currentTime+t;
+      g.gain.setValueAtTime(0.0001,s);
+      g.gain.exponentialRampToValueAtTime(0.3,s+0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001,s+0.16);
+      o.start(s); o.stop(s+0.17);
+    });
+  }catch(e){}
+}
+function hantooBtns(running){
+  const sb=document.getElementById('hantooStartBtn'), tb=document.getElementById('hantooStopBtn');
+  if(!sb||!tb) return;
+  if(running){
+    // 실행중 → 시작버튼은 '● 감시 중'(채워진 초록·눌린 상태), 중지버튼 활성(빨강)
+    sb.textContent='● 감시 중';
+    sb.style.cssText='font-weight:700;min-width:150px;transition:all .15s;background:#16a34a;border:1px solid #16a34a;color:#04210f;box-shadow:inset 0 0 0 2px #052e16;cursor:default';
+    tb.style.cssText='font-weight:700;min-width:90px;transition:all .15s;background:#3a1113;border:1px solid #f87171;color:#fecaca;opacity:1;cursor:pointer';
+  }else{
+    sb.textContent='▶ 실시간 감시 시작';
+    sb.style.cssText='font-weight:700;min-width:150px;transition:all .15s;background:#12210f;border:1px solid #4ade80;color:#86efac;cursor:pointer';
+    tb.style.cssText='font-weight:700;min-width:90px;transition:all .15s;background:#1a0f10;border:1px solid #5a2a2a;color:#7a5a5a;opacity:.55;cursor:default';
+  }
+}
+function hantooStart(){
+  hantooAudioUnlock();               // 클릭 제스처로 오디오 활성화 (브라우저 자동재생 정책)
+  const sb=document.getElementById('hantooStartBtn');
+  if(sb){ sb.textContent='● 시작 중...'; sb.style.background='#0f3a1e'; }
+  fetch('/api/64/hantoo/start').then(r=>r.json()).then(()=>hantooPoll());
+}
+function hantooStop(){ fetch('/api/64/hantoo/stop').then(r=>r.json()).then(()=>hantooPoll()); }
+function hantooPoll(){
+  fetch('/api/64/hantoo/status').then(r=>r.json()).then(d=>{
+    hantooBtns(d.running);
+    // ── 새 종목 감지 → 알림음 ──
+    const codes=[];
+    if(d.active) codes.push(d.active['종목코드']);
+    if(d.history) d.history.forEach(s=>codes.push(s['종목코드']));
+    if(_hantooSeen===null){ _hantooSeen=new Set(codes); }   // 첫 조회는 무음
+    else {
+      let neu=false;
+      codes.forEach(c=>{ if(!_hantooSeen.has(c)){ _hantooSeen.add(c); neu=true; } });
+      if(neu){ hantooBeep(); document.title='🔔 새 신호! · 한투 신호봇'; setTimeout(()=>{document.title='한투 신호봇';},4000); }
+    }
+    const el=document.getElementById('hantooStatus');
+    if(!el) return;
+    el.innerHTML = d.running
+      ? `<span style="color:#4ade80;font-weight:700">● 감시중</span> · ${d.msg||''} · 오늘 신호 <b>${d.trades_today}/3</b> · 최근 ${d.last_scan||'-'} · 다음 ${d.next_scan||'-'}`
+      : `<span style="color:#8b8fa8">○ 중지됨</span> · ${d.msg||''}`;
+    let h='';
+    if(d.active){ const a=d.active; const ac=a['종목코드'];
+      const bl=_hantooAck.has(ac)?'':' hantoo-blink';
+      h+=`<div class="hantoo-item${bl}" data-code="${ac}" onclick="hantooAck('${ac}')" title="클릭하면 깜빡임이 멈춥니다"
+        style="padding:10px 12px;border:1px solid #4ade80;border-radius:8px;background:#0e1a0e">
+        <b style="color:#86efac">● 활성 신호 (감시중)</b> &nbsp;<b>${a['종목명']}</b> (${ac}) · ${a['시장']}${bl?' &nbsp;<span style="color:#fbbf24">🔔 클릭해 확인</span>':''}<br>
+        <span style="color:#fdba74">${a['테마']}</span> · 클러스터 ${a['클러스터']}종목<br>
+        진입 <b>${Number(a['진입가']).toLocaleString()}</b> · <span style="color:#f87171">손절 ${Number(a['손절가']).toLocaleString()}</span> · <span style="color:#4ade80">익절 ${Number(a['익절가']).toLocaleString()}</span> · ${a['수량']}주 (${Number(a['매수금액']).toLocaleString()}원)</div>`;
+    }
+    if(d.history && d.history.length){
+      h+='<div style="margin-top:8px;font-size:.8rem;color:#8b8fa8">오늘 신호 이력 ('+d.history.length+')</div>';
+      d.history.forEach((s,i)=>{ const sc=s['종목코드']; const bl=_hantooAck.has(sc)?'':' hantoo-blink';
+        h+=`<div class="hantoo-item${bl}" data-code="${sc}" onclick="hantooAck('${sc}')" title="클릭하면 깜빡임이 멈춥니다"
+          style="font-size:.8rem;padding:4px 6px;margin:2px 0;border-radius:6px;color:#c9cdd6">${i+1}. <b>${s['종목명']}</b> 진입 ${Number(s['진입가']).toLocaleString()} · 손절 ${Number(s['손절가']).toLocaleString()} · 익절 ${Number(s['익절가']).toLocaleString()} · ${s['수량']}주${bl?' <span style="color:#fbbf24">🔔</span>':''}</div>`; });
+    }
+    const p=document.getElementById('hantooPanel'); if(p) p.innerHTML=h;
+    if(d.running) setTimeout(hantooPoll, 5000);
+  }).catch(()=>{});
+}
+hantooPoll();
 """
 
 
@@ -14474,6 +18590,12 @@ def screener_page(sid):
                      _RT41_EXTRA_SECTION if sid == 41 else
                      _RT42_EXTRA_SECTION if sid == 42 else
                      _S48_EXTRA_SECTION  if sid == 48 else
+                     _S53_EXTRA_SECTION  if sid == 53 else
+                     _S54_EXTRA_SECTION  if sid == 54 else
+                     _S57_EXTRA_SECTION  if sid == 57 else
+                     _S64_EXTRA_SECTION  if sid == 64 else
+                     _S65_EXTRA_SECTION  if sid == 65 else
+                     _S67_EXTRA_SECTION  if sid == 67 else
                      _S16_EXTRA_SECTION  if sid == 16 else "")
     extra_js      = (_RT14_EXTRA_JS      if sid == 14 else
                      _RT19_EXTRA_JS      if sid == 19 else
@@ -14497,6 +18619,12 @@ def screener_page(sid):
                      _RT41_EXTRA_JS      if sid == 41 else
                      _RT42_EXTRA_JS      if sid == 42 else
                      _S48_EXTRA_JS       if sid == 48 else
+                     _S53_EXTRA_JS       if sid == 53 else
+                     _S54_EXTRA_JS       if sid == 54 else
+                     _S57_EXTRA_JS       if sid == 57 else
+                     _S64_EXTRA_JS       if sid == 64 else
+                     _S65_EXTRA_JS       if sid == 65 else
+                     _S67_EXTRA_JS       if sid == 67 else
                      _S16_EXTRA_JS       if sid == 16 else "")
     html = (SCREENER_HTML
             .replace("{{TITLE}}",          info["title"])
@@ -14720,11 +18848,204 @@ def api_s48_start():
     return jsonify({"ok": True})
 
 
+# ── 업종(섹터) 분류 라우트 (조건57 부가기능) ─────────────────────────────────
+@app.route("/api/industry/list")
+def api_industry_list():
+    """전체 업종 목록 + 종목수 (종목 많은 순)."""
+    groups = _load_industry_map()
+    items = sorted(({"업종": nm, "종목수": len(st),
+                     "종목": [s["name"] for s in st]} for nm, st in groups.items()),
+                   key=lambda x: -x["종목수"])
+    return jsonify({"count": len(items), "industries": items})
+
+
+@app.route("/api/industry/lookup")
+def api_industry_lookup():
+    """종목명/코드 → 업종 + 동종 종목."""
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"error": "종목명 또는 코드를 입력하세요."}), 400
+    _load_industry_map()
+    ind = None
+    if _re.fullmatch(r"\d{6}", q):
+        ind = _industry_by_code.get(q)
+        matched = q
+    else:
+        ind = _industry_by_name.get(q)
+        matched = q
+        if ind is None:                          # 부분일치 보조
+            for nm in _industry_by_name:
+                if q in nm:
+                    ind = _industry_by_name[nm]; matched = nm; break
+    if not ind:
+        return jsonify({"found": False, "query": q,
+                        "msg": "해당 종목의 업종을 찾지 못했습니다."})
+    peers = [s["name"] for s in _industry_groups.get(ind, [])]
+    return jsonify({"found": True, "query": q, "matched": matched,
+                    "업종": ind, "종목수": len(peers), "동종종목": peers})
+
+
+@app.route("/api/theme/list")
+def api_theme_list():
+    """전체 테마 목록 + 종목수 (종목 많은 순)."""
+    groups = _load_theme_map()
+    items = sorted(({"테마": nm, "종목수": len(st),
+                     "종목": [s["name"] for s in st]} for nm, st in groups.items()),
+                   key=lambda x: -x["종목수"])
+    return jsonify({"count": len(items), "themes": items})
+
+
+@app.route("/api/theme/lookup")
+def api_theme_lookup():
+    """종목명/코드 → 소속 테마들 (각 테마 종목수 포함)."""
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"error": "종목명 또는 코드를 입력하세요."}), 400
+    _load_theme_map()
+    themes, matched = [], q
+    if _re.fullmatch(r"\d{6}", q):
+        themes = _theme_by_code.get(q, [])
+    else:
+        themes = _theme_by_name.get(q, [])
+        if not themes:
+            for nm in _theme_by_name:
+                if q in nm:
+                    themes = _theme_by_name[nm]; matched = nm; break
+    if not themes:
+        return jsonify({"found": False, "query": q,
+                        "msg": "해당 종목의 테마를 찾지 못했습니다."})
+    out = [{"테마": t, "종목수": len(_theme_groups.get(t, []))} for t in themes]
+    return jsonify({"found": True, "query": q, "matched": matched,
+                    "테마수": len(out), "테마": out})
+
+
+@app.route("/api/theme/top/start")
+def api_theme_top_start():
+    """상위테마(월간 상승률) 계산 시작 — 백그라운드."""
+    date_str = request.args.get("date", datetime.now().strftime("%Y%m%d"))
+    n = max(1, min(30, int(request.args.get("n", 10))))
+    with _theme_top_lock:
+        if _theme_top["status"] == "running":
+            return jsonify({"ok": True, "msg": "이미 계산 중"})
+        # 같은 날짜 이미 계산됨 → 캐시 재사용 (재계산 안 함)
+        if (_theme_top["status"] == "done" and _theme_top["date"] == date_str
+                and _theme_top["n"] >= n and _theme_top["ranking"]):
+            return jsonify({"ok": True, "cached": True})
+        threading.Thread(target=_compute_theme_top, args=(date_str, n), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/theme/top/status")
+def api_theme_top_status():
+    return jsonify(_theme_top)
+
+
+# ── 조건64 한투 신호봇 실시간 제어 라우트 (실주문 없음) ──────────────────────
+@app.route("/api/64/hantoo/start")
+def api_hantoo_start():
+    if _hantoo_state["running"]:
+        return jsonify({"ok": True, "msg": "이미 감시 중"})
+    _hantoo_state["running"] = True
+    threading.Thread(target=_run_hantoo, daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/64/hantoo/stop")
+def api_hantoo_stop():
+    _hantoo_state["running"] = False
+    return jsonify({"ok": True})
+
+
+@app.route("/api/64/hantoo/status")
+def api_hantoo_status():
+    return jsonify(_hantoo_state)
+
+
+# ── 조건53 전용: KRX 데이터 사전 적재 라우트 ──────────────────────────────────
+@app.route("/api/53/prefetch")
+def api_s53_prefetch():
+    date_str = request.args.get("date", datetime.now().strftime("%Y%m%d"))
+    days     = int(request.args.get("days", _S53_PREFETCH_DAYS))
+    if KRX_API_KEY == "":
+        return jsonify({"error": "KRX_API_KEY가 설정되지 않았습니다 (.env 확인)"}), 400
+    with _S53_PREFETCH_LOCK:
+        if _S53_PREFETCH["status"] == "running":
+            return jsonify({"ok": True, "msg": "이미 적재 중"})
+        threading.Thread(target=_s53_prefetch_run,
+                         args=(date_str, days), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/53/prefetch/status")
+def api_s53_prefetch_status():
+    return jsonify(_S53_PREFETCH)
+
+
+@app.route("/api/53/chart")
+def api_s53_chart():
+    """조건53 종목 클릭 시: 윈도우(20봉) 일봉 + 저항/지지 추세선 반환."""
+    code = request.args.get("code", "").strip()
+    with _S53_CACHE_LOCK:
+        df = _S53_CACHE.get(code)
+    if df is None:
+        return jsonify({"error": "데이터 없음 — 먼저 [KRX 데이터 불러오기] 실행"}), 404
+    g = _s53_geom(df)
+    if g is None:
+        return jsonify({"error": "차트 계산 불가 (데이터 부족)"}), 404
+    W   = g["W"]
+    sub = df.iloc[-W:]
+    dts = []
+    if "date" in sub.columns:
+        for s in sub["date"].astype(str).tolist():
+            dts.append(f"{s[4:6]}/{s[6:8]}" if len(s) == 8 else s)
+    return jsonify({
+        "code":  code,
+        "type":  g["type"] or "수렴",
+        "open":  [int(round(v)) for v in sub["Open"].astype(float).tolist()],
+        "high":  [int(round(v)) for v in sub["High"].astype(float).tolist()],
+        "low":   [int(round(v)) for v in sub["Low"].astype(float).tolist()],
+        "close": [int(round(v)) for v in sub["Close"].astype(float).tolist()],
+        "upper": [round(v, 1) for v in g["upper"]],
+        "lower": [round(v, 1) for v in g["lower"]],
+        "dates": dts,
+        "conv_pct": round((1.0 - g["conv_ratio"]) * 100, 1),
+        "vol_pct":  round((1.0 - g["vol_ratio"]) * 100, 1),
+        "apex":     (round(float(g["apex"]), 1) if np.isfinite(g["apex"]) else 0),
+    })
+
+
+# ── 조건54 전용 start 라우트 (period M/W 파라미터 처리) ──────────────────────
+@app.route("/api/54/start")
+def api_s54_start():
+    global _S54_PERIOD
+    if not DART_API_KEY:
+        return jsonify({"error": "DART_API_KEY가 설정되지 않았습니다 (.env 확인)"}), 400
+    st = _state[54]
+    date_str = request.args.get("date", datetime.now().strftime("%Y%m%d"))
+    _S54_PERIOD = "W" if request.args.get("period", "M").upper() == "W" else "M"
+
+    def _run():
+        try:
+            st["result_df"]   = RUNNER[54](date_str, st["progress"])
+            st["result_date"] = date_str
+        except Exception as e:
+            print(f"[ERROR sid=54] {e}")
+            st["progress"]["status"] = "done"
+
+    st["progress"] = {"current": 0, "total": 0, "status": "loading"}
+    st["worker"]   = threading.Thread(target=_run, daemon=True)
+    st["worker"].start()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/<int:sid>/start")
 def api_start(sid):
     if sid not in SCREENERS: return jsonify({"error": "없는 스크리너"}), 404
     st = _state[sid]
     date_str = request.args.get("date", datetime.now().strftime("%Y%m%d"))
+    if request.args.get("find_mode") is not None:      # 모드 선택형 스크리너용
+        try: st["find_mode"] = int(request.args.get("find_mode"))
+        except ValueError: pass
 
     def _run():
         try:
