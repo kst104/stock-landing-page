@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>수능영어 D-23 달력</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<main>
+<p class="eyebrow">수능영어 연습 세트 · 2027학년도 수능 2026-11-19(목)</p>
+<h1>날짜별 독해 세트</h1>
+<p>하루 한 세트, 20분. 세트를 풀면 이 달력에 점수가 표시됩니다. 점수는 이 브라우저에만 저장되니 결과 요약은 Claude 대화창에 붙여 넣어 두세요.</p>
+<div class="callout">
+  <p><strong>영어 영역 시험 시간:</strong> 3교시 13:10~14:20(70분), 듣기 17문항 포함 45문항. 듣기는 13:10부터 25분 이내에 끝납니다. (출처: 한국교육과정평가원 2027학년도 실시요강)</p>
+  <p class="small muted">이 세트는 AI가 새로 쓴 창작 문항이며 평가원 문제가 아닙니다. 실제 기출은 <a href="https://www.suneung.re.kr/boardCnts/list.do?boardID=1500234&m=0403&s=suneung">평가원 기출문제 게시판</a>에서 받아 병행하세요.</p>
+</div>
+<p><a href="reference/question-types.html">유형별 접근법 (참고 문서)</a> · <a href="lessons/exam-day.html">시험 당일 점검표</a></p>
+
+<div id="calendar"></div>
+
+<nav class="footer-nav" aria-label="관련 문서">
+  <a href="MISSION.md">내 미션</a>
+  <a href="RESOURCES.md">출처</a>
+</nav>
+</main>
+<script src="assets/plan.js"></script>
+<script>
+(function () {
+  var plan = window.CSAT_PLAN;
+  var root = document.getElementById('calendar');
+  function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  var now = new Date();
+  var today = now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate());
+  var weeks = {};
+  plan.days.forEach(function (d) { (weeks[d.week] = weeks[d.week] || []).push(d); });
+  var done = 0, sumCorrect = 0, sumCount = 0;
+  Object.keys(weeks).sort().forEach(function (w) {
+    var sec = document.createElement('section');
+    sec.className = 'week';
+    sec.innerHTML = '<h2>' + esc(plan.weeks[w] || ('주차 ' + w)) + '</h2>';
+    var ul = document.createElement('ul');
+    ul.className = 'days';
+    weeks[w].forEach(function (d) {
+      var r = null;
+      try { r = JSON.parse(localStorage.getItem('csat-en:' + d.date)); } catch (e) { r = null; }
+      var li = document.createElement('li');
+      li.className = 'day' + (d.date === today ? ' today' : '') + (r ? ' done' : '');
+      var status, cls = 'status';
+      if (r) {
+        done += 1; sumCorrect += r.correct; sumCount += r.count;
+        var pct = Math.round(r.correct / r.count * 100);
+        status = r.correct + '/' + r.count + ' · ' + r.score + '/' + r.total + '점';
+        cls += pct >= 90 ? ' ok' : (pct < 70 ? ' low' : '');
+      } else {
+        status = d.date === today ? '오늘' : (d.date < today ? '미완료' : '');
+      }
+      var mm = d.date.slice(5, 7), dd = d.date.slice(8, 10);
+      li.innerHTML = '<span class="dday">D-' + esc(d.dday) + '</span><span class="date">' + Number(mm) + '/' + Number(dd) + '</span>' +
+        '<a href="lessons/' + esc(d.date) + '.html">' + esc(d.focus) + '</a><span class="' + cls + '">' + esc(status) + '</span>';
+      ul.appendChild(li);
+    });
+    sec.appendChild(ul);
+    root.appendChild(sec);
+  });
+  if (done) {
+    var p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '완료 ' + done + '/' + plan.days.length + ' 세트 · 누적 정답률 ' + Math.round(sumCorrect / sumCount * 100) + '%';
+    root.insertBefore(p, root.firstChild);
+  }
+})();
+</script>
+</body>
+</html>
